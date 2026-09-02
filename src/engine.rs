@@ -67,13 +67,23 @@ impl Engine {
             (None, _) | (_, crate::config::Source::None) => {
                 (Vec::new(), "no fetch (model-generated content)".to_string())
             }
-            (Some(_), source) => match news::fetch(source, cfg.since_hours, cfg.limit) {
+            (Some(_), source) => match news::fetch(
+                source,
+                cfg.since_hours,
+                cfg.limit,
+                (!cfg.question.trim().is_empty()).then_some(cfg.question.as_str()),
+            ) {
                 Ok(items) => {
                     let note = format!(
-                        "{} items from {} over the last {}h",
+                        "{} items from {} over the last {}h{}",
                         items.len(),
                         source.label(),
-                        cfg.since_hours
+                        cfg.since_hours,
+                        if cfg.question.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" matching {:?}", cfg.question)
+                        }
                     );
                     (items, note)
                 }
