@@ -131,7 +131,12 @@ pub struct Cli {
 impl Cli {
     /// Resolution order: defaults -> preset -> explicit flags/env.
     pub fn to_config(&self) -> Res<RunConfig> {
-        let question = read_question(&self.question)?;
+        // --tui owns stdin for key events; do not drain it as a piped question.
+        let question = if self.tui {
+            self.question.join(" ")
+        } else {
+            read_question(&self.question)?
+        };
 
         // A bare question keeps the original behaviour of this CLI; with no question we
         // are the news service, so the topic (and its schema) becomes the default.

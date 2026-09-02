@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use crate::cli::display_stops;
@@ -38,12 +39,22 @@ const ROWS: &[&str] = &[
 ];
 
 pub fn run(cfg: RunConfig) -> Res<()> {
-    // Fetch before taking over the screen, so network errors are readable.
-    let engine = Engine::new(&cfg)?;
-    let mut app = App::new(cfg, engine);
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err("--tui requires an interactive terminal".into());
+    }
 
-    let mut terminal = ratatui::init();
-    let result = app.event_loop(&mut terminal);
+    // Take over the screen first so a slow news fetch is not a blank hang.
+    let mut terminal = ratatui::try_init().map_err(|e| {
+        let _ = ratatui::try_restore();
+        format!("cannot start TUI: {e}")
+    })?;
+
+    let result = (|| {
+        let _ = terminal.draw(|f| draw_busy(f, "fetching news…"));
+        let engine = Engine::new(&cfg)?;
+        let mut app = App::new(cfg, engine);
+        app.event_loop(&mut terminal)
+    })();
     ratatui::restore();
     result
 }
@@ -271,7 +282,7 @@ impl App {
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .areas(f.area());
         let [left, right] =
