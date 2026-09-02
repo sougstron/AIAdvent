@@ -1,3 +1,5 @@
 target/
 runs/
-
+docs/
+.omo/
+PLAN.md
