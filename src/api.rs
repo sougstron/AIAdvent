@@ -106,8 +106,18 @@ pub fn build_body(
     schema: Option<&Value>,
 ) -> Value {
     let mut messages = Vec::new();
-    if !system.is_empty() {
-        messages.push(json!({ "role": "system", "content": system }));
+    let budget_note = cfg.max_tokens.map(|n| {
+        format!(
+            "The entire generation, including reasoning and the final answer, has a hard budget of {n} tokens. Plan accordingly and finish the final answer before that limit; never stop mid-answer."
+        )
+    });
+    if !system.is_empty() || budget_note.is_some() {
+        let content = match budget_note {
+            Some(note) if system.is_empty() => note,
+            Some(note) => format!("{system}\n\n{note}"),
+            None => system.to_string(),
+        };
+        messages.push(json!({ "role": "system", "content": content }));
     }
     messages.push(json!({ "role": "user", "content": user }));
 
@@ -239,4 +249,23 @@ fn field(v: Option<&Value>, key: &str) -> u64 {
     v.and_then(|v| v.get(key))
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_budget_is_sent_and_explained_to_model() {
+        let cfg = RunConfig {
+            max_tokens: Some(8192),
+            ..RunConfig::default()
+        };
+        let body = build_body("model", &cfg, "base", "question", None);
+        assert_eq!(body["max_tokens"], 8192);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("entire generation"));
+        assert!(system.contains("8192 tokens"));
+        assert!(system.contains("finish the final answer"));
+    }
 }

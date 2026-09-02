@@ -31,7 +31,7 @@ cargo build --release
 # compare every preset and print a stability report
 ./target/release/ask --compare
 
-# interactive switches
+# chat TUI: queries, sessions, reasoning/final output and switches
 ./target/release/ask --tui
 ```
 
@@ -156,19 +156,30 @@ which is what makes length and stop predictable.
 ask --tui
 ```
 
-One screen, no logic of its own — it edits the same `RunConfig` and calls the
-same `Engine` as the CLI.
+The TUI is a small ChatGPT-style client over the same `RunConfig` and `Engine`
+as the CLI. Each submitted query drives the news search (HN server-side and
+Steam by local matching), and the material line shows what was found. See the
+model's reasoning (when enabled) followed by its final answer. Chats keep their own visible history; `Ctrl-N` starts a new
+session. The comparison action deliberately runs only the two requested bots:
+unconstrained text (`baseline`) and strict JSON (`strict`).
 
 ```
-↑↓ / j k     select a setting
-←→ / h l     change it (presets, format, think, numbers, stop, source)
-Enter        generate
-c            compare every preset
-f            refetch news
-r            toggle raw API response
-PgUp / PgDn  scroll the answer
-q / Esc      quit
+Type + Enter  send a query
+Tab           switch between message input and settings
+↑↓ / j k      select a setting
+←→ / h l      change it (format, thinking, token budget, stop, source…)
+Ctrl-N        create a new chat session
+Ctrl-← / →    switch between chat sessions
+c             compare baseline vs strict JSON (from settings focus)
+f             refetch news (from settings focus)
+r             toggle raw API response (from settings focus)
+PgUp / PgDn   scroll the conversation
+Esc           quit
 ```
+
+The TUI token-budget selector uses fixed whole-generation limits: off, 8k, 16k,
+33k, and 64k. When enabled, the prompt tells the model that reasoning and final
+output share this budget and asks it to finish cleanly before the hard limit.
 
 ## Other flags
 

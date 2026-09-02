@@ -1,7 +1,6 @@
-//! Interactive settings screen. It owns no logic of its own: it edits the same
-//! `RunConfig` the CLI builds and calls the same `Engine`.
+//! Chat-style TUI over the shared generation engine.
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -12,27 +11,23 @@ use std::time::Duration;
 
 use crate::cli::display_stops;
 use crate::compare;
-use crate::config::{apply_preset, preset_names, Res, RunConfig, PRESETS};
+use crate::config::{Res, RunConfig};
 use crate::engine::{Engine, RunResult};
 
-/// Stop-sequence choices offered by the screen, in cycle order.
-const STOP_CHOICES: &[&[&str]] = &[
-    &[],
-    &["\n---\n"],
-    &["\n\n"],
-    &["\n\n\n"],
-    &["}"],
-    &["\"items\""],
+const STOP_CHOICES: &[&[&str]] = &[&[], &["\n---\n"], &["\n\n"], &["\n\n\n"]];
+const TOKEN_CHOICES: &[Option<u32>] = &[
+    None,
+    Some(8 * 1024),
+    Some(16 * 1024),
+    Some(33 * 1024),
+    Some(64 * 1024),
 ];
-
 const ROWS: &[&str] = &[
-    "preset",
     "format",
     "thinking",
     "max_tokens",
     "max_items",
     "stop",
-    "runs",
     "source",
     "since (h)",
     "limit",
@@ -42,58 +37,69 @@ pub fn run(cfg: RunConfig) -> Res<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("--tui requires an interactive terminal".into());
     }
-
-    // Take over the screen first so a slow news fetch is not a blank hang.
     let mut terminal = ratatui::try_init().map_err(|e| {
         let _ = ratatui::try_restore();
         format!("cannot start TUI: {e}")
     })?;
-
     let result = (|| {
         let _ = terminal.draw(|f| draw_busy(f, "fetching news…"));
         let engine = Engine::new(&cfg)?;
-        let mut app = App::new(cfg, engine);
-        app.event_loop(&mut terminal)
+        App::new(cfg, engine).event_loop(&mut terminal)
     })();
     ratatui::restore();
     result
 }
 
-enum View {
-    Answer(Box<RunResult>),
-    Report(String),
-    Empty,
+struct Turn {
+    question: String,
+    result: RunResult,
+}
+
+struct Chat {
+    title: String,
+    turns: Vec<Turn>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    Input,
+    Settings,
 }
 
 struct App {
     cfg: RunConfig,
     engine: Engine,
+    chats: Vec<Chat>,
+    chat_idx: usize,
+    input: String,
+    focus: Focus,
     selected: usize,
     stop_idx: usize,
-    preset_idx: usize,
-    view: View,
+    report: Option<String>,
     status: String,
     scroll: u16,
     show_raw: bool,
-    /// Set when a source/window change means the fetched material is out of date.
     news_dirty: bool,
     quit: bool,
 }
 
 impl App {
     fn new(cfg: RunConfig, engine: Engine) -> App {
-        let stop_idx = STOP_CHOICES
-            .iter()
-            .position(|c| c.iter().map(|s| s.to_string()).collect::<Vec<_>>() == cfg.stop)
-            .unwrap_or(0);
+        let stop_idx = stop_index(&cfg);
         App {
-            preset_idx: matching_preset_idx(&cfg).unwrap_or(0),
             cfg,
             engine,
+            chats: vec![Chat {
+                title: "New chat".into(),
+                turns: Vec::new(),
+            }],
+            chat_idx: 0,
+            input: String::new(),
+            focus: Focus::Input,
             selected: 0,
             stop_idx,
-            view: View::Empty,
-            status: "Enter — run · c — compare all presets · q to quit".into(),
+            report: None,
+            status: "Type a request and press Enter".into(),
             scroll: 0,
             show_raw: false,
             news_dirty: false,
@@ -106,7 +112,6 @@ impl App {
             terminal
                 .draw(|f| self.draw(f))
                 .map_err(|e| format!("draw failed: {e}"))?;
-
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 continue;
             }
@@ -116,109 +121,142 @@ impl App {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('n') => self.new_chat(),
+                    KeyCode::Left => self.switch_chat(-1),
+                    KeyCode::Right => self.switch_chat(1),
+                    KeyCode::Char('q') => self.quit = true,
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected = (self.selected + ROWS.len() - 1) % ROWS.len();
+                KeyCode::Esc => self.quit = true,
+                KeyCode::Tab => {
+                    self.focus = if self.focus == Focus::Input {
+                        Focus::Settings
+                    } else {
+                        Focus::Input
+                    }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selected = (self.selected + 1) % ROWS.len();
+                KeyCode::Enter if !self.input.trim().is_empty() => self.generate(terminal),
+                KeyCode::Backspace if self.focus == Focus::Input => {
+                    self.input.pop();
                 }
-                KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => self.adjust(1),
-                KeyCode::Char('r') => {
+                KeyCode::Char(c) if self.focus == Focus::Input => self.input.push(c),
+                KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Settings => {
+                    self.selected = (self.selected + ROWS.len() - 1) % ROWS.len()
+                }
+                KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Settings => {
+                    self.selected = (self.selected + 1) % ROWS.len()
+                }
+                KeyCode::Left | KeyCode::Char('h') if self.focus == Focus::Settings => {
+                    self.adjust(-1)
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ')
+                    if self.focus == Focus::Settings =>
+                {
+                    self.adjust(1)
+                }
+                KeyCode::Char('r') if self.focus == Focus::Settings => {
                     self.show_raw = !self.show_raw;
                     self.scroll = 0;
                 }
-                KeyCode::Char('f') => self.refetch(terminal),
+                KeyCode::Char('f') if self.focus == Focus::Settings => self.refetch(terminal),
+                KeyCode::Char('c') if self.focus == Focus::Settings => self.run_compare(terminal),
                 KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
                 KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
                 KeyCode::Home => self.scroll = 0,
-                KeyCode::Enter => self.generate(terminal),
-                KeyCode::Char('c') => self.run_compare(terminal),
                 _ => {}
             }
         }
         Ok(())
     }
 
-    // ---- settings -------------------------------------------------------
+    fn new_chat(&mut self) {
+        self.chats.push(Chat {
+            title: format!("Chat {}", self.chats.len() + 1),
+            turns: Vec::new(),
+        });
+        self.chat_idx = self.chats.len() - 1;
+        self.input.clear();
+        self.report = None;
+        self.scroll = 0;
+        self.focus = Focus::Input;
+        self.status = "New chat created".into();
+    }
+
+    fn switch_chat(&mut self, delta: i32) {
+        self.chat_idx = (self.chat_idx as i32 + delta).rem_euclid(self.chats.len() as i32) as usize;
+        self.report = None;
+        self.scroll = 0;
+        self.status = format!("Switched to {}", self.chats[self.chat_idx].title);
+    }
 
     fn value(&self, row: usize) -> String {
         match row {
-            0 => matching_preset_idx(&self.cfg)
-                .map(|i| PRESETS[i].name.to_string())
-                .unwrap_or_else(|| "custom".into()),
-            1 => self.cfg.format.to_string(),
-            2 => if self.cfg.thinking { "on" } else { "off" }.into(),
-            3 => self
+            0 => self.cfg.format.to_string(),
+            1 => if self.cfg.thinking { "on" } else { "off" }.into(),
+            2 => self
                 .cfg
                 .max_tokens
-                .map(|n| n.to_string())
+                .map(format_tokens)
                 .unwrap_or_else(|| "off".into()),
-            4 => self
+            3 => self
                 .cfg
                 .max_items
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "off".into()),
-            5 => display_stops(&self.cfg.stop),
-            6 => self.cfg.runs.to_string(),
-            7 => self.cfg.source.label().to_string(),
-            8 => self.cfg.since_hours.to_string(),
-            9 => self.cfg.limit.to_string(),
+            4 => display_stops(&self.cfg.stop),
+            5 => self.cfg.source.label().to_string(),
+            6 => self.cfg.since_hours.to_string(),
+            7 => self.cfg.limit.to_string(),
             _ => String::new(),
         }
     }
 
     fn adjust(&mut self, delta: i32) {
         match self.selected {
-            0 => {
-                let n = PRESETS.len() as i32;
-                self.preset_idx = (self.preset_idx as i32 + delta).rem_euclid(n) as usize;
-                let name = PRESETS[self.preset_idx].name;
-                let _ = apply_preset(&mut self.cfg, name);
-                self.stop_idx = STOP_CHOICES
+            0 => self.cfg.format = self.cfg.format.cycle(delta),
+            1 => self.cfg.thinking = !self.cfg.thinking,
+            2 => {
+                let current = TOKEN_CHOICES
                     .iter()
-                    .position(|c| {
-                        c.iter().map(|s| s.to_string()).collect::<Vec<_>>() == self.cfg.stop
-                    })
-                    .unwrap_or(0);
-                self.status = format!("preset `{name}`: {}", PRESETS[self.preset_idx].blurb);
+                    .position(|v| *v == self.cfg.max_tokens)
+                    .unwrap_or(0) as i32;
+                self.cfg.max_tokens = TOKEN_CHOICES
+                    [(current + delta).rem_euclid(TOKEN_CHOICES.len() as i32) as usize];
             }
-            1 => self.cfg.format = self.cfg.format.cycle(delta),
-            2 => self.cfg.thinking = !self.cfg.thinking,
-            3 => self.cfg.max_tokens = step_opt(self.cfg.max_tokens, delta * 50, 50, 4000),
-            4 => {
+            3 => {
                 self.cfg.max_items =
                     step_opt(self.cfg.max_items.map(|n| n as u32), delta, 1, 30).map(|n| n as usize)
             }
-            5 => {
-                let n = STOP_CHOICES.len() as i32;
-                self.stop_idx = (self.stop_idx as i32 + delta).rem_euclid(n) as usize;
+            4 => {
+                self.stop_idx =
+                    (self.stop_idx as i32 + delta).rem_euclid(STOP_CHOICES.len() as i32) as usize;
                 self.cfg.stop = STOP_CHOICES[self.stop_idx]
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
             }
-            6 => self.cfg.runs = (self.cfg.runs as i32 + delta).clamp(1, 20) as u32,
-            7 => {
+            5 => {
                 self.cfg.source = self.cfg.source.cycle(delta);
                 self.news_dirty = true;
             }
-            8 => {
+            6 => {
                 self.cfg.since_hours =
                     (self.cfg.since_hours as i64 + delta as i64 * 12).clamp(6, 24 * 60) as u64;
                 self.news_dirty = true;
             }
-            9 => {
+            7 => {
                 self.cfg.limit = (self.cfg.limit as i32 + delta).clamp(1, 60) as usize;
                 self.news_dirty = true;
             }
             _ => {}
         }
     }
-
-    // ---- actions --------------------------------------------------------
 
     fn refetch(&mut self, terminal: &mut DefaultTerminal) {
         let _ = terminal.draw(|f| draw_busy(f, "fetching news…"));
@@ -233,15 +271,31 @@ impl App {
     }
 
     fn generate(&mut self, terminal: &mut DefaultTerminal) {
-        if self.news_dirty {
-            self.refetch(terminal);
+        let question = self.input.trim().to_string();
+        self.cfg.question = question.clone();
+        let _ = terminal.draw(|f| draw_busy(f, "searching news for your query…"));
+        match Engine::new(&self.cfg) {
+            Ok(engine) => {
+                self.engine = engine;
+                self.news_dirty = false;
+            }
+            Err(e) => {
+                self.status = format!("search failed: {e}");
+                return;
+            }
         }
-        let _ = terminal.draw(|f| draw_busy(f, "generating…"));
+        let _ = terminal.draw(|f| draw_busy(f, "model is thinking…"));
         match self.engine.run_once(&self.cfg) {
-            Ok(res) => {
-                self.status = summarize(&res);
-                self.view = View::Answer(Box::new(res));
-                self.scroll = 0;
+            Ok(result) => {
+                self.status = summarize(&result);
+                let chat = &mut self.chats[self.chat_idx];
+                if chat.turns.is_empty() {
+                    chat.title = question.chars().take(24).collect();
+                }
+                chat.turns.push(Turn { question, result });
+                self.input.clear();
+                self.report = None;
+                self.scroll = u16::MAX;
             }
             Err(e) => self.status = format!("request failed: {e}"),
         }
@@ -251,93 +305,121 @@ impl App {
         if self.news_dirty {
             self.refetch(terminal);
         }
-        let presets: Vec<String> = preset_names().iter().map(|s| s.to_string()).collect();
+        let presets = vec!["baseline".to_string(), "strict".to_string()];
         let out_dir = compare::default_out_dir();
-        let cfg = self.cfg.clone();
-
-        let result = {
-            let engine = &self.engine;
-            compare::compare(engine, &cfg, &presets, Some(&out_dir), |name, i, n| {
-                let _ = terminal.draw(|f| {
-                    draw_busy(f, &format!("comparing `{name}` — run {i}/{n}"));
-                });
-            })
-        };
-
+        let mut cfg = self.cfg.clone();
+        cfg.runs = 1;
+        let result = compare::compare(
+            &self.engine,
+            &cfg,
+            &presets,
+            Some(&out_dir),
+            |name, i, n| {
+                let _ =
+                    terminal.draw(|f| draw_busy(f, &format!("comparing `{name}` — run {i}/{n}")));
+            },
+        );
         match result {
             Ok(reports) => {
                 let text = compare::render_report(&self.engine, &cfg, &reports);
                 let _ = std::fs::write(out_dir.join("report.md"), &text);
-                self.status = format!("comparison saved to {}", out_dir.display());
-                self.view = View::Report(text);
+                self.status = format!("2-bot comparison saved to {}", out_dir.display());
+                self.report = Some(text);
                 self.scroll = 0;
             }
             Err(e) => self.status = format!("comparison failed: {e}"),
         }
     }
 
-    // ---- rendering ------------------------------------------------------
+    fn last_result(&self) -> Option<&RunResult> {
+        self.chats
+            .get(self.chat_idx)?
+            .turns
+            .last()
+            .map(|t| &t.result)
+    }
 
     fn draw(&self, f: &mut Frame) {
-        let [header, body, footer] = Layout::vertical([
+        let [header, body, input, footer] = Layout::vertical([
             Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(3),
+            Constraint::Length(3),
         ])
         .areas(f.area());
         let [left, right] =
             Layout::horizontal([Constraint::Length(34), Constraint::Min(0)]).areas(body);
         let [metrics, output] =
-            Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(right);
-
+            Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(right);
         self.draw_header(f, header);
         self.draw_settings(f, left);
         self.draw_metrics(f, metrics);
         self.draw_output(f, output);
+        let input_style = if self.focus == Focus::Input {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        f.render_widget(
+            Paragraph::new(self.input.as_str())
+                .style(input_style)
+                .block(Block::bordered().title(" message (Tab switches focus) ")),
+            input,
+        );
         self.draw_footer(f, footer);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", self.engine.topic.map(|t| t.title).unwrap_or("ask")),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(self.cfg.constraints(), Style::default().fg(Color::Yellow)),
-        ]);
+        let tabs = self
+            .chats
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == self.chat_idx {
+                    format!("[{}]", c.title)
+                } else {
+                    c.title.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
         f.render_widget(
-            Paragraph::new(line).block(Block::bordered().title(" ask — response control ")),
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " ask chat ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(tabs),
+            ]))
+            .block(Block::bordered()),
             area,
         );
     }
 
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = ROWS
+        let items = ROWS
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                let selected = i == self.selected;
-                let marker = if selected { "▸ " } else { "  " };
-                let style = if selected {
-                    Style::default().add_modifier(Modifier::BOLD)
+                let marker = if self.focus == Focus::Settings && i == self.selected {
+                    "▸ "
                 } else {
-                    Style::default()
+                    "  "
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{marker}{name:<11}"), style),
+                    Span::raw(format!("{marker}{name:<11}")),
                     Span::styled(self.value(i), Style::default().fg(Color::Green)),
                 ]))
             })
-            .collect();
-
+            .collect::<Vec<_>>();
         let mut state = ListState::default();
         state.select(Some(self.selected));
         f.render_stateful_widget(
-            List::new(items).block(Block::bordered().title(" settings (←/→ to change) ")),
+            List::new(items).block(Block::bordered().title(" settings ")),
             area,
             &mut state,
         );
@@ -345,42 +427,24 @@ impl App {
 
     fn draw_metrics(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![Line::from(format!("material: {}", self.engine.news_note))];
-        if self.news_dirty {
-            lines.push(Line::styled(
-                "source changed — press f to refetch",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        match &self.view {
-            View::Answer(res) => {
-                let u = &res.outcome.usage;
-                lines.push(Line::from(format!(
-                    "finish: {}   latency: {} ms",
-                    res.outcome.finish_reason.as_deref().unwrap_or("?"),
-                    res.outcome.latency_ms
-                )));
-                lines.push(Line::from(format!(
-                    "tokens: prompt {} · completion {} · reasoning {}",
-                    u.prompt_tokens, u.completion_tokens, u.reasoning_tokens
-                )));
-                lines.push(status_line(
-                    "JSON parses",
-                    res.json_ok(),
-                    self.cfg.format.expects_json(),
-                ));
-                lines.push(status_line("schema matches", res.schema_ok(), true));
-                if let Some(n) = res.item_count() {
-                    lines.push(Line::from(format!("items in answer: {n}")));
-                }
-                if let Some(e) = &res.json_error {
-                    lines.push(Line::styled(
-                        format!("json error: {e}"),
-                        Style::default().fg(Color::Red),
-                    ));
-                }
-            }
-            View::Report(_) => lines.push(Line::from("comparison report in the panel below")),
-            View::Empty => lines.push(Line::from("press Enter to generate")),
+        if let Some(res) = self.last_result() {
+            let u = &res.outcome.usage;
+            lines.push(Line::from(format!(
+                "finish: {} · {} ms",
+                res.outcome.finish_reason.as_deref().unwrap_or("?"),
+                res.outcome.latency_ms
+            )));
+            lines.push(Line::from(format!(
+                "tokens: prompt {} · completion {} · reasoning {}",
+                u.prompt_tokens, u.completion_tokens, u.reasoning_tokens
+            )));
+            lines.push(Line::from(format!(
+                "JSON: {} · schema: {}",
+                yesno(res.json_ok()),
+                yesno(res.schema_ok())
+            )));
+        } else {
+            lines.push(Line::from("No messages yet"));
         }
         f.render_widget(
             Paragraph::new(lines)
@@ -391,31 +455,43 @@ impl App {
     }
 
     fn draw_output(&self, f: &mut Frame, area: Rect) {
-        let (title, body) = match &self.view {
-            View::Answer(res) => {
-                let text = if self.show_raw {
-                    serde_json::to_string_pretty(&res.outcome.raw).unwrap_or_default()
-                } else if let Some(v) = &res.json {
-                    serde_json::to_string_pretty(v).unwrap_or_default()
+        let (title, body) = if let Some(report) = &self.report {
+            (" baseline vs strict JSON ", report.clone())
+        } else {
+            let mut body = String::new();
+            for turn in &self.chats[self.chat_idx].turns {
+                body.push_str(&format!("YOU\n{}\n\n", turn.question));
+                if self.show_raw {
+                    body.push_str(
+                        &serde_json::to_string_pretty(&turn.result.outcome.raw).unwrap_or_default(),
+                    );
                 } else {
-                    let t = res.outcome.text().to_string();
-                    if t.is_empty() {
-                        "(no content — generation stopped before any visible token)".into()
-                    } else {
-                        t
+                    if let Some(reasoning) = turn
+                        .result
+                        .outcome
+                        .reasoning
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        body.push_str(&format!("MODEL · THINKING\n{}\n\n", reasoning.trim()));
                     }
-                };
-                (
-                    if self.show_raw {
-                        " raw response (r) "
+                    body.push_str("MODEL · FINAL\n");
+                    if let Some(json) = &turn.result.json {
+                        body.push_str(&serde_json::to_string_pretty(json).unwrap_or_default());
                     } else {
-                        " answer (r for raw) "
-                    },
-                    text,
-                )
+                        body.push_str(turn.result.outcome.text());
+                    }
+                }
+                body.push_str("\n\n────────────────────────\n\n");
             }
-            View::Report(text) => (" comparison ", text.clone()),
-            View::Empty => (" answer ", String::new()),
+            (
+                if self.show_raw {
+                    " raw conversation "
+                } else {
+                    " conversation: thinking + final "
+                },
+                body,
+            )
         };
         f.render_widget(
             Paragraph::new(body)
@@ -427,51 +503,53 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let keys = "↑↓ select · ←→ change · Enter run · c compare · f refetch · r raw · PgUp/PgDn scroll · q quit";
-        let lines = vec![
-            Line::styled(self.status.clone(), Style::default().fg(Color::Cyan)),
-            Line::styled(keys, Style::default().fg(Color::DarkGray)),
-        ];
-        f.render_widget(Paragraph::new(lines).block(Block::bordered()), area);
+        let keys = "Enter send · Tab input/settings · Ctrl-N new · Ctrl-←/→ chats · c compare · r raw · PgUp/PgDn · Esc quit";
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::styled(self.status.clone(), Style::default().fg(Color::Cyan)),
+                Line::styled(keys, Style::default().fg(Color::DarkGray)),
+            ]),
+            area,
+        );
     }
 }
 
-fn status_line(label: &str, ok: bool, applicable: bool) -> Line<'static> {
-    if !applicable {
-        return Line::from(format!("{label}: n/a"));
-    }
-    let (mark, color) = if ok {
-        ("yes", Color::Green)
+fn format_tokens(n: u32) -> String {
+    if n.is_multiple_of(1024) {
+        format!("{}k", n / 1024)
     } else {
-        ("no", Color::Red)
-    };
-    Line::from(vec![
-        Span::raw(format!("{label}: ")),
-        Span::styled(mark, Style::default().fg(color)),
-    ])
+        n.to_string()
+    }
 }
-
+fn yesno(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+fn stop_index(cfg: &RunConfig) -> usize {
+    STOP_CHOICES
+        .iter()
+        .position(|c| c.iter().map(|s| s.to_string()).collect::<Vec<_>>() == cfg.stop)
+        .unwrap_or(0)
+}
 fn summarize(res: &RunResult) -> String {
-    let mut parts = vec![format!(
+    let mut s = format!(
         "finish={}",
         res.outcome.finish_reason.as_deref().unwrap_or("?")
-    )];
+    );
     if res.outcome.truncated() {
-        parts.push("truncated by max_tokens".into());
+        s.push_str(" · token budget exhausted; answer may be incomplete");
+    } else if res.json_ok() {
+        s.push_str(" · required JSON completed");
     }
-    if let Some(e) = &res.json_error {
-        parts.push(format!("json error: {e}"));
-    } else if !res.schema_errors.is_empty() {
-        parts.push(format!("{} schema violation(s)", res.schema_errors.len()));
-    }
-    parts.join(" · ")
+    s
 }
-
 fn draw_busy(f: &mut Frame, msg: &str) {
     let area = f.area();
-    let block = Block::bordered().title(" working ");
     f.render_widget(
-        Paragraph::new(msg).block(block),
+        Paragraph::new(msg).block(Block::bordered().title(" working ")),
         Rect {
             x: area.x,
             y: area.y + area.height / 2,
@@ -480,21 +558,6 @@ fn draw_busy(f: &mut Frame, msg: &str) {
         },
     );
 }
-
-/// Which named preset, if any, matches the knobs currently on `cfg`.
-fn matching_preset_idx(cfg: &RunConfig) -> Option<usize> {
-    PRESETS.iter().position(|p| {
-        let mut probe = RunConfig::default();
-        let _ = apply_preset(&mut probe, p.name);
-        probe.format == cfg.format
-            && probe.max_tokens == cfg.max_tokens
-            && probe.max_items == cfg.max_items
-            && probe.stop == cfg.stop
-            && probe.thinking == cfg.thinking
-    })
-}
-
-/// `off -> min -> …` stepping used by the numeric rows, where 0 means "not set".
 fn step_opt(current: Option<u32>, delta: i32, min: u32, max: u32) -> Option<u32> {
     match current {
         None if delta > 0 => Some(min.max(delta as u32)),
@@ -507,5 +570,17 @@ fn step_opt(current: Option<u32>, delta: i32, min: u32, max: u32) -> Option<u32>
                 Some((next as u32).min(max))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn token_choices_are_requested_fixed_budgets() {
+        assert_eq!(
+            TOKEN_CHOICES,
+            &[None, Some(8192), Some(16384), Some(33792), Some(65536)]
+        );
     }
 }

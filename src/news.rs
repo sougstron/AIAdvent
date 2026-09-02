@@ -74,7 +74,12 @@ pub fn fmt_date(ts: i64) -> String {
 }
 
 /// Fetches items newer than `since_hours`, newest first, capped at `limit`.
-pub fn fetch(source: Source, since_hours: u64, limit: usize) -> Res<Vec<NewsItem>> {
+pub fn fetch(
+    source: Source,
+    since_hours: u64,
+    limit: usize,
+    query: Option<&str>,
+) -> Res<Vec<NewsItem>> {
     let cutoff = now_unix() - (since_hours as i64) * 3600;
     let mut items = Vec::new();
     let mut errors = Vec::new();
@@ -86,7 +91,7 @@ pub fn fetch(source: Source, since_hours: u64, limit: usize) -> Res<Vec<NewsItem
         }
     }
     if matches!(source, Source::Hn | Source::Both) {
-        match fetch_hn(cutoff) {
+        match fetch_hn(cutoff, query.unwrap_or("game development")) {
             Ok(mut v) => items.append(&mut v),
             Err(e) => errors.push(format!("hn: {e}")),
         }
@@ -94,6 +99,17 @@ pub fn fetch(source: Source, since_hours: u64, limit: usize) -> Res<Vec<NewsItem
 
     if items.is_empty() && !errors.is_empty() {
         return Err(errors.join("; "));
+    }
+    if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
+        let terms: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
+        items.retain(|item| {
+            if item.source != "steam" {
+                return true; // HN already applied the query server-side.
+            }
+            let haystack =
+                format!("{} {} {}", item.subject, item.title, item.summary).to_lowercase();
+            terms.iter().any(|term| haystack.contains(term))
+        });
     }
     items.sort_by(|a, b| b.published.cmp(&a.published));
     items.truncate(limit);
@@ -154,13 +170,12 @@ fn fetch_steam(cutoff: i64) -> Res<Vec<NewsItem>> {
     Ok(out)
 }
 
-fn fetch_hn(cutoff: i64) -> Res<Vec<NewsItem>> {
-    let url = format!(
-        "https://hn.algolia.com/api/v1/search_by_date\
-         ?tags=story&hitsPerPage=25&numericFilters=created_at_i>{cutoff}\
-         &query=game%20development"
-    );
-    let body: Value = ureq::get(&url)
+fn fetch_hn(cutoff: i64, query: &str) -> Res<Vec<NewsItem>> {
+    let body: Value = ureq::get("https://hn.algolia.com/api/v1/search_by_date")
+        .query("tags", "story")
+        .query("hitsPerPage", "25")
+        .query("numericFilters", &format!("created_at_i>{cutoff}"))
+        .query("query", query)
         .timeout(std::time::Duration::from_secs(20))
         .call()
         .map_err(|e| e.to_string())?
