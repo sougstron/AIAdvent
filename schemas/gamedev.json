@@ -1,0 +1,51 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["period", "generated_at", "headline", "items", "top_pick"],
+  "properties": {
+    "period": {
+      "type": "string",
+      "description": "Time window covered by the digest, e.g. 'last 72 hours'"
+    },
+    "generated_at": {
+      "type": "string",
+      "description": "UTC timestamp of the digest, format YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "headline": {
+      "type": "string",
+      "description": "One sentence summarising the whole period"
+    },
+    "items": {
+      "type": "array",
+      "description": "The news entries, most important first",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "game", "studio", "platforms", "category", "date", "summary", "hype_score"],
+        "properties": {
+          "title": { "type": "string" },
+          "game": { "type": "string" },
+          "studio": { "type": "string" },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["pc", "playstation", "xbox", "switch", "mobile", "vr", "web", "unknown"]
+            }
+          },
+          "category": {
+            "type": "string",
+            "enum": ["release", "update", "patch", "announcement", "event", "business", "tech", "other"]
+          },
+          "date": { "type": "string" },
+          "summary": { "type": "string" },
+          "hype_score": { "type": "integer", "minimum": 1, "maximum": 10 }
+        }
+      }
+    },
+    "top_pick": {
+      "type": "string",
+      "description": "Title of the single most notable item"
+    }
+  }
+}
