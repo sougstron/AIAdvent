@@ -2,7 +2,11 @@
 //! input line, and slash commands for sessions, effort, JSON mode, length
 //! and stop-condition settings.
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -37,6 +41,9 @@ const COMMANDS: &[&str] = &[
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
 const SPINNER_FRAMES: &[&str] = &["/", "-", "\\", "-"];
+/// Maximum visible content rows of the input box; the box grows from 1 to
+/// this many rows as the wrapped text gets longer, then scrolls internally.
+const MAX_INPUT_LINES: usize = 4;
 /// Default cast for `/personas` when the user doesn't supply their own list.
 const DEFAULT_PERSONAS: &[&str] = &["physicist", "philosopher", "mathematician"];
 
@@ -63,7 +70,20 @@ pub fn run(settings: Settings) -> Res<()> {
         let _ = ratatui::try_restore();
         format!("cannot start TUI: {e}")
     })?;
+    // Mouse capture for wheel scrolling; kitty keyboard flags so Shift+Enter
+    // arrives as Enter+SHIFT instead of a plain Enter (terminals without
+    // support ignore the push and Shift+Enter degrades to Enter).
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let result = App::new(ep, settings).event_loop(&mut terminal);
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture
+    );
     ratatui::restore();
     result
 }
@@ -88,9 +108,18 @@ struct App {
     sessions_dir: PathBuf,
     entries: Vec<Entry>,
     input: String,
+    /// Cursor position inside `input`, in chars (not bytes).
+    cursor: usize,
+    /// First visual (wrapped) input line shown when the text needs more than
+    /// the 4 visible rows of the input box.
+    input_scroll: usize,
     focus: Focus,
     status: String,
     scroll: u16,
+    /// While true, newly appended transcript content keeps the view pinned to
+    /// the bottom; any manual scroll up clears it until the user scrolls
+    /// back down to the last line.
+    follow: bool,
     settings_selected: usize,
     sessions_list: Vec<SessionSummary>,
     sessions_selected: usize,
@@ -114,9 +143,12 @@ impl App {
             sessions_dir: session::sessions_dir(),
             entries: Vec::new(),
             input: String::new(),
+            cursor: 0,
+            input_scroll: 0,
             focus: Focus::Input,
             status: "Type a message and press Enter · /help for commands".into(),
             scroll: 0,
+            follow: true,
             settings_selected: 0,
             sessions_list: Vec::new(),
             sessions_selected: 0,
@@ -136,37 +168,67 @@ impl App {
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 continue;
             }
-            let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Char('n') => self.new_chat(),
-                    KeyCode::Char('q') => self.quit = true,
-                    _ => {}
-                }
-                continue;
-            }
-
-            match self.focus {
-                Focus::Input => self.handle_input_key(key.code, terminal),
-                Focus::Settings => self.handle_settings_key(key.code),
-                Focus::Sessions => self.handle_sessions_key(key.code, terminal),
+            match event::read().map_err(|e| e.to_string())? {
+                Event::Key(key) => self.handle_key(key, terminal),
+                Event::Mouse(mouse) => self.handle_mouse(mouse.kind, terminal),
+                _ => continue,
             }
         }
         Ok(())
     }
 
-    fn handle_input_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) {
+    fn handle_key(&mut self, key: KeyEvent, terminal: &mut DefaultTerminal) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('n') => self.new_chat(),
+                KeyCode::Char('q') => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+
+        match self.focus {
+            Focus::Input => self.handle_input_key(key, terminal),
+            Focus::Settings => self.handle_settings_key(key.code),
+            Focus::Sessions => self.handle_sessions_key(key.code, terminal),
+        }
+    }
+
+    /// Mouse wheel scrolls the transcript regardless of which panel has
+    /// focus (3 lines per tick).
+    fn handle_mouse(&mut self, kind: MouseEventKind, terminal: &DefaultTerminal) {
+        match kind {
+            MouseEventKind::ScrollUp => {
+                let max = self.max_scroll(terminal);
+                self.set_scroll(self.scroll.min(max).saturating_sub(3), max);
+            }
+            MouseEventKind::ScrollDown => {
+                let max = self.max_scroll(terminal);
+                self.set_scroll(self.scroll.min(max).saturating_add(3), max);
+            }
+            _ => {}
+        }
+    }
+
+    /// Sets the transcript scroll offset, clamped to `max`, and refreshes
+    /// `follow`: pinned only when the view sits exactly at the last page, so
+    /// any manual scroll up detaches from incoming content and scrolling
+    /// back to the bottom re-attaches.
+    fn set_scroll(&mut self, scroll: u16, max: u16) {
+        self.scroll = scroll.min(max);
+        self.follow = self.scroll >= max;
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent, terminal: &mut DefaultTerminal) {
         // The command popup only hijacks the arrow keys; Char/Backspace/Enter/
         // Tab/Esc fall through unchanged so typing and the existing bindings
         // keep working while the popup is open.
         if self.command_popup_active() {
-            match code {
+            match key.code {
                 KeyCode::Up => {
                     self.move_command_selection(-1);
                     return;
@@ -187,14 +249,22 @@ impl App {
             }
         }
 
-        match code {
+        let width = terminal.size().map(|s| s.width).unwrap_or(80);
+        match key.code {
             KeyCode::Esc => self.quit = true,
             KeyCode::Tab => {
                 self.focus = Focus::Settings;
                 self.settings_selected = 0;
             }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.insert_char('\n');
+                self.cmd_selected = 0;
+                self.sync_input_scroll(width);
+            }
             KeyCode::Enter if !self.input.trim().is_empty() => {
                 let line = std::mem::take(&mut self.input);
+                self.cursor = 0;
+                self.input_scroll = 0;
                 self.cmd_popup_dismissed = false;
                 self.cmd_selected = 0;
                 if let Some(cmd) = line.trim().strip_prefix('/') {
@@ -204,24 +274,123 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                self.delete_char_before();
                 if self.input.is_empty() {
                     self.cmd_popup_dismissed = false;
                 }
                 self.cmd_selected = 0;
+                self.sync_input_scroll(width);
+            }
+            KeyCode::Delete => {
+                self.delete_char_at();
+                self.cmd_selected = 0;
+                self.sync_input_scroll(width);
             }
             KeyCode::Char(c) => {
-                self.input.push(c);
+                self.insert_char(c);
                 self.cmd_selected = 0;
+                self.sync_input_scroll(width);
             }
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::Left => {
+                self.cursor = self.cursor.saturating_sub(1);
+                self.sync_input_scroll(width);
+            }
+            KeyCode::Right => {
+                let len = self.input.chars().count();
+                if self.cursor < len {
+                    self.cursor += 1;
+                }
+                self.sync_input_scroll(width);
+            }
+            // Up/Down walk the cursor through the wrapped input lines; once
+            // it is already on the first/last line (or the input is a single
+            // line), the key scrolls the transcript instead.
+            KeyCode::Up => {
+                match move_cursor_line(&input_lines(&self.input, width), self.cursor, -1) {
+                    Some(pos) => {
+                        self.cursor = pos;
+                        self.sync_input_scroll(width);
+                    }
+                    None => {
+                        let max = self.max_scroll(terminal);
+                        self.set_scroll(self.scroll.min(max).saturating_sub(1), max);
+                    }
+                }
+            }
+            KeyCode::Down => {
+                match move_cursor_line(&input_lines(&self.input, width), self.cursor, 1) {
+                    Some(pos) => {
+                        self.cursor = pos;
+                        self.sync_input_scroll(width);
+                    }
+                    None => {
+                        let max = self.max_scroll(terminal);
+                        self.set_scroll(self.scroll.min(max).saturating_add(1), max);
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                let max = self.max_scroll(terminal);
+                self.set_scroll(self.scroll.min(max).saturating_sub(10), max);
+            }
             KeyCode::PageDown => {
                 let max = self.max_scroll(terminal);
-                self.scroll = self.scroll.saturating_add(10).min(max);
+                self.set_scroll(self.scroll.min(max).saturating_add(10), max);
             }
-            KeyCode::Home => self.scroll = 0,
+            KeyCode::Home => self.set_scroll(0, self.max_scroll(terminal)),
+            KeyCode::End => {
+                let max = self.max_scroll(terminal);
+                self.set_scroll(max, max);
+            }
             _ => {}
         }
+    }
+
+    /// Inserts `c` at the cursor (which is a char offset; the `String` API
+    /// wants a byte offset).
+    fn insert_char(&mut self, c: char) {
+        let byte = byte_pos(&self.input, self.cursor);
+        self.input.insert(byte, c);
+        self.cursor += 1;
+    }
+
+    fn delete_char_before(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let from = byte_pos(&self.input, self.cursor - 1);
+        let to = byte_pos(&self.input, self.cursor);
+        self.input.drain(from..to);
+        self.cursor -= 1;
+    }
+
+    fn delete_char_at(&mut self) {
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
+        let from = byte_pos(&self.input, self.cursor);
+        let to = byte_pos(&self.input, self.cursor + 1);
+        self.input.drain(from..to);
+    }
+
+    /// The input box grows with the wrapped text, from 1 to 4 content rows
+    /// (plus its two borders); longer text scrolls inside those 4 rows.
+    fn input_box_height(&self, width: u16) -> u16 {
+        input_lines(&self.input, width).len().clamp(1, MAX_INPUT_LINES) as u16 + 2
+    }
+
+    /// Keeps the cursor's visual row inside the visible input window after
+    /// any edit or cursor move.
+    fn sync_input_scroll(&mut self, width: u16) {
+        let lines = input_lines(&self.input, width);
+        let (row, _) = cursor_visual_pos(&lines, self.cursor);
+        let view = MAX_INPUT_LINES.min(lines.len().max(1));
+        if row < self.input_scroll {
+            self.input_scroll = row;
+        } else if row >= self.input_scroll + view {
+            self.input_scroll = row + 1 - view;
+        }
+        self.input_scroll = self.input_scroll.min(lines.len().saturating_sub(view));
     }
 
     /// Whether the input line is currently in "/" command-selection mode:
@@ -343,6 +512,7 @@ impl App {
         self.session = Session::new(self.settings.clone());
         self.entries.clear();
         self.scroll = 0;
+        self.follow = true;
         self.focus = Focus::Input;
         self.status = "New chat".into();
     }
@@ -631,7 +801,9 @@ impl App {
         let mut frame = 0usize;
         loop {
             self.spinner = Some((label.to_string(), SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]));
-            self.scroll_to_bottom(terminal);
+            if self.follow {
+                self.scroll_to_bottom(terminal);
+            }
             let _ = terminal.draw(|f| self.draw(f));
             match rx.recv_timeout(Duration::from_millis(110)) {
                 Ok(v) => {
@@ -675,6 +847,7 @@ impl App {
     fn send_message(&mut self, question: String, terminal: &mut DefaultTerminal) {
         self.session.push_user(question.clone());
         self.entries.push(Entry::User(question));
+        self.follow = true;
         let history = self.session.history();
 
         // JSON mode stays on the blocking path: streamed fragments of a JSON
@@ -751,7 +924,9 @@ impl App {
         let mut frame = 0usize;
         loop {
             self.spinner = Some(("model is thinking".into(), SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]));
-            self.scroll_to_bottom(terminal);
+            if self.follow {
+                self.scroll_to_bottom(terminal);
+            }
             let _ = terminal.draw(|f| self.draw(f));
             match rx.recv_timeout(Duration::from_millis(110)) {
                 Ok(StreamEvent::Piece(piece)) => {
@@ -829,7 +1004,9 @@ impl App {
             outcome.latency_ms
         );
         self.save_session();
-        self.scroll_to_bottom(terminal);
+        if self.follow {
+            self.scroll_to_bottom(terminal);
+        }
     }
 
     /// Blocking-path variant: no live entry exists yet, so append one first.
@@ -840,26 +1017,18 @@ impl App {
     }
 
     fn draw(&self, f: &mut Frame) {
+        let width = f.area().width;
+        let input_height = self.input_box_height(width);
         let [header, body, input, footer] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(2),
         ])
         .areas(f.area());
         self.draw_header(f, header);
         self.draw_transcript(f, body);
-        let input_style = if self.focus == Focus::Input {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        };
-        f.render_widget(
-            Paragraph::new(self.input.as_str())
-                .style(input_style)
-                .block(Block::bordered().title(" message — /help for commands ")),
-            input,
-        );
+        self.draw_input(f, input, width);
         self.draw_footer(f, footer);
 
         if self.focus == Focus::Settings {
@@ -868,6 +1037,43 @@ impl App {
             self.draw_sessions_overlay(f, body);
         } else if self.focus == Focus::Input && self.command_popup_active() {
             self.draw_command_popup(f, body);
+        }
+    }
+
+    /// Input box: renders only the wrapped lines visible inside the (at most
+    /// 4-row) window and places the text cursor at the cursor offset. The
+    /// same `wrap_input` output drives layout, rendering and cursor math, so
+    /// they cannot drift out of sync.
+    fn draw_input(&self, f: &mut Frame, area: Rect, width: u16) {
+        let input_style = if self.focus == Focus::Input {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        let lines = input_lines(&self.input, width);
+        let view = (area.height.saturating_sub(2)) as usize;
+        let scroll = self
+            .input_scroll
+            .min(lines.len().saturating_sub(view.min(lines.len())));
+        let visible: Vec<Line> = lines
+            .iter()
+            .skip(scroll)
+            .take(view)
+            .map(|(_, text)| Line::raw(text.clone()))
+            .collect();
+        f.render_widget(
+            Paragraph::new(visible)
+                .style(input_style)
+                .block(Block::bordered().title(" message — /help for commands ")),
+            area,
+        );
+        if self.focus == Focus::Input {
+            let (row, col) = cursor_visual_pos(&lines, self.cursor);
+            if row >= scroll && row < scroll + view {
+                let cx = area.x + 1 + (col as u16).min(area.width.saturating_sub(3));
+                let cy = area.y + 1 + (row - scroll) as u16;
+                f.set_cursor_position((cx, cy));
+            }
         }
     }
 
@@ -914,11 +1120,15 @@ impl App {
         body
     }
 
+    /// Draw-time clamp: growing the input box shrinks the transcript area, so
+    /// a stale offset could exceed `max_scroll` — and `Paragraph::scroll`
+    /// clips rather than clamps, which would render a blank pane.
     fn draw_transcript(&self, f: &mut Frame, area: Rect) {
+        let max = self.max_scroll_for(f.area().width, f.area().height);
         f.render_widget(
             Paragraph::new(self.transcript_text())
                 .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0))
+                .scroll((self.scroll.min(max), 0))
                 .block(Block::bordered().title(" conversation ")),
             area,
         );
@@ -929,18 +1139,26 @@ impl App {
     /// every manual or automatic scroll must be capped to this value.
     fn max_scroll(&self, terminal: &DefaultTerminal) -> u16 {
         let Ok(size) = terminal.size() else { return self.scroll };
-        // Mirrors the vertical layout in `draw`: header(3) + input(3) + footer(2).
-        let body_height = size.height.saturating_sub(3 + 3 + 2);
-        let inner_width = size.width.saturating_sub(2); // block borders
+        self.max_scroll_for(size.width, size.height)
+    }
+
+    /// The last-page scroll offset for given frame dimensions (kept separate
+    /// from `max_scroll` so `draw` can clamp without a terminal). Mirrors
+    /// the vertical layout in `draw`: header(3) + input + footer(2).
+    fn max_scroll_for(&self, width: u16, height: u16) -> u16 {
+        let body_height = height.saturating_sub(3 + self.input_box_height(width) + 2);
+        let inner_width = width.saturating_sub(2); // block borders
         let inner_height = body_height.saturating_sub(2); // block borders
         let total_lines =
             Paragraph::new(self.transcript_text()).wrap(Wrap { trim: false }).line_count(inner_width) as u16;
         total_lines.saturating_sub(inner_height)
     }
 
-    /// Scrolls to the true bottom of the wrapped transcript (see `max_scroll`).
+    /// Scrolls to the true bottom of the wrapped transcript (see `max_scroll`)
+    /// and re-pins the view to incoming content.
     fn scroll_to_bottom(&mut self, terminal: &DefaultTerminal) {
         self.scroll = self.max_scroll(terminal);
+        self.follow = true;
     }
 
     fn draw_settings_overlay(&self, f: &mut Frame, area: Rect) {
@@ -1110,6 +1328,143 @@ fn cycle_temperature(current: Option<f32>, delta: i32) -> Option<f32> {
     TEMP_CHOICES[(i + delta).rem_euclid(n) as usize]
 }
 
+/// Byte offset of the char at `char_idx` (`s.len()` when the index is at/past
+/// the end) — bridges the char-offset cursor and the byte-offset `String` API.
+fn byte_pos(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// Inner text width of the input box for a frame of `width` columns.
+fn input_width(width: u16) -> usize {
+    width.saturating_sub(2).max(1) as usize
+}
+
+/// The input text wrapped into visual lines for a frame of `width` columns.
+fn input_lines(input: &str, width: u16) -> Vec<(usize, String)> {
+    wrap_input(input, input_width(width))
+}
+
+/// Greedy word-wrap of the input into visual lines of at most `width`
+/// columns. Returns one entry per visual line: `(start, text)` where `start`
+/// is the char offset of the line's first char, so a char-offset cursor can
+/// be mapped to a (row, col) on screen. Rendering uses these same lines, so
+/// the mapping never drifts out of sync with what the user sees. Words
+/// longer than `width` are hard-split; explicit newlines always break.
+fn wrap_input(input: &str, width: usize) -> Vec<(usize, String)> {
+    let width = width.max(1);
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_start = 0usize;
+    let mut cur_w = 0usize;
+    let mut spaces = 0usize; // spaces between the last committed word and the next
+    let mut word = String::new();
+    let mut word_start = 0usize;
+    let mut i = 0usize;
+    while i <= n {
+        let c = chars.get(i).copied();
+        if let Some(ch) = c {
+            if ch != ' ' && ch != '\n' {
+                if word.is_empty() {
+                    word_start = i;
+                }
+                word.push(ch);
+                i += 1;
+                continue;
+            }
+        }
+        // Word boundary (space, newline, or end of input): commit the word.
+        if !word.is_empty() {
+            let wlen = word.chars().count();
+            let fits = if cur_w == 0 { spaces + wlen <= width } else { cur_w + spaces + wlen <= width };
+            if fits {
+                if cur_w == 0 {
+                    cur_start = word_start.saturating_sub(spaces);
+                }
+                cur.extend(std::iter::repeat_n(' ', spaces));
+                cur.push_str(&word);
+                cur_w += spaces + wlen;
+            } else {
+                // Wrap: the word starts a new line (the buffered spaces at the
+                // break point are not rendered). Nothing to emit when the
+                // current line is still empty (word alone overflows it).
+                if !cur.is_empty() {
+                    lines.push((cur_start, std::mem::take(&mut cur)));
+                }
+                if wlen <= width {
+                    cur_start = word_start;
+                    cur.push_str(&word);
+                    cur_w = wlen;
+                } else {
+                    // Word longer than the whole line: hard-split it.
+                    let mut chunk_start = word_start;
+                    let mut chunk_w = 0usize;
+                    for (k, ch) in word.chars().enumerate() {
+                        if chunk_w == width {
+                            lines.push((chunk_start, std::mem::take(&mut cur)));
+                            chunk_start = word_start + k;
+                            chunk_w = 0;
+                        }
+                        cur.push(ch);
+                        chunk_w += 1;
+                    }
+                    cur_start = chunk_start;
+                    cur_w = chunk_w;
+                }
+            }
+            word.clear();
+            spaces = 0;
+        }
+        match c {
+            Some(' ') => {
+                spaces += 1;
+                i += 1;
+            }
+            Some('\n') => {
+                lines.push((cur_start, std::mem::take(&mut cur)));
+                cur_w = 0;
+                cur_start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    lines.push((cur_start, cur));
+    if lines.is_empty() {
+        lines.push((0, String::new()));
+    }
+    lines
+}
+
+/// Maps a char-offset cursor to its (visual row, column) in `lines` produced
+/// by `wrap_input` (column clamped to the line's length).
+fn cursor_visual_pos(lines: &[(usize, String)], cursor: usize) -> (usize, usize) {
+    let mut row = 0;
+    for (i, (start, _)) in lines.iter().enumerate() {
+        if *start <= cursor {
+            row = i;
+        } else {
+            break;
+        }
+    }
+    let (start, text) = &lines[row];
+    (row, (cursor - start).min(text.chars().count()))
+}
+
+/// Moves the cursor `delta` visual lines from its current row, keeping the
+/// column where possible. Returns `None` when the cursor is already on the
+/// first/last line — the caller turns that case into transcript scrolling.
+fn move_cursor_line(lines: &[(usize, String)], cursor: usize, delta: i32) -> Option<usize> {
+    let (row, col) = cursor_visual_pos(lines, cursor);
+    let target = row as i32 + delta;
+    if target < 0 || target >= lines.len() as i32 {
+        return None;
+    }
+    let (start, text) = &lines[target as usize];
+    Some(*start + col.min(text.chars().count()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,5 +1481,81 @@ mod tests {
         let choices = [None, Some(1u32), Some(2)];
         assert_eq!(cycle_choice(&choices, None, 1), Some(1));
         assert_eq!(cycle_choice(&choices, None, -1), Some(2));
+    }
+    #[test]
+    fn wrap_short_text_is_one_line() {
+        assert_eq!(wrap_input("hello", 10), vec![(0, "hello".to_string())]);
+        assert_eq!(wrap_input("", 10), vec![(0, String::new())]);
+    }
+
+    #[test]
+    fn wrap_breaks_at_word_boundary() {
+        let lines = wrap_input("aaa bbb ccc", 7);
+        assert_eq!(lines, vec![(0, "aaa bbb".to_string()), (8, "ccc".to_string())]);
+    }
+
+    #[test]
+    fn wrap_hard_splits_long_words() {
+        let lines = wrap_input("abcdefgh", 3);
+        assert_eq!(
+            lines,
+            vec![(0, "abc".to_string()), (3, "def".to_string()), (6, "gh".to_string())]
+        );
+    }
+
+    #[test]
+    fn wrap_respects_explicit_newlines() {
+        let lines = wrap_input("ab\ncd\n", 10);
+        assert_eq!(
+            lines,
+            vec![(0, "ab".to_string()), (3, "cd".to_string()), (6, String::new())]
+        );
+    }
+
+    #[test]
+    fn cursor_maps_to_visual_row_and_column() {
+        let lines = wrap_input("aaa bbb ccc", 7);
+        assert_eq!(cursor_visual_pos(&lines, 0), (0, 0));
+        assert_eq!(cursor_visual_pos(&lines, 7), (0, 7)); // end of first row
+        assert_eq!(cursor_visual_pos(&lines, 8), (1, 0)); // start of wrapped word
+        assert_eq!(cursor_visual_pos(&lines, 11), (1, 3)); // end of input
+    }
+
+    #[test]
+    fn cursor_after_shift_enter_starts_new_row() {
+        // Simulates typing "ab" then Shift+Enter: cursor lands at the start
+        // of the freshly created (empty) visual line.
+        let lines = wrap_input("ab\n", 10);
+        assert_eq!(cursor_visual_pos(&lines, 3), (1, 0));
+    }
+
+    #[test]
+    fn move_cursor_line_keeps_column_and_clamps() {
+        // Column is preserved when the target line is long enough…
+        let lines = wrap_input("aaaa\nbbbb", 10);
+        assert_eq!(move_cursor_line(&lines, 3, 1), Some(8)); // col 3 on row 1
+        // …and clamped to a shorter target line.
+        let lines = wrap_input("aaaa\nbb", 10);
+        assert_eq!(move_cursor_line(&lines, 3, 1), Some(7)); // col 2 (clamped)
+    }
+
+    #[test]
+    fn move_cursor_line_returns_none_at_edges() {
+        let lines = wrap_input("aaaa\nbbbb", 10);
+        assert_eq!(move_cursor_line(&lines, 2, -1), None); // on first row
+        assert_eq!(move_cursor_line(&lines, 7, 1), None); // on last row
+        // Single-line input: both directions hit an edge → transcript scrolls.
+        let lines = wrap_input("single", 10);
+        assert_eq!(move_cursor_line(&lines, 3, -1), None);
+        assert_eq!(move_cursor_line(&lines, 3, 1), None);
+    }
+
+    #[test]
+    fn byte_pos_tracks_char_boundaries() {
+        let s = "aé日 b";
+        assert_eq!(byte_pos(s, 0), 0);
+        assert_eq!(byte_pos(s, 2), "aé".len());
+        assert_eq!(byte_pos(s, 3), "aé日".len());
+        assert_eq!(byte_pos(s, 99), s.len());
     }
 }
