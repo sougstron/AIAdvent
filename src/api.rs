@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -305,6 +306,156 @@ pub fn chat(
     })
 }
 
+/// A live chat-completion stream: pull visible-text deltas with `next_chunk`
+/// until it returns `Ok(None)`, then call `into_outcome` for the same
+/// `Outcome` shape `chat` returns (usage, finish_reason, full text) — the
+/// streaming and non-streaming paths converge there so callers downstream of
+/// "the reply is done" don't need to care which path produced it.
+pub struct ChatStream {
+    lines: std::io::Lines<BufReader<Box<dyn Read + Send + Sync>>>,
+    started: Instant,
+    content: String,
+    reasoning: String,
+    finish_reason: Option<String>,
+    usage: Usage,
+}
+
+impl ChatStream {
+    /// Blocks until the next visible-content delta arrives, returning `None`
+    /// once the stream ends. Usage, `reasoning_content`, and `finish_reason`
+    /// are accumulated internally along the way and surface through
+    /// `into_outcome` — a caller updating a live view only ever needs the
+    /// text.
+    pub fn next_chunk(&mut self) -> Res<Option<String>> {
+        loop {
+            let Some(line) = self.lines.next() else {
+                return Ok(None);
+            };
+            let line = line.map_err(|e| format!("stream read failed: {e}"))?;
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                return Ok(None);
+            }
+            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+
+            if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+                self.usage = Usage {
+                    prompt_tokens: field(Some(u), "prompt_tokens"),
+                    completion_tokens: field(Some(u), "completion_tokens"),
+                    reasoning_tokens: u
+                        .get("completion_tokens_details")
+                        .and_then(|d| d.get("reasoning_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| field(Some(u), "reasoning_tokens")),
+                    total_tokens: field(Some(u), "total_tokens"),
+                };
+            }
+
+            let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
+                continue;
+            };
+            if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                self.finish_reason = Some(fr.to_string());
+            }
+            let delta = choice.get("delta");
+            if let Some(piece) = delta
+                .and_then(|d| d.get("reasoning_content"))
+                .and_then(|c| c.as_str())
+            {
+                self.reasoning.push_str(piece);
+            }
+            let content_delta = delta
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(piece) = content_delta {
+                self.content.push_str(piece);
+                return Ok(Some(piece.to_string()));
+            }
+        }
+    }
+
+    /// Everything accumulated so far, in the same shape `chat` returns —
+    /// callable after `next_chunk` returns `Ok(None)`, or early (e.g. after
+    /// a read error) to keep whatever text streamed in before the failure.
+    pub fn into_outcome(self) -> Outcome {
+        Outcome {
+            content: (!self.content.is_empty()).then_some(self.content),
+            reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            finish_reason: self.finish_reason,
+            usage: self.usage,
+            raw: Value::Null,
+            latency_ms: self.started.elapsed().as_millis(),
+        }
+    }
+}
+
+/// Same request as `chat`, but with `stream: true` — returns a `ChatStream`
+/// to pull deltas from as they arrive over the wire, instead of blocking for
+/// the whole body. `schema` is unused by streaming replies today (JSON mode
+/// stays on the non-streaming path in the TUI, since flattening structured
+/// output only makes sense once it's complete) but kept for signature parity.
+pub fn chat_stream(
+    ep: &Endpoint,
+    settings: &Settings,
+    system: &str,
+    history: &[ChatMessage],
+    schema: Option<&Value>,
+) -> Res<ChatStream> {
+    let mut body = build_body(&ep.model, settings, system, history, schema);
+    let obj = body.as_object_mut().expect("object");
+    obj.insert("stream".into(), json!(true));
+    obj.insert("stream_options".into(), json!({ "include_usage": true }));
+    let url = format!("{}/chat/completions", ep.base_url);
+
+    let started = Instant::now();
+    let resp = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {}", ep.api_key))
+        .set("Content-Type", "application/json")
+        .send_json(body);
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            return Err(format!("HTTP {code} from {url}: {}", detail.trim()));
+        }
+        Err(e) => return Err(format!("request failed: {e}")),
+    };
+
+    let lines = BufReader::new(resp.into_reader()).lines();
+    Ok(ChatStream {
+        lines,
+        started,
+        content: String::new(),
+        reasoning: String::new(),
+        finish_reason: None,
+        usage: Usage::default(),
+    })
+}
+
+#[cfg(test)]
+impl ChatStream {
+    /// Builds a stream over canned SSE bytes, bypassing the network — lets
+    /// `next_chunk`/`into_outcome` be tested against a captured real response
+    /// without a live endpoint.
+    fn from_sse(data: &'static str) -> ChatStream {
+        let reader: Box<dyn Read + Send + Sync> = Box::new(data.as_bytes());
+        ChatStream {
+            lines: BufReader::new(reader).lines(),
+            started: Instant::now(),
+            content: String::new(),
+            reasoning: String::new(),
+            finish_reason: None,
+            usage: Usage::default(),
+        }
+    }
+}
+
 fn field(v: Option<&Value>, key: &str) -> u64 {
     v.and_then(|v| v.get(key))
         .and_then(Value::as_u64)
@@ -385,6 +536,52 @@ mod tests {
         let (out, cut) = enforce_max_chars("hi", Some(5));
         assert_eq!(out, "hi");
         assert!(!cut);
+    }
+
+    /// Captured live from the Yolo-Auto endpoint (see AGENTS.md live
+    /// verification) with `reasoning_effort: "none"` — exercises the exact
+    /// wire shape `next_chunk`/`into_outcome` need to handle: an empty
+    /// role-priming delta, multi-token content deltas, a finish-only delta,
+    /// a usage-only trailing chunk with empty `choices`, then `[DONE]`.
+    const SAMPLE_SSE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"content\":\"1\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"content\":\"\\n2\\n3\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":10,\"total_tokens\":35}}\n\n",
+        "data: [DONE]\n",
+    );
+
+    #[test]
+    fn stream_accumulates_deltas_in_order() {
+        let mut stream = ChatStream::from_sse(SAMPLE_SSE);
+        let mut pieces = Vec::new();
+        while let Some(piece) = stream.next_chunk().unwrap() {
+            pieces.push(piece);
+        }
+        assert_eq!(pieces, vec!["1", "\n2\n3"]);
+    }
+
+    #[test]
+    fn stream_into_outcome_matches_the_non_streaming_shape() {
+        let mut stream = ChatStream::from_sse(SAMPLE_SSE);
+        while stream.next_chunk().unwrap().is_some() {}
+        let outcome = stream.into_outcome();
+        assert_eq!(outcome.text(), "1\n2\n3");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(outcome.usage.prompt_tokens, 25);
+        assert_eq!(outcome.usage.completion_tokens, 10);
+        assert_eq!(outcome.usage.total_tokens, 35);
+        assert!(outcome.stopped_by_sequence());
+    }
+
+    #[test]
+    fn stream_empty_body_yields_no_content() {
+        let mut stream = ChatStream::from_sse("data: [DONE]\n");
+        assert!(stream.next_chunk().unwrap().is_none());
+        let outcome = stream.into_outcome();
+        assert!(outcome.content.is_none());
+        assert_eq!(outcome.text(), "");
     }
 
     #[test]
