@@ -11,9 +11,11 @@ use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::Duration;
 
-use crate::api::{self, ChatMessage, Endpoint};
+use crate::api::{self, ChatMessage, Endpoint, Outcome};
 use crate::config::{self, Effort, Res, Settings};
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
@@ -24,12 +26,33 @@ const MAX_CHARS_CHOICES: &[Option<usize>] =
 const BUDGET_CHOICES: &[Option<u32>] =
     &[None, Some(32), Some(64), Some(128), Some(256), Some(512), Some(1024), Some(4096)];
 const STOP_PRESETS: &[&[&str]] = &[&[], &["\n\n"], &["\n---\n"], &["\n\n\n"]];
-const TEMP_CHOICES: &[Option<f32>] = &[None, Some(0.0), Some(0.3), Some(0.7), Some(1.0)];
+const TEMP_CHOICES: &[Option<f32>] =
+    &[None, Some(0.0), Some(0.3), Some(0.7), Some(1.0), Some(1.2)];
 const SETTINGS_ROWS: &[&str] = &["effort", "json mode", "max_chars", "budget_tokens", "stop", "temperature"];
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
-const COMMANDS: &[&str] =
-    &["effort", "help", "json", "new", "quit", "sessions", "settings", "stop", "verify"];
+const COMMANDS: &[&str] = &[
+    "effort", "help", "json", "new", "personas", "quit", "sessions", "settings", "stop", "verify",
+];
+/// Cycled while a background call is in flight — drawn inline in the
+/// transcript instead of a full-screen "working" overlay.
+const SPINNER_FRAMES: &[&str] = &["/", "-", "\\", "-"];
+/// Default cast for `/personas` when the user doesn't supply their own list.
+const DEFAULT_PERSONAS: &[&str] = &["physicist", "philosopher", "mathematician"];
+
+/// One event from the background thread reading a streamed reply — lets the
+/// main loop redraw an animated spinner on every poll timeout instead of
+/// blocking silently on the socket read (which is what used to freeze the
+/// screen on a static "model is thinking" overlay during long reasoning
+/// pauses between visible tokens).
+enum StreamEvent {
+    Piece(String),
+    Done(Res<Outcome>),
+}
+
+fn default_personas() -> Vec<String> {
+    DEFAULT_PERSONAS.iter().map(|s| s.to_string()).collect()
+}
 
 pub fn run(settings: Settings) -> Res<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -76,6 +99,10 @@ struct App {
     cmd_popup_dismissed: bool,
     cmd_selected: usize,
     quit: bool,
+    /// `Some((label, frame))` while a background request is in flight —
+    /// rendered as the last line of the transcript, replacing the old
+    /// full-screen "working" overlay.
+    spinner: Option<(String, &'static str)>,
 }
 
 impl App {
@@ -97,6 +124,7 @@ impl App {
             cmd_popup_dismissed: false,
             cmd_selected: 0,
             quit: false,
+            spinner: None,
         }
     }
 
@@ -382,6 +410,7 @@ impl App {
             "json" => self.cmd_json(rest, terminal),
             "stop" => self.cmd_stop(rest),
             "verify" => self.cmd_verify(rest, terminal),
+            "personas" => self.cmd_personas(rest, terminal),
             "help" => self.entries.push(Entry::Info(HELP.to_string())),
             "quit" | "exit" => self.quit = true,
             "" => {}
@@ -466,7 +495,6 @@ impl App {
     /// Asks the model to rewrite the current schema per a natural-language
     /// instruction — the "the model can edit the JSON on request" path.
     fn json_edit(&mut self, instruction: &str, terminal: &mut DefaultTerminal) {
-        let _ = terminal.draw(|f| draw_busy(f, "updating schema…"));
         let system = format!(
             "You maintain a JSON Schema (draft-like: type/properties/required/additionalProperties). \
              Current schema:\n{}\n\nRewrite it per the user's instruction. \
@@ -477,7 +505,11 @@ impl App {
         let mut plain = self.settings.without_stop_condition();
         plain.json_mode.enabled = false;
         plain.max_chars = None;
-        match api::chat(&self.ep, &plain, &system, &history, None) {
+        let ep = self.ep.clone();
+        let result = self.with_spinner(terminal, "updating schema", move || {
+            api::chat(&ep, &plain, &system, &history, None)
+        });
+        match result {
             Ok(outcome) => {
                 let text = strip_fences(outcome.text());
                 match serde_json::from_str::<Value>(text)
@@ -502,8 +534,12 @@ impl App {
         } else {
             rest.to_string()
         };
-        let _ = terminal.draw(|f| draw_busy(f, "verifying stop condition (2 calls)…"));
-        match verify::run(&self.ep, &self.settings, &prompt) {
+        let ep = self.ep.clone();
+        let settings = self.settings.clone();
+        let result = self.with_spinner(terminal, "verifying stop condition (2 calls)", move || {
+            verify::run(&ep, &settings, &prompt)
+        });
+        match result {
             Ok(report) => {
                 self.status = if report.stop_condition_had_effect() {
                     "verify: stop condition CONFIRMED working".into()
@@ -514,6 +550,100 @@ impl App {
                 self.scroll_to_bottom(terminal);
             }
             Err(e) => self.status = format!("verify failed: {e}"),
+        }
+    }
+
+    /// Runs one question past several independent personas, one call at a
+    /// time — never in parallel, since the provider handles concurrent
+    /// requests from one client poorly. Each persona only ever sees the
+    /// original question, not the other personas' answers, so the replies
+    /// are genuinely independent takes rather than a single conversation
+    /// that role-plays through several voices in one response.
+    ///
+    /// Usage: `/personas <question>` (default cast: physicist, philosopher,
+    /// mathematician) or `/personas physicist,poet: <question>` for a custom
+    /// cast.
+    fn cmd_personas(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
+        if rest.trim().is_empty() {
+            self.status = "usage: /personas [persona,persona,...:] <question>".into();
+            return;
+        }
+        let (personas, question) = match rest.split_once(':') {
+            Some((list, q)) if !q.trim().is_empty() => {
+                let custom: Vec<String> =
+                    list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if custom.is_empty() {
+                    (default_personas(), rest.trim().to_string())
+                } else {
+                    (custom, q.trim().to_string())
+                }
+            }
+            _ => (default_personas(), rest.trim().to_string()),
+        };
+
+        self.session.push_user(question.clone());
+        self.entries.push(Entry::User(question.clone()));
+
+        let n = personas.len();
+        for (i, persona) in personas.iter().enumerate() {
+            let system = format!(
+                "You are answering strictly in character as an expert {persona}. Analyze the user's \
+                 question using only the concepts, reasoning style and vocabulary of a {persona}, \
+                 independent of any other perspective — don't mention or defer to other viewpoints. \
+                 Be concise but substantive."
+            );
+            let ep = self.ep.clone();
+            let settings = self.settings.clone();
+            let history = vec![ChatMessage::user(question.clone())];
+            let label = format!("thinking as {persona} ({}/{n})", i + 1);
+            let result = self.with_spinner(terminal, &label, move || {
+                api::chat(&ep, &settings, &system, &history, None)
+            });
+            match result {
+                Ok(outcome) => {
+                    let text = outcome.text().to_string();
+                    self.session.push_assistant(format!("[{persona}] {text}"));
+                    self.entries.push(Entry::Assistant {
+                        text: format!("[{persona}]\n{text}"),
+                        note: None,
+                    });
+                }
+                Err(e) => self.entries.push(Entry::Info(format!("[{persona}] failed: {e}"))),
+            }
+            self.scroll_to_bottom(terminal);
+        }
+        self.save_session();
+        self.status = format!("ran {n} personas sequentially");
+    }
+
+    /// Runs `f` on a background thread while animating `self.spinner` on the
+    /// main thread so the transcript shows movement instead of freezing for
+    /// the duration of a blocking network call.
+    fn with_spinner<T, F>(&mut self, terminal: &mut DefaultTerminal, label: &str, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        let mut frame = 0usize;
+        loop {
+            self.spinner = Some((label.to_string(), SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]));
+            self.scroll_to_bottom(terminal);
+            let _ = terminal.draw(|f| self.draw(f));
+            match rx.recv_timeout(Duration::from_millis(110)) {
+                Ok(v) => {
+                    self.spinner = None;
+                    return v;
+                }
+                Err(RecvTimeoutError::Timeout) => frame = frame.wrapping_add(1),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.spinner = None;
+                    panic!("spinner worker thread ended without a result");
+                }
+            }
         }
     }
 
@@ -552,9 +682,14 @@ impl App {
         // meaningful to render live, and `render_json_reply` needs the whole
         // body to flatten anyway.
         if self.settings.json_mode.enabled {
-            let schema = Some(self.settings.json_mode.schema.clone());
-            let _ = terminal.draw(|f| draw_busy(f, "model is thinking…"));
-            match api::chat(&self.ep, &self.settings, "", &history, schema.as_ref()) {
+            let schema = self.settings.json_mode.schema.clone();
+            let ep = self.ep.clone();
+            let settings = self.settings.clone();
+            let hist = history.clone();
+            let result = self.with_spinner(terminal, "model is thinking", move || {
+                api::chat(&ep, &settings, "", &hist, Some(&schema))
+            });
+            match result {
                 Ok(outcome) => self.finish_reply(outcome, terminal),
                 Err(e) => {
                     self.session.messages.pop();
@@ -564,52 +699,88 @@ impl App {
             return;
         }
 
-        let _ = terminal.draw(|f| draw_busy(f, "model is thinking…"));
-        let mut stream = match api::chat_stream(&self.ep, &self.settings, "", &history, None) {
-            Ok(s) => s,
-            Err(e) => {
-                self.session.messages.pop();
-                self.status = format!("request failed: {e}");
-                return;
-            }
-        };
-
         self.entries.push(Entry::Assistant { text: String::new(), note: None });
         let idx = self.entries.len() - 1;
         self.status = "generating…".into();
 
-        let mut stream_err = None;
+        // Runs the connect-and-read loop on a background thread so the main
+        // loop can keep animating the spinner during the (sometimes long)
+        // silent stretch spent inside hidden `reasoning_content` deltas,
+        // instead of blocking on the socket read with a frozen screen.
+        let (tx, rx) = mpsc::channel();
+        let ep = self.ep.clone();
+        let settings = self.settings.clone();
+        thread::spawn(move || {
+            let mut stream = match api::chat_stream(&ep, &settings, "", &history, None) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Done(Err(e)));
+                    return;
+                }
+            };
+            loop {
+                match stream.next_chunk() {
+                    Ok(Some(piece)) => {
+                        if tx.send(StreamEvent::Piece(piece)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(StreamEvent::Done(Ok(stream.into_outcome())));
+                        return;
+                    }
+                    Err(e) => {
+                        // Keep whatever text already streamed in rather than
+                        // discarding it — the user watched it arrive, so it
+                        // stays in the transcript (and in session history) with
+                        // a note explaining the cut.
+                        let mut outcome = stream.into_outcome();
+                        let interrupted = format!("stream interrupted: {e}");
+                        outcome.finish_reason = Some(
+                            outcome
+                                .finish_reason
+                                .map_or(interrupted.clone(), |fr| format!("{fr}, {interrupted}")),
+                        );
+                        let _ = tx.send(StreamEvent::Done(Ok(outcome)));
+                        return;
+                    }
+                }
+            }
+        });
+
+        let mut frame = 0usize;
         loop {
-            match stream.next_chunk() {
-                Ok(Some(piece)) => {
+            self.spinner = Some(("model is thinking".into(), SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]));
+            self.scroll_to_bottom(terminal);
+            let _ = terminal.draw(|f| self.draw(f));
+            match rx.recv_timeout(Duration::from_millis(110)) {
+                Ok(StreamEvent::Piece(piece)) => {
                     if let Entry::Assistant { text, .. } = &mut self.entries[idx] {
                         text.push_str(&piece);
                     }
-                    self.scroll_to_bottom(terminal);
-                    let _ = terminal.draw(|f| self.draw(f));
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    stream_err = Some(e);
-                    break;
+                Ok(StreamEvent::Done(result)) => {
+                    self.spinner = None;
+                    match result {
+                        Ok(outcome) => self.finish_reply_at(idx, outcome, terminal),
+                        Err(e) => {
+                            self.session.messages.pop();
+                            self.entries.remove(idx);
+                            self.status = format!("request failed: {e}");
+                        }
+                    }
+                    return;
+                }
+                Err(RecvTimeoutError::Timeout) => frame = frame.wrapping_add(1),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.spinner = None;
+                    self.session.messages.pop();
+                    self.entries.remove(idx);
+                    self.status = "request failed: worker thread ended unexpectedly".into();
+                    return;
                 }
             }
         }
-
-        let mut outcome = stream.into_outcome();
-        if let Some(e) = &stream_err {
-            // Keep whatever text already streamed in rather than discarding
-            // it — the user watched it arrive, so it stays in the transcript
-            // (and in session history, so a follow-up question has the same
-            // context the user is looking at) with a note explaining the cut.
-            let interrupted = format!("stream interrupted: {e}");
-            outcome.finish_reason = Some(
-                outcome
-                    .finish_reason
-                    .map_or(interrupted.clone(), |fr| format!("{fr}, {interrupted}")),
-            );
-        }
-        self.finish_reply_at(idx, outcome, terminal);
     }
 
     /// Shared tail of both the streaming and blocking reply paths: enforce
@@ -736,6 +907,9 @@ impl App {
         }
         if body.is_empty() {
             body = "No messages yet — say something.".into();
+        }
+        if let Some((label, frame)) = &self.spinner {
+            body.push_str(&format!("{frame} {label}…\n"));
         }
         body
     }
@@ -902,6 +1076,8 @@ const HELP: &str = "\
 /stop add <seq>           add a stop sequence (max 4)
 /stop clear               clear stop sequences
 /verify [prompt]          prove the stop condition changes the output
+/personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
+/personas a,b,c: <question>   same, with your own cast instead of the default three
 /settings                 open the settings panel (Tab does the same)
 /quit                     exit";
 
@@ -914,19 +1090,6 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
-}
-
-fn draw_busy(f: &mut Frame, msg: &str) {
-    let area = f.area();
-    f.render_widget(
-        Paragraph::new(msg).block(Block::bordered().title(" working ")),
-        Rect {
-            x: area.x,
-            y: area.y + area.height / 2,
-            width: area.width,
-            height: 3.min(area.height),
-        },
-    );
 }
 
 fn cycle_choice<T: PartialEq + Copy>(choices: &[T], current: T, delta: i32) -> T {

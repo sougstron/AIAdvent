@@ -53,9 +53,16 @@ Esc            close a panel, or quit from the input
 /stop add <seq>                   add a stop sequence (max 4)
 /stop clear                       clear stop sequences
 /verify [prompt]                  prove the stop condition changes the output
+/personas <question>              ask physicist/philosopher/mathematician, one call each, in sequence
+/personas a,b,c: <question>       same, with your own cast instead of the default three
 /settings                         open the settings panel (Tab does the same)
 /quit                             exit
 ```
+
+While a reply is in flight, the transcript shows an inline animated indicator
+(`/ - \ -`, cycled on a background thread) in place of the eventual answer,
+instead of a full-screen "working" overlay that used to blank out the rest of
+the conversation.
 
 ## Sessions
 
@@ -150,6 +157,31 @@ available non-interactively:
 ask --verify-stop --budget-tokens 60
 ask --verify-stop --stop $'\n\n' "List 6 things, one per paragraph."
 ```
+
+## Personas — sequential, independent multi-perspective replies
+
+`/personas <question>` runs the same question past several personas — by
+default a physicist, a philosopher and a mathematician — and shows each
+answer as it comes in. Each persona only ever sees the original question
+(never the other personas' replies), so these are genuinely independent
+takes, not one model role-playing through several voices in a single
+response.
+
+Calls are made **one at a time, never in parallel**: the provider handles
+concurrent requests from one client poorly, so `/personas` waits for each
+persona to finish before starting the next, showing which persona is
+currently running (`thinking as philosopher (2/3)…`) in the inline spinner.
+
+Custom cast: `/personas physicist,poet,lawyer: is it ethical to lie to
+protect someone's feelings?`
+
+## Temperature
+
+Sampling temperature (`/settings`, or `--temperature F` for one-shot calls),
+cycled in the TUI over `off, 0.0, 0.3, 0.7, 1.0, 1.2`. Confirmed live against
+`yolo-auto.com`: at `0.0` the same prompt returns the same token repeatedly;
+at `1.2` it varies run to run — proof the provider actually honors the
+parameter rather than ignoring it.
 
 ## API key
 

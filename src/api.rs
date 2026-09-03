@@ -26,6 +26,7 @@ struct PiProvider {
     api_key: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Endpoint {
     pub base_url: String,
     pub model: String,
