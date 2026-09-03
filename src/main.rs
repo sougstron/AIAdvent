@@ -1,11 +1,10 @@
 mod api;
 mod cli;
-mod compare;
 mod config;
-mod engine;
-mod news;
-mod topics;
+mod render;
+mod session;
 mod tui;
+mod verify;
 
 fn main() {
     if let Err(e) = cli::run() {

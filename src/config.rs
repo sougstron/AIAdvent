@@ -1,281 +1,229 @@
-//! The single knob-set shared by the CLI parser, the env vars and the TUI.
+//! Chat settings shared by the CLI, the TUI and the stop-condition self-test.
 
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::fmt;
 
 pub type Res<T> = Result<T, String>;
 
-/// How hard we constrain the shape of the answer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Format {
-    /// No constraint at all — plain prose, whatever the model feels like.
-    Text,
-    /// `response_format: json_object` — valid JSON, but the keys are the model's choice.
-    JsonObject,
-    /// `response_format: json_schema` with `strict: true` — the shape is ours.
-    JsonSchema,
+/// How much the model is allowed to reason before answering.
+/// Maps straight onto the provider's `reasoning_effort` field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Effort {
+    /// Reasoning forced off (`reasoning_effort: none` + `enable_thinking: false`).
+    None,
+    Low,
+    Medium,
+    High,
 }
 
-impl Format {
-    pub const ALL: [Format; 3] = [Format::Text, Format::JsonObject, Format::JsonSchema];
+impl Effort {
+    pub const ALL: [Effort; 4] = [Effort::None, Effort::Low, Effort::Medium, Effort::High];
 
     pub fn label(self) -> &'static str {
         match self {
-            Format::Text => "text",
-            Format::JsonObject => "json",
-            Format::JsonSchema => "schema",
+            Effort::None => "none",
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
         }
     }
 
-    pub fn parse(s: &str) -> Res<Format> {
-        match s {
-            "text" => Ok(Format::Text),
-            "json" | "json_object" => Ok(Format::JsonObject),
-            "schema" | "json_schema" => Ok(Format::JsonSchema),
-            other => Err(format!("unknown format `{other}` (text|json|schema)")),
+    pub fn parse(s: &str) -> Res<Effort> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" => Ok(Effort::None),
+            "low" => Ok(Effort::Low),
+            "medium" | "med" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            other => Err(format!("unknown effort `{other}` (none|low|medium|high)")),
         }
     }
 
-    /// True when the answer is supposed to parse as JSON.
-    pub fn expects_json(self) -> bool {
-        !matches!(self, Format::Text)
-    }
-
-    pub fn cycle(self, delta: i32) -> Format {
-        let i = Format::ALL.iter().position(|f| *f == self).unwrap_or(0) as i32;
-        let n = Format::ALL.len() as i32;
-        Format::ALL[(i + delta).rem_euclid(n) as usize]
+    pub fn cycle(self, delta: i32) -> Effort {
+        let i = Effort::ALL.iter().position(|e| *e == self).unwrap_or(0) as i32;
+        let n = Effort::ALL.len() as i32;
+        Effort::ALL[(i + delta).rem_euclid(n) as usize]
     }
 }
 
-impl fmt::Display for Format {
+impl fmt::Display for Effort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
     }
 }
 
-/// Where the real-world material for the digest comes from.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Source {
-    /// Steam news API (`ISteamNews`), a curated list of appids.
-    Steam,
-    /// Hacker News via the Algolia search API.
-    Hn,
-    Both,
-    /// No fetch — the model makes the content up. Useful to isolate format effects.
-    None,
+/// The structured-output mode: off (free prose) or on with a JSON Schema the
+/// model must fill. The schema is editable at runtime via `/json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JsonMode {
+    pub enabled: bool,
+    pub schema: Value,
 }
 
-impl Source {
-    pub const ALL: [Source; 4] = [Source::Steam, Source::Hn, Source::Both, Source::None];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Source::Steam => "steam",
-            Source::Hn => "hn",
-            Source::Both => "both",
-            Source::None => "none",
-        }
-    }
-
-    pub fn parse(s: &str) -> Res<Source> {
-        match s {
-            "steam" => Ok(Source::Steam),
-            "hn" => Ok(Source::Hn),
-            "both" | "all" => Ok(Source::Both),
-            "none" | "off" => Ok(Source::None),
-            other => Err(format!("unknown source `{other}` (steam|hn|both|none)")),
-        }
-    }
-
-    pub fn cycle(self, delta: i32) -> Source {
-        let i = Source::ALL.iter().position(|s| *s == self).unwrap_or(0) as i32;
-        let n = Source::ALL.len() as i32;
-        Source::ALL[(i + delta).rem_euclid(n) as usize]
-    }
-}
-
-/// Everything one generation run needs. Built identically by CLI, env and TUI.
-#[derive(Clone, Debug)]
-pub struct RunConfig {
-    /// Topic key from the registry, or `none` for a raw pass-through question.
-    pub topic: String,
-    pub format: Format,
-    /// Hard generation budget. Careful: it also counts reasoning tokens.
-    pub max_tokens: Option<u32>,
-    /// Soft, semantic length limit: `maxItems` on the list inside the schema.
-    pub max_items: Option<usize>,
-    pub stop: Vec<String>,
-    /// Reasoning on/off. Off is the default — see the note in README.
-    pub thinking: bool,
-    pub runs: u32,
-    pub temperature: Option<f32>,
-    /// Freeform user question / focus hint.
-    pub question: String,
-    /// Path to a schema file overriding the topic's built-in one.
-    pub schema_file: Option<String>,
-    // --- news fetching ---
-    pub source: Source,
-    pub since_hours: u64,
-    pub limit: usize,
-}
-
-impl Default for RunConfig {
+impl Default for JsonMode {
     fn default() -> Self {
-        RunConfig {
-            topic: "gamedev".into(),
-            format: Format::JsonSchema,
-            max_tokens: None,
-            max_items: None,
-            stop: Vec::new(),
-            thinking: false,
-            runs: 1,
-            temperature: None,
-            question: String::new(),
-            schema_file: None,
-            source: Source::Steam,
-            since_hours: 168,
-            limit: 12,
+        JsonMode {
+            enabled: false,
+            schema: default_schema(),
         }
     }
 }
 
-impl RunConfig {
-    /// One-line description of the active constraints, for reports and the TUI.
-    pub fn constraints(&self) -> String {
-        let mut parts = vec![format!("format={}", self.format)];
-        match self.max_tokens {
-            Some(n) => parts.push(format!("max_tokens={n}")),
-            None => parts.push("max_tokens=off".into()),
-        }
-        if let Some(n) = self.max_items {
-            parts.push(format!("max_items={n}"));
-        }
-        if self.stop.is_empty() {
-            parts.push("stop=off".into());
-        } else {
-            parts.push(format!("stop={}", render_stops(&self.stop)));
-        }
-        parts.push(format!(
-            "think={}",
-            if self.thinking { "on" } else { "off" }
-        ));
-        parts.join("  ")
+/// A flat, all-string-fields schema — the common case from the spec example
+/// (`{title, game, publisher, summary}`), buildable with `/json fields a,b,c`.
+pub fn flat_string_schema(fields: &[String]) -> Value {
+    let mut properties = serde_json::Map::new();
+    for f in fields {
+        properties.insert(f.clone(), json!({ "type": "string" }));
     }
-}
-
-/// Escapes control characters so stop sequences stay readable in one line of output.
-pub fn render_stops(stop: &[String]) -> String {
-    let shown: Vec<String> = stop
-        .iter()
-        .map(|s| format!("\"{}\"", s.replace('\n', "\\n").replace('\t', "\\t")))
-        .collect();
-    shown.join(",")
-}
-
-/// A named bundle of settings — the "переключалка" between demo modes.
-pub struct Preset {
-    pub name: &'static str,
-    pub blurb: &'static str,
-    apply: fn(&mut RunConfig),
-}
-
-pub const PRESETS: &[Preset] = &[
-    Preset {
-        name: "baseline",
-        blurb: "no constraints at all: free prose, thinking on",
-        apply: |c| {
-            c.format = Format::Text;
-            c.max_tokens = None;
-            c.max_items = None;
-            c.stop.clear();
-            c.thinking = true;
-        },
-    },
-    Preset {
-        name: "json-soft",
-        blurb: "json_object: valid JSON, but the model picks the keys",
-        apply: |c| {
-            c.format = Format::JsonObject;
-            c.max_tokens = None;
-            c.max_items = None;
-            c.stop.clear();
-            c.thinking = true;
-        },
-    },
-    Preset {
-        name: "strict",
-        blurb: "json_schema + strict, thinking off: the shape is ours",
-        apply: |c| {
-            c.format = Format::JsonSchema;
-            c.max_tokens = None;
-            c.max_items = None;
-            c.stop.clear();
-            c.thinking = false;
-        },
-    },
-    Preset {
-        name: "capped",
-        blurb: "strict + max_tokens=300: shows the truncation failure mode",
-        apply: |c| {
-            c.format = Format::JsonSchema;
-            c.max_tokens = Some(300);
-            c.max_items = None;
-            c.stop.clear();
-            c.thinking = false;
-        },
-    },
-    Preset {
-        name: "capped-items",
-        blurb: "strict + maxItems=3: the semantic way to shorten the answer",
-        apply: |c| {
-            c.format = Format::JsonSchema;
-            c.max_tokens = None;
-            c.max_items = Some(3);
-            c.stop.clear();
-            c.thinking = false;
-        },
-    },
-    Preset {
-        name: "stopped",
-        blurb: "text + stop on the item separator: cuts after the first entry",
-        apply: |c| {
-            c.format = Format::Text;
-            c.max_tokens = Some(600);
-            c.max_items = None;
-            c.stop = vec!["\n---\n".into()];
-            c.thinking = false;
-        },
-    },
-    Preset {
-        name: "strict-all",
-        blurb: "all three controls at once: schema + budget + stop",
-        apply: |c| {
-            c.format = Format::JsonSchema;
-            // ~1200 tokens are needed for a 7-item digest; 5 items fit in ~900.
-            // 700 (and the plan's 400) truncate like `capped` — keep the budget
-            // above that so this preset shows the knobs combining *successfully*.
-            c.max_tokens = Some(1600);
-            c.max_items = Some(5);
-            c.stop = vec!["\n\n\n".into()];
-            c.thinking = false;
-        },
-    },
-];
-
-pub fn preset(name: &str) -> Res<&'static Preset> {
-    PRESETS.iter().find(|p| p.name == name).ok_or_else(|| {
-        format!(
-            "unknown preset `{name}` (known: {})",
-            preset_names().join(", ")
-        )
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": fields,
+        "properties": properties,
     })
 }
 
-pub fn preset_names() -> Vec<&'static str> {
-    PRESETS.iter().map(|p| p.name).collect()
+fn default_schema() -> Value {
+    flat_string_schema(&["title".into(), "summary".into()])
 }
 
-pub fn apply_preset(cfg: &mut RunConfig, name: &str) -> Res<()> {
-    (preset(name)?.apply)(cfg);
-    Ok(())
+/// Everything one turn of generation needs. Built once per app, mutated live
+/// by `/effort`, `/json`, `/settings`, and persisted per session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Settings {
+    pub effort: Effort,
+    pub json_mode: JsonMode,
+    /// Hard character cap on the *visible* answer. Enforced twice: as a
+    /// system-prompt hint (soft, helps the model wrap up cleanly) and as a
+    /// client-side truncation after the fact (hard, always true regardless
+    /// of what the model does).
+    pub max_chars: Option<usize>,
+    /// Generation token budget — counts reasoning *and* visible tokens.
+    /// This is the primary "stop condition" lever: set low enough and the
+    /// model is cut off mid-thought, deterministically (`finish_reason=length`).
+    pub budget_tokens: Option<u32>,
+    /// Literal stop strings — the other stop-condition lever. The provider
+    /// halts generation the instant one is emitted (`finish_reason=stop`).
+    pub stop: Vec<String>,
+    pub temperature: Option<f32>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            effort: Effort::None,
+            json_mode: JsonMode::default(),
+            max_chars: None,
+            budget_tokens: None,
+            stop: Vec::new(),
+            temperature: None,
+        }
+    }
+}
+
+impl Settings {
+    pub fn thinking(&self) -> bool {
+        self.effort != Effort::None
+    }
+
+    /// One-line status strip, shown in the TUI header and CLI stats.
+    pub fn summary(&self) -> String {
+        let mut parts = vec![format!("effort={}", self.effort)];
+        parts.push(format!(
+            "json={}",
+            if self.json_mode.enabled { "on" } else { "off" }
+        ));
+        parts.push(match self.max_chars {
+            Some(n) => format!("max_chars={n}"),
+            None => "max_chars=off".into(),
+        });
+        parts.push(match self.budget_tokens {
+            Some(n) => format!("budget={n}tok"),
+            None => "budget=off".into(),
+        });
+        parts.push(if self.stop.is_empty() {
+            "stop=off".into()
+        } else {
+            format!("stop={}", render_stops(&self.stop))
+        });
+        parts.join("  ")
+    }
+
+    /// A copy with both stop-condition levers cleared — the "off" side of
+    /// the `/verify` comparison.
+    pub fn without_stop_condition(&self) -> Settings {
+        let mut s = self.clone();
+        s.budget_tokens = None;
+        s.stop.clear();
+        s
+    }
+}
+
+/// Escapes control characters so stop sequences stay readable on one line.
+pub fn render_stops(stop: &[String]) -> String {
+    stop.iter()
+        .map(|s| format!("\"{}\"", s.replace('\n', "\\n").replace('\t', "\\t")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Turns the literal two-character `\n` typed at a prompt into a real newline.
+pub fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effort_cycles_and_round_trips_through_label() {
+        for e in Effort::ALL {
+            assert_eq!(Effort::parse(e.label()).unwrap(), e);
+        }
+        assert_eq!(Effort::None.cycle(1), Effort::Low);
+        assert_eq!(Effort::None.cycle(-1), Effort::High);
+    }
+
+    #[test]
+    fn thinking_is_off_only_at_effort_none() {
+        let mut s = Settings::default();
+        assert!(!s.thinking());
+        s.effort = Effort::Low;
+        assert!(s.thinking());
+    }
+
+    #[test]
+    fn without_stop_condition_clears_both_levers_only() {
+        let s = Settings {
+            budget_tokens: Some(64),
+            stop: vec!["\n\n".into()],
+            max_chars: Some(200),
+            ..Settings::default()
+        };
+        let cleared = s.without_stop_condition();
+        assert_eq!(cleared.budget_tokens, None);
+        assert!(cleared.stop.is_empty());
+        assert_eq!(cleared.max_chars, Some(200)); // unrelated setting untouched
+    }
 }

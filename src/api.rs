@@ -1,4 +1,5 @@
-//! Talking to the OpenAI-compatible endpoint, with the response-control knobs applied.
+//! Talking to the OpenAI-compatible endpoint. Multi-turn: the whole visible
+//! history is resent every call, exactly like a real chat client.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -7,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::config::{Format, Res, RunConfig};
+use crate::config::{Res, Settings};
 
 const DEFAULT_BASE_URL: &str = "https://yolo-auto.com/v1";
 const DEFAULT_MODEL: &str = "qwen3.8-27b";
@@ -31,6 +32,19 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// Unusable for actual requests — only for tests that need an `Endpoint`
+    /// value but return before making a call.
+    #[cfg(test)]
+    pub fn dummy() -> Endpoint {
+        Endpoint {
+            base_url: "http://unused.invalid".into(),
+            model: "unused".into(),
+            api_key: String::new(),
+        }
+    }
+
+    /// Resolution order: `$YOLO_BASE_URL` / `$YOLO_MODEL` / `$YOLO_API_KEY`,
+    /// falling back to the `Yolo-Auto` provider in `~/.pi/agent/models.json`.
     pub fn resolve() -> Res<Endpoint> {
         Ok(Endpoint {
             base_url: env::var("YOLO_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into()),
@@ -40,7 +54,6 @@ impl Endpoint {
     }
 }
 
-/// API key resolution order: $YOLO_API_KEY, then ~/.pi/agent/models.json (Yolo-Auto provider).
 fn resolve_api_key() -> Res<String> {
     if let Ok(key) = env::var("YOLO_API_KEY") {
         if !key.is_empty() {
@@ -65,16 +78,55 @@ fn pi_models_path() -> Res<PathBuf> {
         .map_err(|_| "HOME not set".to_string())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn user(s: impl Into<String>) -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            content: s.into(),
+        }
+    }
+    pub fn assistant(s: impl Into<String>) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: s.into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    /// Part of `completion_tokens` that the model spent thinking.
+    /// Part of `completion_tokens` spent thinking, not in the visible answer.
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
 }
 
-/// One generation, with everything we need to judge whether the controls worked.
+/// One generation, with everything needed to judge whether the stop
+/// condition and length cap actually fired.
 #[derive(Clone, Debug)]
 pub struct Outcome {
     /// `None` when the budget ran out before any visible token was produced.
@@ -87,9 +139,15 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// True when the provider cut us off rather than the model finishing its thought.
+    /// True when the token budget cut generation off mid-thought, rather
+    /// than the model finishing on its own.
     pub fn truncated(&self) -> bool {
         matches!(self.finish_reason.as_deref(), Some("length"))
+    }
+
+    /// True when a literal stop sequence ended generation early.
+    pub fn stopped_by_sequence(&self) -> bool {
+        matches!(self.finish_reason.as_deref(), Some("stop"))
     }
 
     pub fn text(&self) -> &str {
@@ -97,29 +155,37 @@ impl Outcome {
     }
 }
 
-/// Builds the request body. Kept separate so `--dry-run` and tests can inspect it.
+/// Builds the request body. Kept separate from `chat` so `--show-request`
+/// and tests can inspect it without a network call.
 pub fn build_body(
     model: &str,
-    cfg: &RunConfig,
+    settings: &Settings,
     system: &str,
-    user: &str,
+    history: &[ChatMessage],
     schema: Option<&Value>,
 ) -> Value {
     let mut messages = Vec::new();
-    let budget_note = cfg.max_tokens.map(|n| {
-        format!(
-            "The entire generation, including reasoning and the final answer, has a hard budget of {n} tokens. Plan accordingly and finish the final answer before that limit; never stop mid-answer."
-        )
-    });
-    if !system.is_empty() || budget_note.is_some() {
-        let content = match budget_note {
-            Some(note) if system.is_empty() => note,
-            Some(note) => format!("{system}\n\n{note}"),
-            None => system.to_string(),
-        };
-        messages.push(json!({ "role": "system", "content": content }));
+
+    let budget_note = settings.budget_tokens.map(|n| format!(
+        "The entire generation, including reasoning and the final answer, has a hard budget of {n} tokens. Plan accordingly and finish the final answer before that limit; never stop mid-answer."
+    ));
+    let chars_note = settings
+        .max_chars
+        .map(|n| format!("Keep your entire final answer under {n} characters."));
+    let mut system = system.to_string();
+    for note in [budget_note, chars_note].into_iter().flatten() {
+        if system.is_empty() {
+            system = note;
+        } else {
+            system = format!("{system}\n\n{note}");
+        }
     }
-    messages.push(json!({ "role": "user", "content": user }));
+    if !system.is_empty() {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    for m in history {
+        messages.push(json!({ "role": m.role.as_str(), "content": m.content }));
+    }
 
     let mut body = json!({
         "model": model,
@@ -127,58 +193,52 @@ pub fn build_body(
     });
     let obj = body.as_object_mut().expect("object");
 
-    match cfg.format {
-        Format::Text => {}
-        Format::JsonObject => {
-            obj.insert("response_format".into(), json!({ "type": "json_object" }));
-        }
-        Format::JsonSchema => {
-            let schema = schema
-                .cloned()
-                .unwrap_or_else(|| json!({ "type": "object" }));
-            obj.insert(
-                "response_format".into(),
-                json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "answer",
-                        "strict": true,
-                        "schema": schema,
-                    }
-                }),
-            );
-        }
+    if settings.json_mode.enabled {
+        obj.insert(
+            "response_format".into(),
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": true,
+                    "schema": schema.cloned().unwrap_or(json!({ "type": "object" })),
+                }
+            }),
+        );
     }
 
-    if let Some(n) = cfg.max_tokens {
+    if let Some(n) = settings.budget_tokens {
         obj.insert("max_tokens".into(), json!(n));
     }
-    if !cfg.stop.is_empty() {
-        obj.insert("stop".into(), json!(cfg.stop));
+    if !settings.stop.is_empty() {
+        obj.insert("stop".into(), json!(settings.stop));
     }
-    if let Some(t) = cfg.temperature {
+    if let Some(t) = settings.temperature {
         obj.insert("temperature".into(), json!(t));
     }
-    if !cfg.thinking {
-        // Two independent switches: the OpenAI-style one and the Qwen chat-template one.
-        // Both were verified to zero out reasoning_tokens on this provider.
+
+    if !settings.thinking() {
+        // Two independent switches: the OpenAI-style one and the Qwen chat-template
+        // one. Both were verified live to zero out reasoning_tokens on this provider.
         obj.insert("reasoning_effort".into(), json!("none"));
         obj.insert(
             "chat_template_kwargs".into(),
             json!({ "enable_thinking": false }),
         );
+    } else {
+        obj.insert("reasoning_effort".into(), json!(settings.effort.label()));
     }
     body
 }
 
 pub fn chat(
     ep: &Endpoint,
-    cfg: &RunConfig,
+    settings: &Settings,
     system: &str,
-    user: &str,
+    history: &[ChatMessage],
     schema: Option<&Value>,
 ) -> Res<Outcome> {
-    let body = build_body(&ep.model, cfg, system, user, schema);
+    let body = build_body(&ep.model, settings, system, history, schema);
     let url = format!("{}/chat/completions", ep.base_url);
 
     let started = Instant::now();
@@ -190,7 +250,6 @@ pub fn chat(
 
     let resp = match resp {
         Ok(r) => r,
-        // Surface the provider's own error text: it is what tells us a parameter is unsupported.
         Err(ureq::Error::Status(code, r)) => {
             let detail = r.into_string().unwrap_or_default();
             return Err(format!("HTTP {code} from {url}: {}", detail.trim()));
@@ -208,8 +267,9 @@ pub fn chat(
         .ok_or_else(|| format!("no choices in response: {raw}"))?;
     let message = choice.get("message");
 
-    // `content` is null whenever generation stopped before any visible token — a real
-    // case here, because max_tokens and stop both apply to the reasoning stream too.
+    // `content` is null whenever generation stopped before any visible token — a
+    // real case here, since both the token budget and stop sequences can fire
+    // while the model is still inside `reasoning_content`.
     let content = message
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
@@ -231,7 +291,7 @@ pub fn chat(
             .and_then(|u| u.get("completion_tokens_details"))
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(0),
+            .unwrap_or_else(|| field(u, "reasoning_tokens")),
         total_tokens: field(u, "total_tokens"),
     };
 
@@ -251,21 +311,104 @@ fn field(v: Option<&Value>, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Applies the hard character cap client-side. Deterministic and independent
+/// of whatever the model actually did — this is what makes `max_chars` a real
+/// guarantee rather than a hint the model can ignore.
+pub fn enforce_max_chars(text: &str, max_chars: Option<usize>) -> (String, bool) {
+    match max_chars {
+        Some(n) if text.chars().count() > n => {
+            let truncated: String = text.chars().take(n).collect();
+            (truncated, true)
+        }
+        _ => (text.to_string(), false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Effort, Settings};
 
     #[test]
     fn token_budget_is_sent_and_explained_to_model() {
-        let cfg = RunConfig {
-            max_tokens: Some(8192),
-            ..RunConfig::default()
+        let settings = Settings {
+            budget_tokens: Some(8192),
+            ..Settings::default()
         };
-        let body = build_body("model", &cfg, "base", "question", None);
+        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
         assert_eq!(body["max_tokens"], 8192);
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("entire generation"));
         assert!(system.contains("8192 tokens"));
-        assert!(system.contains("finish the final answer"));
+    }
+
+    #[test]
+    fn effort_none_disables_thinking_switches() {
+        let settings = Settings::default(); // Effort::None
+        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn effort_high_passes_through_without_forcing_thinking_off() {
+        let settings = Settings {
+            effort: Effort::High,
+            ..Settings::default()
+        };
+        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn history_round_trips_in_order() {
+        let settings = Settings::default();
+        let history = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant("reply"),
+            ChatMessage::user("second"),
+        ];
+        let body = build_body("model", &settings, "", &history, None);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "second");
+    }
+
+    #[test]
+    fn max_chars_truncates_deterministically() {
+        let (out, cut) = enforce_max_chars("hello world", Some(5));
+        assert_eq!(out, "hello");
+        assert!(cut);
+        let (out, cut) = enforce_max_chars("hi", Some(5));
+        assert_eq!(out, "hi");
+        assert!(!cut);
+    }
+
+    #[test]
+    fn json_mode_sends_strict_schema() {
+        let settings = Settings {
+            json_mode: crate::config::JsonMode {
+                enabled: true,
+                schema: json!({"type": "object"}),
+            },
+            ..Settings::default()
+        };
+        let schema = json!({"type": "object", "properties": {"title": {"type": "string"}}});
+        let body = build_body(
+            "model",
+            &settings,
+            "",
+            &[ChatMessage::user("hi")],
+            Some(&schema),
+        );
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["properties"]["title"]["type"],
+            "string"
+        );
     }
 }
