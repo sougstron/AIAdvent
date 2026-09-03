@@ -15,7 +15,9 @@ use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -680,7 +682,7 @@ impl App {
             api::chat(&ep, &plain, &system, &history, None)
         });
         match result {
-            Ok(outcome) => {
+            Some(Ok(outcome)) => {
                 let text = strip_fences(outcome.text());
                 match serde_json::from_str::<Value>(text)
                     .map_err(|e| e.to_string())
@@ -694,7 +696,8 @@ impl App {
                     Err(e) => self.status = format!("model reply was not a valid schema: {e}"),
                 }
             }
-            Err(e) => self.status = format!("schema edit failed: {e}"),
+            Some(Err(e)) => self.status = format!("schema edit failed: {e}"),
+            None => self.status = "schema edit cancelled (Esc)".into(),
         }
     }
 
@@ -710,7 +713,7 @@ impl App {
             verify::run(&ep, &settings, &prompt)
         });
         match result {
-            Ok(report) => {
+            Some(Ok(report)) => {
                 self.status = if report.stop_condition_had_effect() {
                     "verify: stop condition CONFIRMED working".into()
                 } else {
@@ -719,7 +722,8 @@ impl App {
                 self.entries.push(Entry::Info(report.render()));
                 self.scroll_to_bottom(terminal);
             }
-            Err(e) => self.status = format!("verify failed: {e}"),
+            Some(Err(e)) => self.status = format!("verify failed: {e}"),
+            None => self.status = "verify cancelled (Esc)".into(),
         }
     }
 
@@ -755,6 +759,7 @@ impl App {
         self.entries.push(Entry::User(question.clone()));
 
         let n = personas.len();
+        let mut cancelled = false;
         for (i, persona) in personas.iter().enumerate() {
             let system = format!(
                 "You are answering strictly in character as an expert {persona}. Analyze the user's \
@@ -770,7 +775,7 @@ impl App {
                 api::chat(&ep, &settings, &system, &history, None)
             });
             match result {
-                Ok(outcome) => {
+                Some(Ok(outcome)) => {
                     let text = outcome.text().to_string();
                     self.session.push_assistant(format!("[{persona}] {text}"));
                     self.entries.push(Entry::Assistant {
@@ -778,18 +783,29 @@ impl App {
                         note: None,
                     });
                 }
-                Err(e) => self.entries.push(Entry::Info(format!("[{persona}] failed: {e}"))),
+                Some(Err(e)) => self.entries.push(Entry::Info(format!("[{persona}] failed: {e}"))),
+                None => {
+                    cancelled = true;
+                    break;
+                }
             }
             self.scroll_to_bottom(terminal);
         }
         self.save_session();
-        self.status = format!("ran {n} personas sequentially");
+        self.status = if cancelled {
+            "personas cancelled (Esc) — earlier replies kept".into()
+        } else {
+            format!("ran {n} personas sequentially")
+        };
     }
 
     /// Runs `f` on a background thread while animating `self.spinner` on the
     /// main thread so the transcript shows movement instead of freezing for
-    /// the duration of a blocking network call.
-    fn with_spinner<T, F>(&mut self, terminal: &mut DefaultTerminal, label: &str, f: F) -> T
+    /// the duration of a blocking network call. Returns `None` when the user
+    /// pressed Esc (or Ctrl-Q, which also sets `quit`) while it was running —
+    /// the worker is left to finish harmlessly in the background; its result
+    /// is discarded.
+    fn with_spinner<T, F>(&mut self, terminal: &mut DefaultTerminal, label: &str, f: F) -> Option<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -805,10 +821,14 @@ impl App {
                 self.scroll_to_bottom(terminal);
             }
             let _ = terminal.draw(|f| self.draw(f));
+            if self.poll_cancel_keys() {
+                self.spinner = None;
+                return None;
+            }
             match rx.recv_timeout(Duration::from_millis(110)) {
                 Ok(v) => {
                     self.spinner = None;
-                    return v;
+                    return Some(v);
                 }
                 Err(RecvTimeoutError::Timeout) => frame = frame.wrapping_add(1),
                 Err(RecvTimeoutError::Disconnected) => {
@@ -817,6 +837,27 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Non-blocking drain of pending key events while a request is in flight
+    /// (the main loop is otherwise stuck polling the worker channel and no
+    /// key would ever be seen). Esc asks to stop the current generation;
+    /// Ctrl-Q stops it and quits. Any other key is ignored.
+    fn poll_cancel_keys(&mut self) -> bool {
+        let mut stop = false;
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            let Ok(event::Event::Key(key)) = event::read() else { continue };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+                self.quit = true;
+                stop = true;
+            } else if key.code == KeyCode::Esc {
+                stop = true;
+            }
+        }
+        stop
     }
 
     fn adjust_setting(&mut self, delta: i32) {
@@ -863,10 +904,14 @@ impl App {
                 api::chat(&ep, &settings, "", &hist, Some(&schema))
             });
             match result {
-                Ok(outcome) => self.finish_reply(outcome, terminal),
-                Err(e) => {
+                Some(Ok(outcome)) => self.finish_reply(outcome, terminal),
+                Some(Err(e)) => {
                     self.session.messages.pop();
                     self.status = format!("request failed: {e}");
+                }
+                None => {
+                    self.session.messages.pop();
+                    self.status = "generation cancelled (Esc)".into();
                 }
             }
             return;
@@ -880,17 +925,22 @@ impl App {
         // loop can keep animating the spinner during the (sometimes long)
         // silent stretch spent inside hidden `reasoning_content` deltas,
         // instead of blocking on the socket read with a frozen screen.
+        // `cancel` lets an Esc in the main loop stop the read loop at the
+        // next SSE line, which drops the stream and closes the connection.
+        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let ep = self.ep.clone();
         let settings = self.settings.clone();
+        let cancel_worker = cancel.clone();
         thread::spawn(move || {
-            let mut stream = match api::chat_stream(&ep, &settings, "", &history, None) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Done(Err(e)));
-                    return;
-                }
-            };
+            let mut stream =
+                match api::chat_stream(&ep, &settings, "", &history, None, Some(cancel_worker)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Done(Err(e)));
+                        return;
+                    }
+                };
             loop {
                 match stream.next_chunk() {
                     Ok(Some(piece)) => {
@@ -928,6 +978,16 @@ impl App {
                 self.scroll_to_bottom(terminal);
             }
             let _ = terminal.draw(|f| self.draw(f));
+            if self.poll_cancel_keys() {
+                // Stop waiting for the worker: raise the flag so its read
+                // loop ends at the next SSE line (dropping the connection),
+                // then finalize whatever text already made it to the screen.
+                // Dropping `rx` on the way out makes the worker exit too.
+                self.spinner = None;
+                cancel.store(true, Ordering::Relaxed);
+                self.finish_cancelled(idx, terminal);
+                return;
+            }
             match rx.recv_timeout(Duration::from_millis(110)) {
                 Ok(StreamEvent::Piece(piece)) => {
                     if let Entry::Assistant { text, .. } = &mut self.entries[idx] {
@@ -955,6 +1015,38 @@ impl App {
                     return;
                 }
             }
+        }
+    }
+
+    /// Tail for a reply the user stopped with Esc: keep whatever text
+    /// already streamed in (subject to the same `max_chars` cap as a normal
+    /// reply) with a note marking the cut, or drop the half-exchange entirely
+    /// if nothing visible ever arrived.
+    fn finish_cancelled(&mut self, idx: usize, terminal: &mut DefaultTerminal) {
+        let partial = match self.entries.get(idx) {
+            Some(Entry::Assistant { text, .. }) if !text.trim().is_empty() => text.clone(),
+            _ => String::new(),
+        };
+        if partial.is_empty() {
+            self.session.messages.pop();
+            self.entries.remove(idx);
+            self.status = "generation stopped (Esc) — nothing was generated yet".into();
+        } else {
+            let (capped, was_cut) = api::enforce_max_chars(&partial, self.settings.max_chars);
+            let mut note = "stopped by Esc".to_string();
+            if was_cut {
+                note = format!("{note} · truncated to {} chars", self.settings.max_chars.unwrap_or(0));
+            }
+            if let Some(Entry::Assistant { text, note: n }) = self.entries.get_mut(idx) {
+                *text = capped.clone();
+                *n = Some(note);
+            }
+            self.session.push_assistant(capped);
+            self.status = "generation stopped by Esc — partial reply kept".into();
+        }
+        self.save_session();
+        if self.follow {
+            self.scroll_to_bottom(terminal);
         }
     }
 
@@ -1271,7 +1363,11 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let keys = "Enter send/run · Tab settings · Ctrl-N new · / Commands · Esc quit";
+        let keys = if self.spinner.is_some() {
+            "Esc stop generation · Ctrl-Q quit"
+        } else {
+            "Enter send/run · Tab settings · Ctrl-N new · / Commands · Esc quit"
+        };
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(self.status.clone(), Style::default().fg(Color::Cyan)),
@@ -1297,7 +1393,9 @@ const HELP: &str = "\
 /personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
 /personas a,b,c: <question>   same, with your own cast instead of the default three
 /settings                 open the settings panel (Tab does the same)
-/quit                     exit";
+/quit                     exit
+Esc while generating      stop the current generation (partial reply is kept)
+Ctrl-Q                    quit, even mid-generation";
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(2)).max(10);

@@ -7,6 +7,8 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::{Res, Settings};
@@ -319,6 +321,10 @@ pub struct ChatStream {
     reasoning: String,
     finish_reason: Option<String>,
     usage: Usage,
+    /// Set by the caller (e.g. the TUI on Esc) to stop consuming the stream;
+    /// checked between SSE lines so the read loop — and with it the
+    /// connection — ends promptly instead of draining the whole reply.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl ChatStream {
@@ -329,6 +335,9 @@ impl ChatStream {
     /// text.
     pub fn next_chunk(&mut self) -> Res<Option<String>> {
         loop {
+            if self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Ok(None);
+            }
             let Some(line) = self.lines.next() else {
                 return Ok(None);
             };
@@ -400,12 +409,15 @@ impl ChatStream {
 /// the whole body. `schema` is unused by streaming replies today (JSON mode
 /// stays on the non-streaming path in the TUI, since flattening structured
 /// output only makes sense once it's complete) but kept for signature parity.
+/// `cancel`, when given, is polled between SSE lines: once set, `next_chunk`
+/// stops and the stream (and its connection) can be dropped by the caller.
 pub fn chat_stream(
     ep: &Endpoint,
     settings: &Settings,
     system: &str,
     history: &[ChatMessage],
     schema: Option<&Value>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Res<ChatStream> {
     let mut body = build_body(&ep.model, settings, system, history, schema);
     let obj = body.as_object_mut().expect("object");
@@ -436,6 +448,7 @@ pub fn chat_stream(
         reasoning: String::new(),
         finish_reason: None,
         usage: Usage::default(),
+        cancel,
     })
 }
 
@@ -453,6 +466,7 @@ impl ChatStream {
             reasoning: String::new(),
             finish_reason: None,
             usage: Usage::default(),
+            cancel: None,
         }
     }
 }
@@ -583,6 +597,15 @@ mod tests {
         let outcome = stream.into_outcome();
         assert!(outcome.content.is_none());
         assert_eq!(outcome.text(), "");
+    }
+
+    #[test]
+    fn stream_cancel_flag_stops_the_read_loop() {
+        let mut stream = ChatStream::from_sse(SAMPLE_SSE);
+        stream.cancel = Some(Arc::new(AtomicBool::new(true)));
+        // Pre-set flag: the very first `next_chunk` call gives up without
+        // reading a single line, so the caller can drop the connection.
+        assert_eq!(stream.next_chunk(), Ok(None));
     }
 
     #[test]

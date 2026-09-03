@@ -41,8 +41,15 @@ PgUp / PgDn    scroll the conversation
 ↑ / ↓          with the cursor on the input's first/last line: scroll one line
 mouse wheel    scroll the conversation
 Home / End     jump to the top / bottom of the conversation
-Esc            close a panel, or quit from the input
+Esc            stop a running generation; otherwise close a panel or quit from the input
+Ctrl-Q         quit, even while a generation is running
 ```
+
+Pressing Esc while a reply is streaming stops it immediately: whatever text
+already arrived stays in the transcript (and the saved session) marked
+`[stopped by Esc]`; if nothing had arrived yet, the question is dropped
+entirely. The same works for any spinner-backed call (`/verify`,
+`/personas`, JSON-mode replies, `/json edit`).
 
 Scrolling up pauses the "follow the tail" behavior while a reply streams in;
 scrolling back to the bottom (or sending a new message) re-pins it.
