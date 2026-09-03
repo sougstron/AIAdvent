@@ -424,63 +424,126 @@ impl App {
         self.session.push_user(question.clone());
         self.entries.push(Entry::User(question));
         let history = self.session.history();
-        let schema = self
-            .settings
-            .json_mode
-            .enabled
-            .then(|| self.settings.json_mode.schema.clone());
+
+        // JSON mode stays on the blocking path: streamed fragments of a JSON
+        // object aren't valid JSON until the last token, so there's nothing
+        // meaningful to render live, and `render_json_reply` needs the whole
+        // body to flatten anyway.
+        if self.settings.json_mode.enabled {
+            let schema = Some(self.settings.json_mode.schema.clone());
+            let _ = terminal.draw(|f| draw_busy(f, "model is thinking…"));
+            match api::chat(&self.ep, &self.settings, "", &history, schema.as_ref()) {
+                Ok(outcome) => self.finish_reply(outcome, terminal),
+                Err(e) => {
+                    self.session.messages.pop();
+                    self.status = format!("request failed: {e}");
+                }
+            }
+            return;
+        }
 
         let _ = terminal.draw(|f| draw_busy(f, "model is thinking…"));
-        match api::chat(&self.ep, &self.settings, "", &history, schema.as_ref()) {
-            Ok(outcome) => {
-                let raw_text = outcome.text();
-                let (display, parse_note) = if self.settings.json_mode.enabled {
-                    render::render_json_reply(raw_text)
-                } else {
-                    (raw_text.to_string(), None)
-                };
-                let (capped, was_cut) = api::enforce_max_chars(&display, self.settings.max_chars);
-
-                self.session.push_assistant(capped.clone());
-                let mut note_parts = Vec::new();
-                if was_cut {
-                    note_parts.push(format!(
-                        "truncated to {} chars",
-                        self.settings.max_chars.unwrap_or(0)
-                    ));
-                }
-                if outcome.truncated() {
-                    note_parts.push("cut by token budget (finish_reason=length)".into());
-                }
-                if outcome.stopped_by_sequence() && !self.settings.stop.is_empty() {
-                    note_parts.push("stopped on a stop sequence".into());
-                }
-                if let Some(e) = parse_note {
-                    note_parts.push(e);
-                }
-                if let Some(r) = outcome.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
-                    note_parts.push(format!("reasoning: {} chars", r.trim().chars().count()));
-                }
-                self.entries.push(Entry::Assistant {
-                    text: capped,
-                    note: (!note_parts.is_empty()).then(|| note_parts.join(" · ")),
-                });
-                self.status = format!(
-                    "finish={} · tokens: prompt={} completion={} (reasoning={}) · {}ms",
-                    outcome.finish_reason.as_deref().unwrap_or("?"),
-                    outcome.usage.prompt_tokens,
-                    outcome.usage.completion_tokens,
-                    outcome.usage.reasoning_tokens,
-                    outcome.latency_ms
-                );
-                self.save_session();
-                self.scroll_to_bottom(terminal);
-            }
+        let mut stream = match api::chat_stream(&self.ep, &self.settings, "", &history, None) {
+            Ok(s) => s,
             Err(e) => {
                 self.session.messages.pop();
                 self.status = format!("request failed: {e}");
+                return;
+            }
+        };
+
+        self.entries.push(Entry::Assistant { text: String::new(), note: None });
+        let idx = self.entries.len() - 1;
+        self.status = "generating…".into();
+
+        let mut stream_err = None;
+        loop {
+            match stream.next_chunk() {
+                Ok(Some(piece)) => {
+                    if let Entry::Assistant { text, .. } = &mut self.entries[idx] {
+                        text.push_str(&piece);
+                    }
+                    self.scroll_to_bottom(terminal);
+                    let _ = terminal.draw(|f| self.draw(f));
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    stream_err = Some(e);
+                    break;
+                }
             }
         }
+
+        let mut outcome = stream.into_outcome();
+        if let Some(e) = &stream_err {
+            // Keep whatever text already streamed in rather than discarding
+            // it — the user watched it arrive, so it stays in the transcript
+            // (and in session history, so a follow-up question has the same
+            // context the user is looking at) with a note explaining the cut.
+            let interrupted = format!("stream interrupted: {e}");
+            outcome.finish_reason = Some(
+                outcome
+                    .finish_reason
+                    .map_or(interrupted.clone(), |fr| format!("{fr}, {interrupted}")),
+            );
+        }
+        self.finish_reply_at(idx, outcome, terminal);
+    }
+
+    /// Shared tail of both the streaming and blocking reply paths: enforce
+    /// `max_chars`, persist to the session, build the status/note text, and
+    /// write the final text into `entries[idx]`.
+    fn finish_reply_at(&mut self, idx: usize, outcome: api::Outcome, terminal: &mut DefaultTerminal) {
+        let raw_text = outcome.text();
+        let (display, parse_note) = if self.settings.json_mode.enabled {
+            render::render_json_reply(raw_text)
+        } else {
+            (raw_text.to_string(), None)
+        };
+        let (capped, was_cut) = api::enforce_max_chars(&display, self.settings.max_chars);
+
+        self.session.push_assistant(capped.clone());
+        let mut note_parts = Vec::new();
+        if was_cut {
+            note_parts.push(format!(
+                "truncated to {} chars",
+                self.settings.max_chars.unwrap_or(0)
+            ));
+        }
+        if outcome.truncated() {
+            note_parts.push("cut by token budget (finish_reason=length)".into());
+        }
+        if outcome.stopped_by_sequence() && !self.settings.stop.is_empty() {
+            note_parts.push("stopped on a stop sequence".into());
+        }
+        if let Some(e) = parse_note {
+            note_parts.push(e);
+        }
+        if let Some(r) = outcome.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
+            note_parts.push(format!("reasoning: {} chars", r.trim().chars().count()));
+        }
+        let note = (!note_parts.is_empty()).then(|| note_parts.join(" · "));
+        if let Some(Entry::Assistant { text, note: n }) = self.entries.get_mut(idx) {
+            *text = capped;
+            *n = note;
+        }
+        self.status = format!(
+            "finish={} · tokens: prompt={} completion={} (reasoning={}) · {}ms",
+            outcome.finish_reason.as_deref().unwrap_or("?"),
+            outcome.usage.prompt_tokens,
+            outcome.usage.completion_tokens,
+            outcome.usage.reasoning_tokens,
+            outcome.latency_ms
+        );
+        self.save_session();
+        self.scroll_to_bottom(terminal);
+    }
+
+    /// Blocking-path variant: no live entry exists yet, so append one first.
+    fn finish_reply(&mut self, outcome: api::Outcome, terminal: &mut DefaultTerminal) {
+        self.entries.push(Entry::Assistant { text: String::new(), note: None });
+        let idx = self.entries.len() - 1;
+        self.finish_reply_at(idx, outcome, terminal);
     }
 
     fn draw(&self, f: &mut Frame) {
