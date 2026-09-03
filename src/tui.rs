@@ -71,6 +71,8 @@ struct App {
     settings_selected: usize,
     sessions_list: Vec<SessionSummary>,
     sessions_selected: usize,
+    /// Index into `sessions_list` awaiting a y/n confirmation before delete.
+    sessions_pending_delete: Option<usize>,
     cmd_popup_dismissed: bool,
     cmd_selected: usize,
     quit: bool,
@@ -91,6 +93,7 @@ impl App {
             settings_selected: 0,
             sessions_list: Vec::new(),
             sessions_selected: 0,
+            sessions_pending_delete: None,
             cmd_popup_dismissed: false,
             cmd_selected: 0,
             quit: false,
@@ -250,6 +253,10 @@ impl App {
     }
 
     fn handle_sessions_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) {
+        if self.sessions_pending_delete.is_some() {
+            self.handle_sessions_confirm_key(code);
+            return;
+        }
         match code {
             KeyCode::Esc => self.focus = Focus::Input,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -264,7 +271,42 @@ impl App {
                 }
             }
             KeyCode::Enter => self.load_selected_session(terminal),
+            KeyCode::Char('d') | KeyCode::Delete if !self.sessions_list.is_empty() => {
+                self.sessions_pending_delete = Some(self.sessions_selected);
+            }
             _ => {}
+        }
+    }
+
+    /// While a delete confirmation popup is showing: y/Enter deletes,
+    /// n/Esc/anything else cancels back to the plain sessions list.
+    fn handle_sessions_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.delete_selected_session(),
+            _ => self.sessions_pending_delete = None,
+        }
+    }
+
+    fn delete_selected_session(&mut self) {
+        let Some(idx) = self.sessions_pending_delete.take() else { return };
+        let Some(summary) = self.sessions_list.get(idx) else { return };
+        let id = summary.id.clone();
+        let title = summary.title.clone();
+        match session::delete_session(&self.sessions_dir, &id) {
+            Ok(()) => {
+                if self.session.id == id {
+                    // The chat currently open was the one deleted — detach it
+                    // from disk so the next autosave doesn't resurrect the file.
+                    self.session = Session::new(self.settings.clone());
+                    self.entries.clear();
+                }
+                self.sessions_list.remove(idx);
+                if self.sessions_selected >= self.sessions_list.len() {
+                    self.sessions_selected = self.sessions_list.len().saturating_sub(1);
+                }
+                self.status = format!("deleted '{title}'");
+            }
+            Err(e) => self.status = format!("delete failed: {e}"),
         }
     }
 
@@ -780,9 +822,28 @@ impl App {
         state.select(Some(self.sessions_selected));
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
-            List::new(items).block(Block::bordered().title(" sessions — ↑↓ select, Enter open, Esc close ")),
+            List::new(items)
+                .block(Block::bordered().title(" sessions — ↑↓ select, Enter open, d delete, Esc close ")),
             popup,
             &mut state,
+        );
+        if let Some(idx) = self.sessions_pending_delete {
+            if let Some(s) = self.sessions_list.get(idx) {
+                self.draw_delete_confirm(f, area, &s.title);
+            }
+        }
+    }
+
+    fn draw_delete_confirm(&self, f: &mut Frame, area: Rect, title: &str) {
+        let msg = format!("Delete '{title}'? y/n");
+        let width = (msg.chars().count() as u16 + 4).min(area.width.saturating_sub(2)).max(20);
+        let popup = centered(area, width, 3);
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_widget(
+            Paragraph::new(msg)
+                .style(Style::default().fg(Color::Red))
+                .block(Block::bordered().title(" confirm delete ")),
+            popup,
         );
     }
 

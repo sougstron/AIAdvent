@@ -33,6 +33,7 @@ Enter          send a message, or run a /command
 Tab            toggle focus between the input and the settings panel
 ↑↓ / j k       (settings/sessions panel) move the selection
 ←→ / h l       (settings panel) change the selected setting
+d / Delete     (sessions panel) delete the selected chat, with y/n confirmation
 Ctrl-N         start a new chat session
 PgUp / PgDn    scroll the conversation
 Esc            close a panel, or quit from the input
@@ -63,6 +64,11 @@ were active. `/new` starts one; `/sessions` lists every session saved so far
 (most recent first) and lets you switch. Sessions are written to
 `~/.ask/sessions/<id>.json` after every turn, so old chats survive a restart.
 Override the location with `$ASK_SESSIONS_DIR` (used by the test suite).
+
+Press `d` (or Delete) on a highlighted session in the `/sessions` list to
+delete it — a confirmation prompt (`y`/`n`) guards against accidental loss.
+Deleting the chat currently open starts a fresh one in its place, so the
+next autosave doesn't recreate the file you just removed.
 
 ## Reasoning effort
 

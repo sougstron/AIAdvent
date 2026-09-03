@@ -146,6 +146,11 @@ pub fn load_session(dir: &Path, id: &str) -> Res<Session> {
     serde_json::from_str(&raw).map_err(|e| format!("cannot parse {}: {e}", path.display()))
 }
 
+pub fn delete_session(dir: &Path, id: &str) -> Res<()> {
+    let path = dir.join(format!("{id}.json"));
+    fs::remove_file(&path).map_err(|e| format!("cannot delete {}: {e}", path.display()))
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -189,5 +194,27 @@ mod tests {
         s.push_user("first message here".into());
         s.push_user("second one".into());
         assert_eq!(s.title, "first message here");
+    }
+
+    #[test]
+    fn delete_session_removes_it_from_the_list() {
+        let dir = tmp_dir("delete");
+        let mut s = Session::new(Settings::default());
+        s.push_user("goodbye chat".into());
+        s.save(&dir).unwrap();
+        assert_eq!(list_sessions(&dir).len(), 1);
+
+        delete_session(&dir, &s.id).unwrap();
+        assert_eq!(list_sessions(&dir).len(), 0);
+        assert!(load_session(&dir, &s.id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_session_missing_file_errors() {
+        let dir = tmp_dir("delete-missing");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(delete_session(&dir, "no-such-id").is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
