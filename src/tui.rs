@@ -142,7 +142,10 @@ impl App {
             }
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::PageDown => {
+                let max = self.max_scroll(terminal);
+                self.scroll = self.scroll.saturating_add(10).min(max);
+            }
             KeyCode::Home => self.scroll = 0,
             _ => {}
         }
@@ -560,19 +563,23 @@ impl App {
         );
     }
 
-    /// Scrolls to the true bottom of the wrapped transcript. `scroll:
-    /// u16::MAX` looks tempting but `Paragraph::scroll` clips rather than
-    /// clamps, so an offset past the content renders a blank pane — this
-    /// computes the real last-page offset via `line_count` instead.
-    fn scroll_to_bottom(&mut self, terminal: &DefaultTerminal) {
-        let Ok(size) = terminal.size() else { return };
+    /// The last-page scroll offset for the wrapped transcript. `Paragraph::scroll`
+    /// clips rather than clamps, so any offset past this renders a blank pane —
+    /// every manual or automatic scroll must be capped to this value.
+    fn max_scroll(&self, terminal: &DefaultTerminal) -> u16 {
+        let Ok(size) = terminal.size() else { return self.scroll };
         // Mirrors the vertical layout in `draw`: header(3) + input(3) + footer(2).
         let body_height = size.height.saturating_sub(3 + 3 + 2);
         let inner_width = size.width.saturating_sub(2); // block borders
         let inner_height = body_height.saturating_sub(2); // block borders
         let total_lines =
             Paragraph::new(self.transcript_text()).wrap(Wrap { trim: false }).line_count(inner_width) as u16;
-        self.scroll = total_lines.saturating_sub(inner_height);
+        total_lines.saturating_sub(inner_height)
+    }
+
+    /// Scrolls to the true bottom of the wrapped transcript (see `max_scroll`).
+    fn scroll_to_bottom(&mut self, terminal: &DefaultTerminal) {
+        self.scroll = self.max_scroll(terminal);
     }
 
     fn draw_settings_overlay(&self, f: &mut Frame, area: Rect) {
