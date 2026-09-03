@@ -30,14 +30,28 @@ echo "Explain Rust ownership in one sentence" | ./target/release/ask
 
 ```
 Enter          send a message, or run a /command
+Shift+Enter    insert a newline (the input box grows up to 4 lines as it wraps)
+←→ ↑↓          move the cursor through the input text
 Tab            toggle focus between the input and the settings panel
 ↑↓ / j k       (settings/sessions panel) move the selection
 ←→ / h l       (settings panel) change the selected setting
 d / Delete     (sessions panel) delete the selected chat, with y/n confirmation
 Ctrl-N         start a new chat session
 PgUp / PgDn    scroll the conversation
+↑ / ↓          with the cursor on the input's first/last line: scroll one line
+mouse wheel    scroll the conversation
+Home / End     jump to the top / bottom of the conversation
 Esc            close a panel, or quit from the input
 ```
+
+Scrolling up pauses the "follow the tail" behavior while a reply streams in;
+scrolling back to the bottom (or sending a new message) re-pins it.
+
+Telling the terminal apart for Shift+Enter requires the kitty keyboard
+protocol; the app requests it on startup. On terminals that support it
+(kitty, alacritty, ghostty, wezterm, foot, contemporary tmux with
+extended-keys, …) Shift+Enter inserts a newline; elsewhere it degrades to a
+plain Enter.
 
 ### Slash commands
 
