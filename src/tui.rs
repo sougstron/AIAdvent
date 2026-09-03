@@ -26,6 +26,10 @@ const BUDGET_CHOICES: &[Option<u32>] =
 const STOP_PRESETS: &[&[&str]] = &[&[], &["\n\n"], &["\n---\n"], &["\n\n\n"]];
 const TEMP_CHOICES: &[Option<f32>] = &[None, Some(0.0), Some(0.3), Some(0.7), Some(1.0)];
 const SETTINGS_ROWS: &[&str] = &["effort", "json mode", "max_chars", "budget_tokens", "stop", "temperature"];
+/// Slash commands offered by the input popup, kept in alphabetical order
+/// since that's the order the popup lists them in.
+const COMMANDS: &[&str] =
+    &["effort", "help", "json", "new", "quit", "sessions", "settings", "stop", "verify"];
 
 pub fn run(settings: Settings) -> Res<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -67,6 +71,8 @@ struct App {
     settings_selected: usize,
     sessions_list: Vec<SessionSummary>,
     sessions_selected: usize,
+    cmd_popup_dismissed: bool,
+    cmd_selected: usize,
     quit: bool,
 }
 
@@ -85,6 +91,8 @@ impl App {
             settings_selected: 0,
             sessions_list: Vec::new(),
             sessions_selected: 0,
+            cmd_popup_dismissed: false,
+            cmd_selected: 0,
             quit: false,
         }
     }
@@ -123,6 +131,31 @@ impl App {
     }
 
     fn handle_input_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) {
+        // The command popup only hijacks the arrow keys; Char/Backspace/Enter/
+        // Tab/Esc fall through unchanged so typing and the existing bindings
+        // keep working while the popup is open.
+        if self.command_popup_active() {
+            match code {
+                KeyCode::Up => {
+                    self.move_command_selection(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.move_command_selection(1);
+                    return;
+                }
+                KeyCode::Left => {
+                    self.cmd_popup_dismissed = true;
+                    return;
+                }
+                KeyCode::Right => {
+                    self.apply_selected_command(terminal);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match code {
             KeyCode::Esc => self.quit = true,
             KeyCode::Tab => {
@@ -131,6 +164,8 @@ impl App {
             }
             KeyCode::Enter if !self.input.trim().is_empty() => {
                 let line = std::mem::take(&mut self.input);
+                self.cmd_popup_dismissed = false;
+                self.cmd_selected = 0;
                 if let Some(cmd) = line.trim().strip_prefix('/') {
                     self.handle_command(cmd.trim(), terminal);
                 } else {
@@ -139,8 +174,15 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.input.pop();
+                if self.input.is_empty() {
+                    self.cmd_popup_dismissed = false;
+                }
+                self.cmd_selected = 0;
             }
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.cmd_selected = 0;
+            }
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => {
                 let max = self.max_scroll(terminal);
@@ -149,6 +191,44 @@ impl App {
             KeyCode::Home => self.scroll = 0,
             _ => {}
         }
+    }
+
+    /// Whether the input line is currently in "/" command-selection mode:
+    /// still composing the command name (no space yet), not dismissed with
+    /// Left, and at least one command matches the typed prefix.
+    fn command_popup_active(&self) -> bool {
+        !self.cmd_popup_dismissed
+            && self.input.starts_with('/')
+            && !self.input[1..].contains(char::is_whitespace)
+            && !self.filtered_commands().is_empty()
+    }
+
+    /// Commands matching the text typed after "/", alphabetically ordered
+    /// (mirrors `COMMANDS`), case-insensitive prefix match.
+    fn filtered_commands(&self) -> Vec<&'static str> {
+        let prefix = self.input.strip_prefix('/').unwrap_or("").to_ascii_lowercase();
+        COMMANDS.iter().copied().filter(|c| c.starts_with(prefix.as_str())).collect()
+    }
+
+    fn move_command_selection(&mut self, delta: i32) {
+        let n = self.filtered_commands().len();
+        if n == 0 {
+            return;
+        }
+        let i = self.cmd_selected.min(n - 1) as i32;
+        self.cmd_selected = (i + delta).rem_euclid(n as i32) as usize;
+    }
+
+    fn apply_selected_command(&mut self, terminal: &mut DefaultTerminal) {
+        let cmds = self.filtered_commands();
+        let Some(name) = cmds.get(self.cmd_selected.min(cmds.len().saturating_sub(1))) else {
+            return;
+        };
+        let name = name.to_string();
+        self.input.clear();
+        self.cmd_popup_dismissed = false;
+        self.cmd_selected = 0;
+        self.handle_command(&name, terminal);
     }
 
     fn handle_settings_key(&mut self, code: KeyCode) {
@@ -573,6 +653,8 @@ impl App {
             self.draw_settings_overlay(f, body);
         } else if self.focus == Focus::Sessions {
             self.draw_sessions_overlay(f, body);
+        } else if self.focus == Focus::Input && self.command_popup_active() {
+            self.draw_command_popup(f, body);
         }
     }
 
@@ -704,8 +786,39 @@ impl App {
         );
     }
 
+    /// Anchored to the bottom of the transcript area, directly above the
+    /// input box, so it reads like a dropdown under the cursor.
+    fn draw_command_popup(&self, f: &mut Frame, body: Rect) {
+        let cmds = self.filtered_commands();
+        let selected = self.cmd_selected.min(cmds.len().saturating_sub(1));
+        let height = (cmds.len() as u16 + 2).min(body.height);
+        let width = 40.min(body.width);
+        let popup = Rect {
+            x: body.x,
+            y: body.y + body.height.saturating_sub(height),
+            width,
+            height,
+        };
+        let items: Vec<ListItem> = cmds
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let marker = if i == selected { "▸ " } else { "  " };
+                ListItem::new(format!("{marker}/{name}"))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(selected));
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_stateful_widget(
+            List::new(items).block(Block::bordered().title(" commands — ↑↓ select, → apply, ← close ")),
+            popup,
+            &mut state,
+        );
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let keys = "Enter send/run · Tab settings · Ctrl-N new · /sessions /effort /json /verify /help · Esc quit";
+        let keys = "Enter send/run · Tab settings · Ctrl-N new · / Commands · Esc quit";
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(self.status.clone(), Style::default().fg(Color::Cyan)),
