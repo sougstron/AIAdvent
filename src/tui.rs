@@ -3,9 +3,9 @@
 //! and stop-condition settings.
 
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -74,17 +74,21 @@ pub fn run(settings: Settings) -> Res<()> {
     })?;
     // Mouse capture for wheel scrolling; kitty keyboard flags so Shift+Enter
     // arrives as Enter+SHIFT instead of a plain Enter (terminals without
-    // support ignore the push and Shift+Enter degrades to Enter).
+    // support ignore the push and Shift+Enter degrades to Enter); bracketed
+    // paste so pasted multi-line text arrives as one Paste event instead of
+    // a burst of Char/Enter keys that would send each line separately.
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         EnableMouseCapture,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     let result = App::new(ep, settings).event_loop(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         PopKeyboardEnhancementFlags,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     );
     ratatui::restore();
     result
@@ -173,6 +177,7 @@ impl App {
             match event::read().map_err(|e| e.to_string())? {
                 Event::Key(key) => self.handle_key(key, terminal),
                 Event::Mouse(mouse) => self.handle_mouse(mouse.kind, terminal),
+                Event::Paste(text) => self.handle_paste(&text, terminal),
                 _ => continue,
             }
         }
@@ -346,6 +351,22 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Bracketed-paste handler: inserts the whole pasted text at the cursor
+    /// in one go — newlines included — so a multi-line paste lands in the
+    /// input box as a single message instead of being sent line by line.
+    fn handle_paste(&mut self, text: &str, terminal: &mut DefaultTerminal) {
+        if self.focus != Focus::Input {
+            return;
+        }
+        let width = terminal.size().map(|s| s.width).unwrap_or(80);
+        let text = normalize_paste(text);
+        let byte = byte_pos(&self.input, self.cursor);
+        self.input.insert_str(byte, &text);
+        self.cursor += text.chars().count();
+        self.cmd_selected = 0;
+        self.sync_input_scroll(width);
     }
 
     /// Inserts `c` at the cursor (which is a char offset; the `String` API
@@ -1432,6 +1453,13 @@ fn byte_pos(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
 }
 
+/// Pasted newlines arrive as `\n` from most terminals but as `\r` (tmux)
+/// or `\r\n` from others; fold all three forms onto `\n` so the text wraps
+/// into real input lines instead of smearing across the row via CR.
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Inner text width of the input box for a frame of `width` columns.
 fn input_width(width: u16) -> usize {
     width.saturating_sub(2).max(1) as usize
@@ -1655,5 +1683,13 @@ mod tests {
         assert_eq!(byte_pos(s, 2), "aé".len());
         assert_eq!(byte_pos(s, 3), "aé日".len());
         assert_eq!(byte_pos(s, 99), s.len());
+    }
+
+    #[test]
+    fn normalize_paste_folds_cr_and_crlf_onto_lf() {
+        assert_eq!(normalize_paste("a\nb"), "a\nb");
+        assert_eq!(normalize_paste("a\rb"), "a\nb");
+        assert_eq!(normalize_paste("a\r\nb"), "a\nb");
+        assert_eq!(normalize_paste("no breaks"), "no breaks");
     }
 }

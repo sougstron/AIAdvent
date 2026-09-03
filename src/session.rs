@@ -72,7 +72,12 @@ impl Session {
 
     pub fn push_user(&mut self, content: String) {
         if self.messages.is_empty() {
-            self.title = content.chars().take(32).collect();
+            // Newlines in the title would smear the single-line header, so
+            // fold them to spaces.
+            self.title = content.replace("\r\n", "\n").replace(['\n', '\r'], " ")
+                .chars()
+                .take(32)
+                .collect();
         }
         self.messages.push(StoredMessage {
             role: "user".into(),
@@ -194,6 +199,13 @@ mod tests {
         s.push_user("first message here".into());
         s.push_user("second one".into());
         assert_eq!(s.title, "first message here");
+    }
+
+    #[test]
+    fn title_folds_newlines_to_spaces() {
+        let mut s = Session::new(Settings::default());
+        s.push_user("first line\nsecond line\r\nthird".into());
+        assert_eq!(s.title, "first line second line third");
     }
 
     #[test]
