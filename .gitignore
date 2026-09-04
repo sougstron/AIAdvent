@@ -1,5 +1,20 @@
 target/
 runs/
 docs/
+# keep the release binary inside task snapshots (see docs/CurrentTask.md)
+!tree/tasks-1-3/target/
+tree/tasks-1-3/target/*
+!tree/tasks-1-3/target/release/
+tree/tasks-1-3/target/release/*
+!tree/tasks-1-3/target/release/ask
+!tree/task-4/target/
+tree/task-4/target/*
+!tree/task-4/target/release/
+tree/task-4/target/release/*
+!tree/task-4/target/release/ask
+# the current-task pointer is tracked even though docs/ is ignored
+!docs/
+docs/*
+!docs/CurrentTask.md
 .omo/
 PLAN.md

@@ -13,6 +13,9 @@ Project-specific notes for Claude Code:
 - Changes to `src/tui.rs` (scroll, layout, panels) need a live tmux smoke test,
   not just a compile check — see AGENTS.md's "real bug twice" note on scroll
   clamping.
+- There is a single current global task: the active snapshot folder lives
+  under `tree/` and is named in `docs/CurrentTask.md`. Work only in that
+  folder; don't touch the rest of the code (root `src/`, other snapshots).
 - The stop-condition proof (`verify.rs`, `/verify`, `--verify-stop`) is the
   feature the user cares most about being *actually true*, not just plausible.
   If you touch it, re-run it live and confirm the causal signature
