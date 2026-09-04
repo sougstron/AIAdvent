@@ -22,6 +22,7 @@ use crate::verify;
         ask                                   open the chat TUI\n  \
         ask \"what is the capital of France?\"   one-shot question\n  \
         ask --verify-stop                     prove the stop condition works\n  \
+        ask --verify-temp --temperature 2     prove temperature changes the output\n  \
         ask --sessions                        list saved chat sessions"
 )]
 pub struct Cli {
@@ -74,6 +75,15 @@ pub struct Cli {
     /// Run the stop-condition proof (same prompt, off vs on) and exit.
     #[arg(long)]
     pub verify_stop: bool,
+
+    /// Run the temperature proof (same prompt sampled at 0.0 vs at
+    /// --temperature) and exit.
+    #[arg(long)]
+    pub verify_temp: bool,
+
+    /// Samples per side for --verify-temp.
+    #[arg(long, default_value_t = verify::DEFAULT_TEMP_RUNS)]
+    pub verify_runs: usize,
 
     /// List saved chat sessions and exit.
     #[arg(long)]
@@ -160,6 +170,18 @@ pub fn run() -> Res<()> {
         };
         let report = verify::run(&ep, &settings, &prompt)?;
         println!("{}", report.render());
+        return Ok(());
+    }
+
+    if cli.verify_temp {
+        let ep = Endpoint::resolve()?;
+        let prompt = if cli.question.is_empty() {
+            verify::DEFAULT_TEMP_PROMPT.to_string()
+        } else {
+            cli.question.join(" ")
+        };
+        let report = verify::run_temperature(&ep, &settings, &prompt, cli.verify_runs)?;
+        print!("{}", report.render());
         return Ok(());
     }
 
