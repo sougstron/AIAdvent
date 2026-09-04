@@ -18,3 +18,6 @@ docs/*
 !docs/CurrentTask.md
 .omo/
 PLAN.md
+
+# tauri-build генерирует их при каждой сборке
+tree/task-4/gen/schemas/

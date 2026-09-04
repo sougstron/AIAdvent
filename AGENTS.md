@@ -50,6 +50,15 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
+**The active snapshot is no longer this chat TUI.** `tree/task-4/` is
+*Temperature Lab*, a Tauri desktop app that fires one prompt at
+`temperature` 0 / 0.7 / 1.2 and has `glm-5.3` compare the three answers. It
+has its own `README.md` covering its build, its providers, and — importantly
+— the two traps found while building it: the Z.AI subscription endpoint
+silently ignores `temperature`, and one OpenRouter backend is
+non-deterministic even at `temperature = 0`. Everything below in this file
+describes the older TUI that still lives in the repo root `src/`.
+
 ## Layout
 
 ```

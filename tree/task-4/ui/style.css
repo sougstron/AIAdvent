@@ -1,0 +1,297 @@
+/* Тёмная тема; каждая температура получает свой оттенок — от холодного к тёплому. */
+:root {
+  --bg: #0e1116;
+  --panel: #161b23;
+  --panel-2: #1c2230;
+  --line: #262d3a;
+  --text: #e6eaf2;
+  --muted: #8b95a7;
+  --accent: #6aa6ff;
+
+  --t0: #58a6ff;   /* temperature 0   — холодный */
+  --t07: #b892ff;  /* temperature 0.7 — переход */
+  --t12: #ff9d5c;  /* temperature 1.2 — тёплый */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 "Inter", "Segoe UI", system-ui, sans-serif;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 22px 26px 30px;
+  overflow-y: auto;
+}
+
+.hidden { display: none !important; }
+.muted { color: var(--muted); font-size: 13px; }
+
+/* ---------- шапка ---------- */
+.top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+h1 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: -0.02em;
+  background: linear-gradient(92deg, var(--t0), var(--t07) 55%, var(--t12));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.sub { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+code {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.92em;
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 5px;
+}
+.models { display: flex; gap: 8px; flex-wrap: wrap; }
+.pill {
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 11px;
+  white-space: nowrap;
+}
+.pill b { color: var(--text); font-weight: 600; }
+
+/* ---------- ввод ---------- */
+.composer {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+textarea {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 11px 13px;
+  font: inherit;
+  outline: none;
+}
+textarea:focus { border-color: var(--accent); }
+
+.composer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.presets { display: flex; gap: 7px; flex-wrap: wrap; }
+.presets button {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.presets button:hover { color: var(--text); border-color: var(--accent); }
+
+.controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.runs {
+  font-size: 12.5px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+/* WebKitGTK рисует свой контрол и игнорирует цвета, пока не снять appearance —
+   без этого текст в списке серый по серому и не читается. */
+select {
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--panel-2)
+    url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath fill='%238b95a7' d='M0 0h10L5 6z'/%3E%3C/svg%3E")
+    no-repeat right 9px center;
+  background-size: 9px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 26px 6px 9px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+select:hover { border-color: var(--accent); }
+/* Выпадающий список рисуется системой — задаём цвета и ему. */
+select option { background: var(--panel-2); color: var(--text); }
+.go {
+  background: linear-gradient(92deg, var(--t0), var(--t12));
+  color: #0e1116;
+  font: inherit;
+  font-weight: 650;
+  border: 0;
+  border-radius: 9px;
+  padding: 9px 22px;
+  cursor: pointer;
+}
+.go:disabled { opacity: 0.5; cursor: progress; }
+.ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.ghost:hover { color: var(--text); border-color: var(--accent); }
+
+/* ---------- вердикт проверки температуры ---------- */
+.verdict.ok { color: #7ee2a8; border-color: #2f5d43; }
+.verdict.bad { color: #ff9d9d; border-color: #6d3a3a; }
+.verdict.meh { color: #ffd479; border-color: #6b5a2c; }
+
+.check {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 10px;
+  padding: 12px 15px;
+  background: var(--panel);
+  font-size: 13.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.check.ok { border-left-color: #7ee2a8; }
+.check.bad { border-left-color: #ff9d9d; }
+.check.meh { border-left-color: #ffd479; }
+.check b { font-weight: 650; }
+.check .probe {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+.check .probe b { color: var(--text); font-weight: 500; }
+
+/* ---------- статус ---------- */
+.status {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 11px 14px;
+  font-size: 13.5px;
+  background: var(--panel);
+}
+.status.err { border-color: #7a3b3b; background: #24171a; color: #ffb4b4; }
+.status .dots::after {
+  content: "";
+  animation: dots 1.2s steps(4, end) infinite;
+}
+@keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+
+/* ---------- карточки ---------- */
+.results { display: flex; flex-direction: column; gap: 18px; }
+.cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+@media (max-width: 1000px) { .cards { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 15px 16px;
+}
+.tcard { border-top: 3px solid var(--tone); display: flex; flex-direction: column; gap: 11px; }
+.tcard h3 { margin: 0; font-size: 14px; color: var(--muted); font-weight: 500; }
+.tcard h3 b { color: var(--tone); font-size: 20px; font-weight: 700; margin-left: 6px; }
+
+.answer {
+  white-space: pre-wrap;
+  font-size: 14px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.meters { display: flex; flex-direction: column; gap: 8px; }
+.meter-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.meter-label b { color: var(--text); font-weight: 600; }
+.bar { height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--tone); border-radius: 3px; }
+
+.facts { display: flex; gap: 6px; flex-wrap: wrap; }
+.fact {
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+
+details.extra { border-top: 1px solid var(--line); padding-top: 9px; }
+details.extra summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--muted);
+  list-style: none;
+}
+details.extra summary:hover { color: var(--text); }
+details.extra summary::before { content: "▸ "; }
+details.extra[open] summary::before { content: "▾ "; }
+details.extra .answer { max-height: 220px; margin-top: 9px; font-size: 13px; }
+details.extra .run-tag { font-size: 11.5px; color: var(--tone); margin-top: 10px; }
+
+/* ---------- разбор ---------- */
+.summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.summary-head h2 { margin: 0; font-size: 16px; }
+.summary-actions { display: flex; align-items: center; gap: 12px; }
+
+.md h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  margin: 18px 0 6px;
+}
+.md h2:first-child { margin-top: 6px; }
+.md p { margin: 0 0 9px; }
+.md ul { margin: 0 0 9px; padding-left: 20px; }
+.md li { margin-bottom: 4px; }
+.md strong { color: #fff; }

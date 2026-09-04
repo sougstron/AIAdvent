@@ -1,669 +1,368 @@
-//! Talking to the OpenAI-compatible endpoint. Multi-turn: the whole visible
-//! history is resent every call, exactly like a real chat client.
+//! Клиент к OpenAI-совместимым endpoint'ам.
+//!
+//! Провайдеров два, и это не про «на всякий случай»: подписочный endpoint Z.AI
+//! молча игнорирует `temperature` (см. `verify.rs` — там это доказывается
+//! замером, а не на словах), поэтому для самого эксперимента нужен бэкенд,
+//! который параметр честно применяет. Разбор при этом всё равно делает
+//! `glm-5.3` — на него игнор температуры не влияет.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::config::{Res, Settings};
+pub type Res<T> = Result<T, String>;
 
-const DEFAULT_BASE_URL: &str = "https://yolo-auto.com/v1";
-const DEFAULT_MODEL: &str = "qwen3.8-27b";
+/// Разбор трёх ответов — всегда старшая модель Z.AI, как в задании.
+pub const JUDGE_PROVIDER: Provider = Provider::Zai;
+pub const JUDGE_MODEL: &str = "glm-5.3";
 
-#[derive(Deserialize)]
-struct PiModels {
-    providers: std::collections::BTreeMap<String, PiProvider>,
+/// Конкретная площадка OpenRouter, к которой прибиты все прогоны (см. `adjust`).
+///
+/// Выбрана не по цене: `deepinfra/turbo` при temperature=0 выдавал разные
+/// ответы на один и тот же запрос (спекулятивное декодирование ломает
+/// воспроизводимость жадного прохода), и это выглядело как «температура
+/// не работает». `nebius/fp8`, `crusoe/bf16` и `novita/bf16` дают 4/4
+/// одинаковых ответа; берём первую — дешёвую и со 131k контекста.
+const OPENROUTER_BACKEND: &str = "nebius/fp8";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// Coding-подписка Z.AI из `~/.pi/agent/auth.json`.
+    Zai,
+    /// Ключ OpenRouter оттуда же.
+    OpenRouter,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PiProvider {
-    #[serde(default)]
-    api_key: Option<String>,
+impl Provider {
+    pub const ALL: [Provider; 2] = [Provider::OpenRouter, Provider::Zai];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Provider::Zai => "zai",
+            Provider::OpenRouter => "openrouter",
+        }
+    }
+
+    pub fn parse(s: &str) -> Res<Provider> {
+        match s {
+            "zai" => Ok(Provider::Zai),
+            "openrouter" | "or" => Ok(Provider::OpenRouter),
+            other => Err(format!("неизвестный провайдер: {other} (zai | openrouter)")),
+        }
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Provider::Zai => "https://open.bigmodel.cn/api/coding/paas/v4",
+            Provider::OpenRouter => "https://openrouter.ai/api/v1",
+        }
+    }
+
+    /// Модель, которой задаём три температуры.
+    pub fn answer_model(self) -> &'static str {
+        match self {
+            Provider::Zai => "glm-5.3-flash",
+            Provider::OpenRouter => "meta-llama/llama-3.3-70b-instruct",
+        }
+    }
+
+    /// Ключ в `~/.pi/agent/auth.json` и переменная окружения, которая его перебивает.
+    fn auth_entry(self) -> (&'static str, &'static str) {
+        match self {
+            Provider::Zai => ("zai-coding-cn", "ZAI_API_KEY"),
+            Provider::OpenRouter => ("openrouter", "OPENROUTER_API_KEY"),
+        }
+    }
+
+    /// Правки тела запроса под конкретный API.
+    fn adjust(self, body: &mut Value, thinking: bool) {
+        match self {
+            // GLM по умолчанию «думает», а длинная цепочка рассуждений сама по
+            // себе усредняет выдачу: финальный текст пересказывает вывод, а не
+            // сэмплируется свободно. Для чистоты эксперимента её глушим.
+            Provider::Zai => {
+                if !thinking {
+                    body["thinking"] = json!({ "type": "disabled" });
+                }
+            }
+            // Два обязательных условия, иначе эксперимент нечист:
+            // `require_parameters` — не уходить на бэкенд, который проглотит
+            // temperature молча; `order` + запрет фолбэка — держать все прогоны
+            // на одном и том же бэкенде. Без пиннинга OpenRouter балансирует
+            // между площадками с разной квантизацией, и temperature=0 перестаёт
+            // быть воспроизводимой по причинам, к температуре не относящимся.
+            Provider::OpenRouter => {
+                body["provider"] = json!({
+                    "require_parameters": true,
+                    "order": [OPENROUTER_BACKEND],
+                    "allow_fallbacks": false,
+                });
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
-pub struct Endpoint {
+pub struct Client {
+    pub provider: Provider,
     pub base_url: String,
-    pub model: String,
     api_key: String,
 }
 
-impl Endpoint {
-    /// Unusable for actual requests — only for tests that need an `Endpoint`
-    /// value but return before making a call.
+impl Client {
+    /// Только для тестов, которые обязаны вернуться до сетевого вызова.
     #[cfg(test)]
-    pub fn dummy() -> Endpoint {
-        Endpoint {
+    pub fn dummy() -> Client {
+        Client {
+            provider: Provider::Zai,
             base_url: "http://unused.invalid".into(),
-            model: "unused".into(),
             api_key: String::new(),
         }
     }
 
-    /// Resolution order: `$YOLO_BASE_URL` / `$YOLO_MODEL` / `$YOLO_API_KEY`,
-    /// falling back to the `Yolo-Auto` provider in `~/.pi/agent/models.json`.
-    pub fn resolve() -> Res<Endpoint> {
-        Ok(Endpoint {
-            base_url: env::var("YOLO_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into()),
-            model: env::var("YOLO_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
-            api_key: resolve_api_key()?,
+    pub fn new(provider: Provider) -> Res<Client> {
+        let (_, env_var) = provider.auth_entry();
+        Ok(Client {
+            base_url: env::var(format!("{env_var}_BASE_URL"))
+                .unwrap_or_else(|_| provider.default_base_url().into()),
+            api_key: resolve_api_key(provider)?,
+            provider,
+        })
+    }
+
+    pub fn complete(&self, req: &Request) -> Res<Reply> {
+        let mut body = json!({
+            "model": req.model,
+            "messages": messages_of(req),
+            "max_tokens": req.max_tokens,
+        });
+        // Ровно тот рычаг, который изучаем. `None` — поле не отправляем вовсе,
+        // чтобы «дефолт сервера» можно было замерить отдельным случаем.
+        if let Some(t) = req.temperature {
+            body["temperature"] = json!(t);
+        }
+        self.provider.adjust(&mut body, req.thinking);
+
+        let started = Instant::now();
+        let resp = ureq::post(&format!("{}/chat/completions", self.base_url))
+            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(300))
+            .send_json(body);
+        let latency_ms = started.elapsed().as_millis() as u64;
+
+        let text = match resp {
+            Ok(r) => r.into_string().map_err(|e| format!("чтение ответа: {e}"))?,
+            Err(ureq::Error::Status(code, r)) => {
+                let detail = r.into_string().unwrap_or_default();
+                return Err(format!("HTTP {code}: {}", truncate(&detail, 400)));
+            }
+            Err(e) => return Err(format!("сеть: {e}")),
+        };
+
+        let parsed: ApiResponse = serde_json::from_str(&text)
+            .map_err(|e| format!("нераспознанный JSON ({e}): {}", truncate(&text, 300)))?;
+        // OpenRouter отдаёт ошибку с HTTP 200 — молча вернуть пустой ответ хуже,
+        // чем упасть с текстом причины.
+        if let Some(err) = parsed.error {
+            return Err(format!("{}: {}", req.model, truncate(&err.message, 300)));
+        }
+        let choice = parsed
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("{}: ответ без choices", req.model))?;
+        let usage = parsed.usage.unwrap_or_default();
+
+        Ok(Reply {
+            content: choice.message.content.unwrap_or_default().trim().to_string(),
+            finish_reason: choice.finish_reason.unwrap_or_else(|| "?".into()),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .map(|d| d.reasoning_tokens)
+                .unwrap_or(0),
+            latency_ms,
         })
     }
 }
 
-fn resolve_api_key() -> Res<String> {
-    if let Ok(key) = env::var("YOLO_API_KEY") {
-        if !key.is_empty() {
-            return Ok(key);
-        }
+fn messages_of(req: &Request) -> Value {
+    let mut out = Vec::new();
+    if let Some(sys) = &req.system {
+        out.push(json!({ "role": "system", "content": sys }));
     }
-    let path = pi_models_path()?;
-    let raw =
-        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    let models: PiModels = serde_json::from_str(&raw)
-        .map_err(|e| format!("cannot parse {}: {}", path.display(), e))?;
-    models
-        .providers
-        .get("Yolo-Auto")
-        .and_then(|p| p.api_key.clone())
-        .ok_or_else(|| format!("no Yolo-Auto apiKey found in {}", path.display()))
+    out.push(json!({ "role": "user", "content": req.prompt }));
+    Value::Array(out)
 }
 
-fn pi_models_path() -> Res<PathBuf> {
+fn resolve_api_key(provider: Provider) -> Res<String> {
+    let (entry, env_var) = provider.auth_entry();
+    if let Ok(k) = env::var(env_var) {
+        if !k.trim().is_empty() {
+            return Ok(k);
+        }
+    }
+    let path = auth_path()?;
+    let raw = fs::read_to_string(&path).map_err(|e| format!("не читается {}: {e}", path.display()))?;
+    let auth: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("не парсится {}: {e}", path.display()))?;
+    auth.get(entry)
+        .and_then(|p| p.get("key"))
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("нет ключа {entry}.key в {} и пустой ${env_var}", path.display()))
+}
+
+fn auth_path() -> Res<PathBuf> {
     env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".pi/agent/models.json"))
-        .map_err(|_| "HOME not set".to_string())
+        .map(|h| PathBuf::from(h).join(".pi/agent/auth.json"))
+        .map_err(|_| "HOME не задан".to_string())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-}
-
-impl Role {
-    fn as_str(self) -> &'static str {
-        match self {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        }
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
     }
+    s.chars().take(n).collect::<String>() + "…"
 }
 
 #[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub role: Role,
+pub struct Request {
+    pub model: String,
+    pub system: Option<String>,
+    pub prompt: String,
+    /// `None` — поле `temperature` не уходит в запрос вообще.
+    pub temperature: Option<f64>,
+    pub max_tokens: u32,
+    /// Для Z.AI: `false` просит модель не рассуждать (см. `Provider::adjust`).
+    pub thinking: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Reply {
     pub content: String,
+    pub finish_reason: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub latency_ms: u64,
 }
 
-impl ChatMessage {
-    pub fn user(s: impl Into<String>) -> ChatMessage {
-        ChatMessage {
-            role: Role::User,
-            content: s.into(),
-        }
-    }
-    pub fn assistant(s: impl Into<String>) -> ChatMessage {
-        ChatMessage {
-            role: Role::Assistant,
-            content: s.into(),
-        }
-    }
+#[derive(Deserialize)]
+struct ApiResponse {
+    #[serde(default)]
+    choices: Vec<Choice>,
+    usage: Option<Usage>,
+    #[serde(default)]
+    error: Option<ApiError>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Usage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    /// Part of `completion_tokens` spent thinking, not in the visible answer.
-    pub reasoning_tokens: u64,
-    pub total_tokens: u64,
+#[derive(Deserialize)]
+struct ApiError {
+    #[serde(default)]
+    message: String,
 }
 
-/// One generation, with everything needed to judge whether the stop
-/// condition and length cap actually fired.
-#[derive(Clone, Debug)]
-pub struct Outcome {
-    /// `None` when the budget ran out before any visible token was produced.
-    pub content: Option<String>,
-    pub reasoning: Option<String>,
-    pub finish_reason: Option<String>,
-    pub usage: Usage,
-    pub raw: Value,
-    pub latency_ms: u128,
-}
-
-impl Outcome {
-    /// True when the token budget cut generation off mid-thought, rather
-    /// than the model finishing on its own.
-    pub fn truncated(&self) -> bool {
-        matches!(self.finish_reason.as_deref(), Some("length"))
-    }
-
-    /// True when a literal stop sequence ended generation early.
-    pub fn stopped_by_sequence(&self) -> bool {
-        matches!(self.finish_reason.as_deref(), Some("stop"))
-    }
-
-    pub fn text(&self) -> &str {
-        self.content.as_deref().unwrap_or("").trim()
-    }
-}
-
-/// Builds the request body. Kept separate from `chat` so `--show-request`
-/// and tests can inspect it without a network call.
-pub fn build_body(
-    model: &str,
-    settings: &Settings,
-    system: &str,
-    history: &[ChatMessage],
-    schema: Option<&Value>,
-) -> Value {
-    let mut messages = Vec::new();
-
-    let budget_note = settings.budget_tokens.map(|n| format!(
-        "The entire generation, including reasoning and the final answer, has a hard budget of {n} tokens. Plan accordingly and finish the final answer before that limit; never stop mid-answer."
-    ));
-    let chars_note = settings
-        .max_chars
-        .map(|n| format!("Keep your entire final answer under {n} characters."));
-    let mut system = system.to_string();
-    for note in [budget_note, chars_note].into_iter().flatten() {
-        if system.is_empty() {
-            system = note;
-        } else {
-            system = format!("{system}\n\n{note}");
-        }
-    }
-    if !system.is_empty() {
-        messages.push(json!({ "role": "system", "content": system }));
-    }
-    for m in history {
-        messages.push(json!({ "role": m.role.as_str(), "content": m.content }));
-    }
-
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-    });
-    let obj = body.as_object_mut().expect("object");
-
-    if settings.json_mode.enabled {
-        obj.insert(
-            "response_format".into(),
-            json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "answer",
-                    "strict": true,
-                    "schema": schema.cloned().unwrap_or(json!({ "type": "object" })),
-                }
-            }),
-        );
-    }
-
-    if let Some(n) = settings.budget_tokens {
-        obj.insert("max_tokens".into(), json!(n));
-    }
-    if !settings.stop.is_empty() {
-        obj.insert("stop".into(), json!(settings.stop));
-    }
-    if let Some(t) = settings.temperature {
-        obj.insert("temperature".into(), json!(t));
-    }
-    // Only sent when explicitly set: left alone, the provider applies its own
-    // truncation defaults, which is exactly what hides the effect of a high
-    // temperature (see README, "Temperature").
-    if let Some(p) = settings.top_p {
-        obj.insert("top_p".into(), json!(p));
-    }
-    if let Some(k) = settings.top_k {
-        obj.insert("top_k".into(), json!(k));
-    }
-
-    if !settings.thinking() {
-        // Two independent switches: the OpenAI-style one and the Qwen chat-template
-        // one. Both were verified live to zero out reasoning_tokens on this provider.
-        obj.insert("reasoning_effort".into(), json!("none"));
-        obj.insert(
-            "chat_template_kwargs".into(),
-            json!({ "enable_thinking": false }),
-        );
-    } else {
-        obj.insert("reasoning_effort".into(), json!(settings.effort.label()));
-    }
-    body
-}
-
-pub fn chat(
-    ep: &Endpoint,
-    settings: &Settings,
-    system: &str,
-    history: &[ChatMessage],
-    schema: Option<&Value>,
-) -> Res<Outcome> {
-    let body = build_body(&ep.model, settings, system, history, schema);
-    let url = format!("{}/chat/completions", ep.base_url);
-
-    let started = Instant::now();
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", ep.api_key))
-        .set("Content-Type", "application/json")
-        .send_json(body);
-    let latency_ms = started.elapsed().as_millis();
-
-    let resp = match resp {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let detail = r.into_string().unwrap_or_default();
-            return Err(format!("HTTP {code} from {url}: {}", detail.trim()));
-        }
-        Err(e) => return Err(format!("request failed: {e}")),
-    };
-
-    let raw: Value = resp
-        .into_json()
-        .map_err(|e| format!("response was not JSON: {e}"))?;
-
-    let choice = raw
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .ok_or_else(|| format!("no choices in response: {raw}"))?;
-    let message = choice.get("message");
-
-    // `content` is null whenever generation stopped before any visible token — a
-    // real case here, since both the token budget and stop sequences can fire
-    // while the model is still inside `reasoning_content`.
-    let content = message
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(str::to_string);
-    let reasoning = message
-        .and_then(|m| m.get("reasoning_content"))
-        .and_then(|c| c.as_str())
-        .map(str::to_string);
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(|f| f.as_str())
-        .map(str::to_string);
-
-    let u = raw.get("usage");
-    let usage = Usage {
-        prompt_tokens: field(u, "prompt_tokens"),
-        completion_tokens: field(u, "completion_tokens"),
-        reasoning_tokens: u
-            .and_then(|u| u.get("completion_tokens_details"))
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| field(u, "reasoning_tokens")),
-        total_tokens: field(u, "total_tokens"),
-    };
-
-    Ok(Outcome {
-        content,
-        reasoning,
-        finish_reason,
-        usage,
-        raw,
-        latency_ms,
-    })
-}
-
-/// A live chat-completion stream: pull visible-text deltas with `next_chunk`
-/// until it returns `Ok(None)`, then call `into_outcome` for the same
-/// `Outcome` shape `chat` returns (usage, finish_reason, full text) — the
-/// streaming and non-streaming paths converge there so callers downstream of
-/// "the reply is done" don't need to care which path produced it.
-pub struct ChatStream {
-    lines: std::io::Lines<BufReader<Box<dyn Read + Send + Sync>>>,
-    started: Instant,
-    content: String,
-    reasoning: String,
+#[derive(Deserialize)]
+struct Choice {
+    message: Message,
     finish_reason: Option<String>,
-    usage: Usage,
-    /// Set by the caller (e.g. the TUI on Esc) to stop consuming the stream;
-    /// checked between SSE lines so the read loop — and with it the
-    /// connection — ends promptly instead of draining the whole reply.
-    cancel: Option<Arc<AtomicBool>>,
 }
 
-impl ChatStream {
-    /// Blocks until the next visible-content delta arrives, returning `None`
-    /// once the stream ends. Usage, `reasoning_content`, and `finish_reason`
-    /// are accumulated internally along the way and surface through
-    /// `into_outcome` — a caller updating a live view only ever needs the
-    /// text.
-    pub fn next_chunk(&mut self) -> Res<Option<String>> {
-        loop {
-            if self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                return Ok(None);
-            }
-            let Some(line) = self.lines.next() else {
-                return Ok(None);
-            };
-            let line = line.map_err(|e| format!("stream read failed: {e}"))?;
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-            if data == "[DONE]" {
-                return Ok(None);
-            }
-            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-
-            if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
-                self.usage = Usage {
-                    prompt_tokens: field(Some(u), "prompt_tokens"),
-                    completion_tokens: field(Some(u), "completion_tokens"),
-                    reasoning_tokens: u
-                        .get("completion_tokens_details")
-                        .and_then(|d| d.get("reasoning_tokens"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or_else(|| field(Some(u), "reasoning_tokens")),
-                    total_tokens: field(Some(u), "total_tokens"),
-                };
-            }
-
-            let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
-                continue;
-            };
-            if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                self.finish_reason = Some(fr.to_string());
-            }
-            let delta = choice.get("delta");
-            if let Some(piece) = delta
-                .and_then(|d| d.get("reasoning_content"))
-                .and_then(|c| c.as_str())
-            {
-                self.reasoning.push_str(piece);
-            }
-            let content_delta = delta
-                .and_then(|d| d.get("content"))
-                .and_then(|c| c.as_str())
-                .filter(|s| !s.is_empty());
-            if let Some(piece) = content_delta {
-                self.content.push_str(piece);
-                return Ok(Some(piece.to_string()));
-            }
-        }
-    }
-
-    /// Everything accumulated so far, in the same shape `chat` returns —
-    /// callable after `next_chunk` returns `Ok(None)`, or early (e.g. after
-    /// a read error) to keep whatever text streamed in before the failure.
-    pub fn into_outcome(self) -> Outcome {
-        Outcome {
-            content: (!self.content.is_empty()).then_some(self.content),
-            reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
-            finish_reason: self.finish_reason,
-            usage: self.usage,
-            raw: Value::Null,
-            latency_ms: self.started.elapsed().as_millis(),
-        }
-    }
+#[derive(Deserialize)]
+struct Message {
+    content: Option<String>,
 }
 
-/// Same request as `chat`, but with `stream: true` — returns a `ChatStream`
-/// to pull deltas from as they arrive over the wire, instead of blocking for
-/// the whole body. `schema` is unused by streaming replies today (JSON mode
-/// stays on the non-streaming path in the TUI, since flattening structured
-/// output only makes sense once it's complete) but kept for signature parity.
-/// `cancel`, when given, is polled between SSE lines: once set, `next_chunk`
-/// stops and the stream (and its connection) can be dropped by the caller.
-pub fn chat_stream(
-    ep: &Endpoint,
-    settings: &Settings,
-    system: &str,
-    history: &[ChatMessage],
-    schema: Option<&Value>,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Res<ChatStream> {
-    let mut body = build_body(&ep.model, settings, system, history, schema);
-    let obj = body.as_object_mut().expect("object");
-    obj.insert("stream".into(), json!(true));
-    obj.insert("stream_options".into(), json!({ "include_usage": true }));
-    let url = format!("{}/chat/completions", ep.base_url);
-
-    let started = Instant::now();
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", ep.api_key))
-        .set("Content-Type", "application/json")
-        .send_json(body);
-
-    let resp = match resp {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let detail = r.into_string().unwrap_or_default();
-            return Err(format!("HTTP {code} from {url}: {}", detail.trim()));
-        }
-        Err(e) => return Err(format!("request failed: {e}")),
-    };
-
-    let lines = BufReader::new(resp.into_reader()).lines();
-    Ok(ChatStream {
-        lines,
-        started,
-        content: String::new(),
-        reasoning: String::new(),
-        finish_reason: None,
-        usage: Usage::default(),
-        cancel,
-    })
+#[derive(Deserialize, Default)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    completion_tokens_details: Option<Details>,
 }
 
-#[cfg(test)]
-impl ChatStream {
-    /// Builds a stream over canned SSE bytes, bypassing the network — lets
-    /// `next_chunk`/`into_outcome` be tested against a captured real response
-    /// without a live endpoint.
-    fn from_sse(data: &'static str) -> ChatStream {
-        let reader: Box<dyn Read + Send + Sync> = Box::new(data.as_bytes());
-        ChatStream {
-            lines: BufReader::new(reader).lines(),
-            started: Instant::now(),
-            content: String::new(),
-            reasoning: String::new(),
-            finish_reason: None,
-            usage: Usage::default(),
-            cancel: None,
-        }
-    }
-}
-
-fn field(v: Option<&Value>, key: &str) -> u64 {
-    v.and_then(|v| v.get(key))
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-}
-
-/// Applies the hard character cap client-side. Deterministic and independent
-/// of whatever the model actually did — this is what makes `max_chars` a real
-/// guarantee rather than a hint the model can ignore.
-pub fn enforce_max_chars(text: &str, max_chars: Option<usize>) -> (String, bool) {
-    match max_chars {
-        Some(n) if text.chars().count() > n => {
-            let truncated: String = text.chars().take(n).collect();
-            (truncated, true)
-        }
-        _ => (text.to_string(), false),
-    }
+#[derive(Deserialize)]
+struct Details {
+    #[serde(default)]
+    reasoning_tokens: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Effort, Settings};
 
-    #[test]
-    fn token_budget_is_sent_and_explained_to_model() {
-        let settings = Settings {
-            budget_tokens: Some(8192),
-            ..Settings::default()
-        };
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
-        assert_eq!(body["max_tokens"], 8192);
-        let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("entire generation"));
-        assert!(system.contains("8192 tokens"));
-    }
-
-    #[test]
-    fn effort_none_disables_thinking_switches() {
-        let settings = Settings::default(); // Effort::None
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
-        assert_eq!(body["reasoning_effort"], "none");
-        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
-    }
-
-    #[test]
-    fn effort_high_passes_through_without_forcing_thinking_off() {
-        let settings = Settings {
-            effort: Effort::High,
-            ..Settings::default()
-        };
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
-        assert_eq!(body["reasoning_effort"], "high");
-        assert!(body.get("chat_template_kwargs").is_none());
-    }
-
-    #[test]
-    fn sampling_knobs_are_sent_only_when_set() {
-        let plain = build_body(
-            "model",
-            &Settings::default(),
-            "",
-            &[ChatMessage::user("hi")],
-            None,
-        );
-        assert!(plain.get("temperature").is_none());
-        assert!(plain.get("top_p").is_none());
-        assert!(plain.get("top_k").is_none());
-
-        let settings = Settings {
-            temperature: Some(1.2),
-            top_p: Some(1.0),
-            top_k: Some(-1),
-            ..Settings::default()
-        };
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
-        assert!((body["temperature"].as_f64().unwrap() - 1.2).abs() < 1e-6);
-        assert_eq!(body["top_p"], 1.0);
-        assert_eq!(body["top_k"], -1);
-    }
-
-    #[test]
-    fn history_round_trips_in_order() {
-        let settings = Settings::default();
-        let history = vec![
-            ChatMessage::user("first"),
-            ChatMessage::assistant("reply"),
-            ChatMessage::user("second"),
-        ];
-        let body = build_body("model", &settings, "", &history, None);
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0]["role"], "user");
-        assert_eq!(msgs[1]["role"], "assistant");
-        assert_eq!(msgs[2]["content"], "second");
-    }
-
-    #[test]
-    fn max_chars_truncates_deterministically() {
-        let (out, cut) = enforce_max_chars("hello world", Some(5));
-        assert_eq!(out, "hello");
-        assert!(cut);
-        let (out, cut) = enforce_max_chars("hi", Some(5));
-        assert_eq!(out, "hi");
-        assert!(!cut);
-    }
-
-    /// Captured live from the Yolo-Auto endpoint (see AGENTS.md live
-    /// verification) with `reasoning_effort: "none"` — exercises the exact
-    /// wire shape `next_chunk`/`into_outcome` need to handle: an empty
-    /// role-priming delta, multi-token content deltas, a finish-only delta,
-    /// a usage-only trailing chunk with empty `choices`, then `[DONE]`.
-    const SAMPLE_SSE: &str = concat!(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"content\":\"1\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"content\":\"\\n2\\n3\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":10,\"total_tokens\":35}}\n\n",
-        "data: [DONE]\n",
-    );
-
-    #[test]
-    fn stream_accumulates_deltas_in_order() {
-        let mut stream = ChatStream::from_sse(SAMPLE_SSE);
-        let mut pieces = Vec::new();
-        while let Some(piece) = stream.next_chunk().unwrap() {
-            pieces.push(piece);
+    fn req(temperature: Option<f64>, thinking: bool) -> Request {
+        Request {
+            model: "m".into(),
+            system: Some("sys".into()),
+            prompt: "hi".into(),
+            temperature,
+            max_tokens: 10,
+            thinking,
         }
-        assert_eq!(pieces, vec!["1", "\n2\n3"]);
     }
 
     #[test]
-    fn stream_into_outcome_matches_the_non_streaming_shape() {
-        let mut stream = ChatStream::from_sse(SAMPLE_SSE);
-        while stream.next_chunk().unwrap().is_some() {}
-        let outcome = stream.into_outcome();
-        assert_eq!(outcome.text(), "1\n2\n3");
-        assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
-        assert_eq!(outcome.usage.prompt_tokens, 25);
-        assert_eq!(outcome.usage.completion_tokens, 10);
-        assert_eq!(outcome.usage.total_tokens, 35);
-        assert!(outcome.stopped_by_sequence());
+    fn system_message_goes_first() {
+        let m = messages_of(&req(Some(0.7), false));
+        assert_eq!(m[0]["role"], "system");
+        assert_eq!(m[1]["role"], "user");
+        assert_eq!(m[1]["content"], "hi");
     }
 
     #[test]
-    fn stream_empty_body_yields_no_content() {
-        let mut stream = ChatStream::from_sse("data: [DONE]\n");
-        assert!(stream.next_chunk().unwrap().is_none());
-        let outcome = stream.into_outcome();
-        assert!(outcome.content.is_none());
-        assert_eq!(outcome.text(), "");
+    fn no_system_means_single_user_message() {
+        let mut r = req(None, false);
+        r.system = None;
+        let m = messages_of(&r);
+        assert_eq!(m.as_array().unwrap().len(), 1);
+        assert_eq!(m[0]["role"], "user");
     }
 
     #[test]
-    fn stream_cancel_flag_stops_the_read_loop() {
-        let mut stream = ChatStream::from_sse(SAMPLE_SSE);
-        stream.cancel = Some(Arc::new(AtomicBool::new(true)));
-        // Pre-set flag: the very first `next_chunk` call gives up without
-        // reading a single line, so the caller can drop the connection.
-        assert_eq!(stream.next_chunk(), Ok(None));
+    fn zai_disables_thinking_only_when_asked() {
+        let mut on = json!({});
+        Provider::Zai.adjust(&mut on, true);
+        assert!(on.get("thinking").is_none());
+
+        let mut off = json!({});
+        Provider::Zai.adjust(&mut off, false);
+        assert_eq!(off["thinking"]["type"], "disabled");
+    }
+
+    /// Все три температуры обязаны попасть на один бэкенд, иначе разброс при
+    /// temperature=0 объясняется маршрутизацией, а не сэмплингом.
+    #[test]
+    fn openrouter_pins_one_backend_that_supports_the_parameters() {
+        let mut body = json!({});
+        Provider::OpenRouter.adjust(&mut body, false);
+        assert_eq!(body["provider"]["require_parameters"], true);
+        assert_eq!(body["provider"]["allow_fallbacks"], false);
+        assert_eq!(body["provider"]["order"], json!([OPENROUTER_BACKEND]));
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
-    fn json_mode_sends_strict_schema() {
-        let settings = Settings {
-            json_mode: crate::config::JsonMode {
-                enabled: true,
-                schema: json!({"type": "object"}),
-            },
-            ..Settings::default()
-        };
-        let schema = json!({"type": "object", "properties": {"title": {"type": "string"}}});
-        let body = build_body(
-            "model",
-            &settings,
-            "",
-            &[ChatMessage::user("hi")],
-            Some(&schema),
-        );
-        assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
-        assert_eq!(
-            body["response_format"]["json_schema"]["schema"]["properties"]["title"]["type"],
-            "string"
-        );
+    fn provider_parse_roundtrips_and_rejects_junk() {
+        for p in Provider::ALL {
+            assert_eq!(Provider::parse(p.id()).unwrap(), p);
+        }
+        assert!(Provider::parse("gpt").is_err());
+    }
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        assert_eq!(truncate("привет", 3), "при…");
+        assert_eq!(truncate("привет", 6), "привет");
     }
 }
