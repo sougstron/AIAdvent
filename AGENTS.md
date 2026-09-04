@@ -23,6 +23,7 @@ With that in place:
 ```sh
 ./target/release/ask "one-shot question"
 ./target/release/ask --verify-stop --budget-tokens 60   # proves the stop condition works
+./target/release/ask --verify-temp --temperature 2.0    # proves temperature changes the output
 ```
 
 `/verify` (or `--verify-stop`) is the load-bearing check for the stop-condition

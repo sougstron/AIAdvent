@@ -72,6 +72,7 @@ plain Enter.
 /json edit <instruction>          ask the model to rewrite the schema
 /json show                        print the active schema
 /temp [off|0.0-2.0]               get or set sampling temperature (2.0 is the provider's max)
+/temp verify [n] [prompt]         prove temperature changes the output (n samples at 0 vs at yours)
 /stop add <seq>                   add a stop sequence (max 4)
 /stop clear                       clear stop sequences
 /verify [prompt]                  prove the stop condition changes the output
@@ -230,6 +231,52 @@ default so the provider's own defaults stay in place. `top_k=-1` (shown as
 `full`) removes the cutoff entirely; that is the setting that makes a high
 temperature behave the way people expect it to — including badly, at `2.0`.
 
+**Reasoning is the stronger damper, and it is the usual reason temperature
+"does nothing" in chat.** With `effort` above `none` the model reasons its
+way to a conclusion first, and the visible answer converges on that
+conclusion no matter how the tokens were sampled. Measured on the same
+"name one animal" prompt, four runs a side:
+
+| settings | temp 0.0 | temp 2.0 |
+| --- | --- | --- |
+| `effort=none` | `cat` ×4 | `lion, kangaroo, tiger, elephant` |
+| `effort=medium` | `dolphin` ×4 | `dolphin` ×4 |
+| `effort=medium top_k=full` | `dolphin` ×4 | `dolphin` ×4 |
+
+Temperature is being applied in all three rows — it just cannot move an
+answer the model has already reasoned itself into. On a longer, open-ended
+prompt the phrasing still varies with reasoning on; on a one-word answer it
+does not. To *see* temperature, ask something open-ended with `/effort none`.
+
+### `/temp verify` — the proof
+
+Judging a sampling knob by reading chat replies does not work: there is one
+sample per side and no baseline. `/temp verify [runs] [prompt]` runs the
+controlled version instead — the same prompt sampled `runs` times at
+temperature `0.0` and `runs` times at the configured temperature, everything
+else held fixed — and prints the request body it actually put on the wire,
+so "are the settings even being sent?" is answered by observation rather
+than by trust.
+
+It reports **CONFIRMED** only on the causal signature, not on "the answers
+differ": temperature `0` is greedy decoding, so it *must* collapse to a
+single answer, and only then does a spread on the hot side have nothing left
+to explain it but temperature. If the cold side varies too, something other
+than temperature is loose and the run reports itself **INCONCLUSIVE** rather
+than claiming a pass. When neither side spreads it says so plainly and lists
+the dampers that are active in your settings (reasoning, `top_k`, `top_p`,
+or a prompt with one dominant answer).
+
+The stop condition and JSON mode are stripped for the run — a stop sequence
+or a small token budget would cut every answer to the same prefix and fake a
+collapse — while `effort`/`top_k`/`top_p` are deliberately kept, since the
+point is to test your own sampling setup, dampers included.
+
+```sh
+ask --verify-temp --temperature 2.0                 # 4 samples a side
+ask --verify-temp --temperature 1.2 --verify-runs 6 "Name one colour, one word only."
+```
+
 ## API key
 
 Resolution order:
@@ -253,6 +300,8 @@ Optional overrides: `$YOLO_BASE_URL`, `$YOLO_MODEL`.
 --raw                  print the full API response
 --quiet                suppress the usage/finish_reason line
 --verify-stop          run the stop-condition proof and exit
+--verify-temp          run the temperature proof (0.0 vs --temperature) and exit
+--verify-runs N        samples per side for --verify-temp (default 4, max 10)
 --sessions             list saved sessions and exit
 ```
 
@@ -264,13 +313,13 @@ Every flag has a matching `ASK_*` env var (`ASK_EFFORT`, `ASK_MAX_CHARS`,
 ```
 src/
   main.rs      dispatcher
-  cli.rs       clap + one-shot / --verify-stop / --sessions flow
+  cli.rs       clap + one-shot / --verify-stop / --verify-temp / --sessions flow
   config.rs    Settings, Effort, JsonMode
   api.rs       request body, multi-turn chat(), effort->reasoning_effort, max_chars enforcement
   session.rs   session persistence (~/.ask/sessions/*.json)
   render.rs    JSON-mode flattening ("Key: value" lines) shared by CLI and TUI
   tui.rs       the chat TUI: transcript, input, slash commands, settings/sessions panels
-  verify.rs    the stop-condition self-test
+  verify.rs    the stop-condition and temperature self-tests
 ```
 
 `Outcome.content` is `Option<String>` on purpose: when `max_tokens` (or a

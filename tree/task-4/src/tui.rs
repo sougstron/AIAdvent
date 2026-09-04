@@ -622,7 +622,7 @@ impl App {
                 self.settings_selected = 0;
             }
             "effort" => self.cmd_effort(rest),
-            "temp" | "temperature" => self.cmd_temp(rest),
+            "temp" | "temperature" => self.cmd_temp(rest, terminal),
             "json" => self.cmd_json(rest, terminal),
             "stop" => self.cmd_stop(rest),
             "verify" => self.cmd_verify(rest, terminal),
@@ -652,17 +652,24 @@ impl App {
 
     /// Setting temperature used to be possible only through the settings
     /// panel, which made it easy to believe it had been set when it hadn't.
-    fn cmd_temp(&mut self, rest: &str) {
+    fn cmd_temp(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
         let rest = rest.trim();
         if rest.is_empty() {
             self.status = format!(
-                "temperature={} (usage: /temp off | /temp 0.0-{})",
+                "temperature={} (usage: /temp off | /temp 0.0-{} | /temp verify)",
                 self.settings
                     .temperature
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "off".into()),
                 config::TEMP_MAX
             );
+            return;
+        }
+        if let Some(arg) = rest
+            .strip_prefix("verify")
+            .filter(|a| a.is_empty() || a.starts_with(char::is_whitespace))
+        {
+            self.cmd_temp_verify(arg.trim(), terminal);
             return;
         }
         if rest.eq_ignore_ascii_case("off") {
@@ -680,6 +687,40 @@ impl App {
                 };
             }
             Err(e) => self.entries.push(Entry::Info(e)),
+        }
+    }
+
+    /// `/temp verify [runs] [prompt]` — the temperature counterpart of
+    /// `/verify`. Chat replies are a bad instrument for judging a sampling
+    /// knob (one question, one answer, no baseline), so this runs the
+    /// controlled version: the same prompt N times at 0 and N times at the
+    /// configured temperature, and prints the request body it sent.
+    fn cmd_temp_verify(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
+        let (head, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let (runs, prompt) = match head.parse::<usize>() {
+            Ok(n) => (n, tail.trim()),
+            Err(_) => (verify::DEFAULT_TEMP_RUNS, rest),
+        };
+        let prompt = if prompt.is_empty() {
+            verify::DEFAULT_TEMP_PROMPT.to_string()
+        } else {
+            prompt.to_string()
+        };
+
+        let ep = self.ep.clone();
+        let settings = self.settings.clone();
+        let label = format!("verifying temperature ({} calls)", runs * 2);
+        let result = self.with_spinner(terminal, &label, move || {
+            verify::run_temperature(&ep, &settings, &prompt, runs)
+        });
+        match result {
+            Some(Ok(report)) => {
+                self.status = report.headline();
+                self.entries.push(Entry::Info(report.render()));
+                self.scroll_to_bottom(terminal);
+            }
+            Some(Err(e)) => self.status = format!("temperature verify failed: {e}"),
+            None => self.status = "temperature verify cancelled (Esc)".into(),
         }
     }
 
@@ -1477,6 +1518,7 @@ const HELP: &str = "\
 /json edit <instruction>  ask the model to rewrite the schema
 /json show                print the active schema
 /temp [off|0.0-2.0]       get or set sampling temperature (2.0 is the provider's max)
+/temp verify [n] [prompt]  prove temperature changes the output (n samples at 0 vs at yours)
 /stop add <seq>           add a stop sequence (max 4)
 /stop clear               clear stop sequences
 /verify [prompt]          prove the stop condition changes the output
