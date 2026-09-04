@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Локальное окно: только базовые core-права, никаких плагинов.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
