@@ -10,6 +10,28 @@ use std::process::ExitCode;
 
 use api::{Client, Provider};
 
+/// WebKitGTK на некоторых Wayland/GPU-конфигурациях открывает пустое окно.
+/// Применяем тот же workaround, что использует эталонный balance-editor, чтобы
+/// релиз запускался обычным двойным кликом без обёрток и переменных окружения.
+fn apply_linux_display_workarounds() {
+    #[cfg(target_os = "linux")]
+    {
+        let native_wayland = std::env::var_os("TEMPERATURE_LAB_NATIVE_WAYLAND").is_some();
+        let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("wayland");
+
+        if on_wayland && !native_wayland && std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+        if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
+    }
+}
+
 /// Кнопка «Сравнить»: три температуры, затем разбор старшей моделью.
 #[tauri::command]
 async fn compare_temperatures(
@@ -74,6 +96,7 @@ fn main() -> ExitCode {
         _ => {}
     }
 
+    apply_linux_display_workarounds();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             compare_temperatures,
