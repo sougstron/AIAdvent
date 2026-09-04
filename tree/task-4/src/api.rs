@@ -79,14 +79,25 @@ impl Provider {
     }
 
     /// Правки тела запроса под конкретный API.
-    fn adjust(self, body: &mut Value, thinking: bool) {
+    fn adjust(self, body: &mut Value, thinking: bool, base_url: &str) {
         match self {
             // GLM по умолчанию «думает», а длинная цепочка рассуждений сама по
             // себе усредняет выдачу: финальный текст пересказывает вывод, а не
             // сэмплируется свободно. Для чистоты эксперимента её глушим.
+            //
+            // Просят одно и то же, но разными словами: подписочный (coding)
+            // route принимает `thinking: disabled`, а обычный pay-as-you-go на
+            // glm-5.3 отвечает `1210 — модель всегда думает` и на любой
+            // thinking-объект, и на `reasoning_effort: minimal`. Минимум,
+            // который он пропускает, — `reasoning_effort: low`; без этой ветки
+            // проверка на payg падала бы ещё до первого прогона.
             Provider::Zai => {
                 if !thinking {
-                    body["thinking"] = json!({ "type": "disabled" });
+                    if is_coding_route(base_url) {
+                        body["thinking"] = json!({ "type": "disabled" });
+                    } else {
+                        body["reasoning_effort"] = json!("low");
+                    }
                 }
             }
             // Два обязательных условия, иначе эксперимент нечист:
@@ -104,6 +115,12 @@ impl Provider {
             }
         }
     }
+}
+
+/// Подписочный endpoint Z.AI отличается от обычного одним сегментом пути —
+/// и ведёт себя иначе и по `thinking`, и по `temperature`.
+fn is_coding_route(base_url: &str) -> bool {
+    base_url.contains("/coding/")
 }
 
 #[derive(Clone)]
@@ -145,7 +162,7 @@ impl Client {
         if let Some(t) = req.temperature {
             body["temperature"] = json!(t);
         }
-        self.provider.adjust(&mut body, req.thinking);
+        self.provider.adjust(&mut body, req.thinking, &self.base_url);
 
         let started = Instant::now();
         let resp = ureq::post(&format!("{}/chat/completions", self.base_url))
@@ -329,15 +346,37 @@ mod tests {
         assert_eq!(m[0]["role"], "user");
     }
 
+    const CODING: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+    const PAYG: &str = "https://open.bigmodel.cn/api/paas/v4";
+
     #[test]
     fn zai_disables_thinking_only_when_asked() {
         let mut on = json!({});
-        Provider::Zai.adjust(&mut on, true);
+        Provider::Zai.adjust(&mut on, true, CODING);
         assert!(on.get("thinking").is_none());
+        assert!(on.get("reasoning_effort").is_none());
 
         let mut off = json!({});
-        Provider::Zai.adjust(&mut off, false);
+        Provider::Zai.adjust(&mut off, false, CODING);
         assert_eq!(off["thinking"]["type"], "disabled");
+    }
+
+    /// Обычный endpoint отвечает 1210 на любой `thinking` и на
+    /// `reasoning_effort: minimal`; low он пропускает. Перепутать нельзя —
+    /// иначе проверка температуры на payg падает до первого прогона.
+    #[test]
+    fn zai_payg_asks_for_low_effort_instead_of_disabled_thinking() {
+        let mut off = json!({});
+        Provider::Zai.adjust(&mut off, false, PAYG);
+        assert!(off.get("thinking").is_none());
+        assert_eq!(off["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn only_the_coding_path_segment_marks_the_subscription_route() {
+        assert!(is_coding_route(CODING));
+        assert!(!is_coding_route(PAYG));
+        assert!(!is_coding_route("https://openrouter.ai/api/v1"));
     }
 
     /// Все три температуры обязаны попасть на один бэкенд, иначе разброс при
@@ -345,7 +384,7 @@ mod tests {
     #[test]
     fn openrouter_pins_one_backend_that_supports_the_parameters() {
         let mut body = json!({});
-        Provider::OpenRouter.adjust(&mut body, false);
+        Provider::OpenRouter.adjust(&mut body, false, "https://openrouter.ai/api/v1");
         assert_eq!(body["provider"]["require_parameters"], true);
         assert_eq!(body["provider"]["allow_fallbacks"], false);
         assert_eq!(body["provider"]["order"], json!([OPENROUTER_BACKEND]));
