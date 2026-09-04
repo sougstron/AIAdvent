@@ -41,6 +41,14 @@ clips rather than clamps, so an offset past the wrapped content renders a
 blank pane (this has been the real bug twice: once on auto-scroll after a
 reply, once on manual `PageDown`).
 
+## Current global task
+
+There is always exactly one active global task; app states are snapshotted
+into `tree/task-*/` folders (source + release binary, each buildable on its
+own). Which folder is active right now, and the rules for rotating to the
+next state, are in `docs/CurrentTask.md` — work only in that folder and
+don't touch the rest of the code.
+
 ## Layout
 
 ```
