@@ -32,13 +32,35 @@ const MAX_CHARS_CHOICES: &[Option<usize>] =
 const BUDGET_CHOICES: &[Option<u32>] =
     &[None, Some(32), Some(64), Some(128), Some(256), Some(512), Some(1024), Some(4096)];
 const STOP_PRESETS: &[&[&str]] = &[&[], &["\n\n"], &["\n---\n"], &["\n\n\n"]];
-const TEMP_CHOICES: &[Option<f32>] =
-    &[None, Some(0.0), Some(0.3), Some(0.7), Some(1.0), Some(1.2)];
-const SETTINGS_ROWS: &[&str] = &["effort", "json mode", "max_chars", "budget_tokens", "stop", "temperature"];
+/// Up to the provider's hard ceiling (`config::TEMP_MAX`); 2.01 is rejected
+/// with HTTP 400, so 2.0 is the last usable step.
+const TEMP_CHOICES: &[Option<f32>] = &[
+    None,
+    Some(0.0),
+    Some(0.3),
+    Some(0.7),
+    Some(1.0),
+    Some(1.2),
+    Some(1.5),
+    Some(2.0),
+];
+const TOP_P_CHOICES: &[Option<f32>] = &[None, Some(0.5), Some(0.8), Some(0.95), Some(1.0)];
+const TOP_K_CHOICES: &[Option<i32>] = &[None, Some(20), Some(50), Some(100), Some(-1)];
+const SETTINGS_ROWS: &[&str] = &[
+    "effort",
+    "json mode",
+    "max_chars",
+    "budget_tokens",
+    "stop",
+    "temperature",
+    "top_p",
+    "top_k",
+];
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
 const COMMANDS: &[&str] = &[
-    "effort", "help", "json", "new", "personas", "quit", "sessions", "settings", "stop", "verify",
+    "effort", "help", "json", "new", "personas", "quit", "sessions", "settings", "stop", "temp",
+    "verify",
 ];
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
@@ -600,6 +622,7 @@ impl App {
                 self.settings_selected = 0;
             }
             "effort" => self.cmd_effort(rest),
+            "temp" | "temperature" => self.cmd_temp(rest),
             "json" => self.cmd_json(rest, terminal),
             "stop" => self.cmd_stop(rest),
             "verify" => self.cmd_verify(rest, terminal),
@@ -622,6 +645,39 @@ impl App {
             Ok(e) => {
                 self.settings.effort = e;
                 self.status = format!("effort set to {e}");
+            }
+            Err(e) => self.entries.push(Entry::Info(e)),
+        }
+    }
+
+    /// Setting temperature used to be possible only through the settings
+    /// panel, which made it easy to believe it had been set when it hadn't.
+    fn cmd_temp(&mut self, rest: &str) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.status = format!(
+                "temperature={} (usage: /temp off | /temp 0.0-{})",
+                self.settings
+                    .temperature
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "off".into()),
+                config::TEMP_MAX
+            );
+            return;
+        }
+        if rest.eq_ignore_ascii_case("off") {
+            self.settings.temperature = None;
+            self.status = "temperature off (provider default)".into();
+            return;
+        }
+        match rest.parse::<f32>().map_err(|_| format!("not a number: {rest}")).and_then(config::parse_temperature) {
+            Ok(t) => {
+                self.settings.temperature = Some(t);
+                self.status = if self.settings.top_k.is_none() && self.settings.top_p.is_none() {
+                    format!("temperature set to {t} — note: top_k/top_p are at the provider's defaults, which damp its effect (/settings)")
+                } else {
+                    format!("temperature set to {t}")
+                };
             }
             Err(e) => self.entries.push(Entry::Info(e)),
         }
@@ -901,7 +957,9 @@ impl App {
                 let next = STOP_PRESETS[(current + delta).rem_euclid(n) as usize];
                 self.settings.stop = next.iter().map(|s| s.to_string()).collect();
             }
-            5 => self.settings.temperature = cycle_temperature(self.settings.temperature, delta),
+            5 => self.settings.temperature = cycle_float(TEMP_CHOICES, self.settings.temperature, delta),
+            6 => self.settings.top_p = cycle_float(TOP_P_CHOICES, self.settings.top_p, delta),
+            7 => self.settings.top_k = cycle_choice(TOP_K_CHOICES, self.settings.top_k, delta),
             _ => {}
         }
     }
@@ -1305,6 +1363,16 @@ impl App {
             3 => self.settings.budget_tokens.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
             4 => config::render_stops(&self.settings.stop),
             5 => self.settings.temperature.map(|t| t.to_string()).unwrap_or_else(|| "off".into()),
+            6 => self
+                .settings
+                .top_p
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "provider default".into()),
+            7 => self
+                .settings
+                .top_k
+                .map(config::render_top_k)
+                .unwrap_or_else(|| "provider default".into()),
             _ => String::new(),
         }
     }
@@ -1408,6 +1476,7 @@ const HELP: &str = "\
 /json schema <json>       set a full JSON Schema
 /json edit <instruction>  ask the model to rewrite the schema
 /json show                print the active schema
+/temp [off|0.0-2.0]       get or set sampling temperature (2.0 is the provider's max)
 /stop add <seq>           add a stop sequence (max 4)
 /stop clear               clear stop sequences
 /verify [prompt]          prove the stop condition changes the output
@@ -1435,16 +1504,16 @@ fn cycle_choice<T: PartialEq + Copy>(choices: &[T], current: T, delta: i32) -> T
     choices[(i + delta).rem_euclid(n) as usize]
 }
 
-/// `f32` doesn't implement `Eq`, so temperature gets its own small cycler
-/// over the fixed `TEMP_CHOICES` set (bitwise comparison is fine — these are
-/// exact constants, not computed values).
-fn cycle_temperature(current: Option<f32>, delta: i32) -> Option<f32> {
-    let i = TEMP_CHOICES
+/// `f32` doesn't implement `Eq`, so the float rows (temperature, top_p) get
+/// their own cycler over a fixed choice set (bitwise comparison is fine —
+/// these are exact constants, not computed values).
+fn cycle_float(choices: &[Option<f32>], current: Option<f32>, delta: i32) -> Option<f32> {
+    let i = choices
         .iter()
         .position(|c| c.map(f32::to_bits) == current.map(f32::to_bits))
         .unwrap_or(0) as i32;
-    let n = TEMP_CHOICES.len() as i32;
-    TEMP_CHOICES[(i + delta).rem_euclid(n) as usize]
+    let n = choices.len() as i32;
+    choices[(i + delta).rem_euclid(n) as usize]
 }
 
 /// Byte offset of the char at `char_idx` (`s.len()` when the index is at/past
@@ -1600,6 +1669,32 @@ mod tests {
         let jm = config::JsonMode::default();
         assert!(!jm.enabled);
         assert_eq!(jm.schema["type"], "object");
+    }
+
+    #[test]
+    fn temperature_choices_stay_inside_the_providers_range() {
+        for t in TEMP_CHOICES.iter().flatten() {
+            assert!(config::parse_temperature(*t).is_ok(), "{t} out of range");
+        }
+        // Stepping back from "off" lands on the ceiling, so it is reachable.
+        assert_eq!(cycle_float(TEMP_CHOICES, None, -1), Some(config::TEMP_MAX));
+        assert_eq!(cycle_float(TEMP_CHOICES, None, 1), Some(0.0));
+    }
+
+    #[test]
+    fn sampling_rows_render_and_cycle() {
+        let mut app = App::new(api::Endpoint::dummy(), config::Settings::default());
+        let temp_row = SETTINGS_ROWS.iter().position(|r| *r == "temperature").unwrap();
+        let top_p_row = SETTINGS_ROWS.iter().position(|r| *r == "top_p").unwrap();
+        let top_k_row = SETTINGS_ROWS.iter().position(|r| *r == "top_k").unwrap();
+        assert_eq!(app.setting_value(temp_row), "off");
+        assert_eq!(app.setting_value(top_p_row), "provider default");
+        assert_eq!(app.setting_value(top_k_row), "provider default");
+
+        app.settings_selected = top_k_row;
+        app.adjust_setting(-1); // one step back from "off" is the "full" end
+        assert_eq!(app.settings.top_k, Some(-1));
+        assert_eq!(app.setting_value(top_k_row), "full");
     }
 
     #[test]

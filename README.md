@@ -71,6 +71,7 @@ plain Enter.
 /json schema <json>                set a full JSON Schema
 /json edit <instruction>          ask the model to rewrite the schema
 /json show                        print the active schema
+/temp [off|0.0-2.0]               get or set sampling temperature (2.0 is the provider's max)
 /stop add <seq>                   add a stop sequence (max 4)
 /stop clear                       clear stop sequences
 /verify [prompt]                  prove the stop condition changes the output
@@ -198,11 +199,36 @@ protect someone's feelings?`
 
 ## Temperature
 
-Sampling temperature (`/settings`, or `--temperature F` for one-shot calls),
-cycled in the TUI over `off, 0.0, 0.3, 0.7, 1.0, 1.2`. Confirmed live against
-`yolo-auto.com`: at `0.0` the same prompt returns the same token repeatedly;
-at `1.2` it varies run to run — proof the provider actually honors the
-parameter rather than ignoring it.
+Sampling temperature: `/temp 1.2` (`/temp off` to clear), the `/settings`
+panel, or `--temperature F` for one-shot calls. Cycled in the TUI over
+`off, 0.0, 0.3, 0.7, 1.0, 1.2, 1.5, 2.0`, and shown in the header strip as
+`temp=…` so it is visible that it is actually set.
+
+**Ceiling: `2.0`.** `yolo-auto.com` validates the field itself and rejects
+anything outside `[0.0, 2.0]` with `HTTP 400 — temperature: Validation
+error: range [min 0.0, max 2.0]` (`2.01` is already refused). The client
+checks the same range up front, so a bad value fails instantly with a plain
+message instead of a wasted round trip.
+
+The parameter is honored: at `0.0` the same prompt returns the same answer
+run after run; at `1.2` it varies. But **on its own, temperature looks much
+weaker than it is**, because the provider applies its own truncation
+defaults (Qwen-style `top_k`/`top_p`) that cut the distribution down before
+temperature ever widens it. Measured with "name one random animal", eight
+runs each:
+
+| settings | result |
+| --- | --- |
+| `temp=0.0` | same word 8/8 |
+| `temp=1.2` | a handful of common animals, `Ostrich` still dominant |
+| `temp=2.0` | slightly more spread, still all plausible animals |
+| `temp=2.0 top_k=-1` | falls apart into other languages and junk tokens |
+
+So the two truncation knobs are exposed as well — `top_p` and `top_k` rows in
+`/settings`, `--top-p F` / `--top-k N` on the command line, both unset by
+default so the provider's own defaults stay in place. `top_k=-1` (shown as
+`full`) removes the cutoff entirely; that is the setting that makes a high
+temperature behave the way people expect it to — including badly, at `2.0`.
 
 ## API key
 
@@ -221,7 +247,9 @@ Optional overrides: `$YOLO_BASE_URL`, `$YOLO_MODEL`.
 --max-chars N
 --budget-tokens N
 --stop SEQ            (repeatable, max 4; \n and \t escapes work)
---temperature F
+--temperature F        0.0-2.0 (the provider's own range)
+--top-p F              nucleus cutoff; unset = provider default
+--top-k N              top-k cutoff, -1 = off; unset = provider default
 --raw                  print the full API response
 --quiet                suppress the usage/finish_reason line
 --verify-stop          run the stop-condition proof and exit
