@@ -57,9 +57,19 @@ pub struct Cli {
     #[arg(long = "stop", env = "ASK_STOP", value_delimiter = ',')]
     pub stop: Vec<String>,
 
-    /// Sampling temperature.
+    /// Sampling temperature, 0.0 to 2.0 (the provider's own range).
     #[arg(long)]
     pub temperature: Option<f32>,
+
+    /// Nucleus sampling cutoff, 0.0 to 1.0. Unset: provider default.
+    #[arg(long)]
+    pub top_p: Option<f32>,
+
+    /// Top-k cutoff; -1 disables it. Unset: provider default (which damps
+    /// the visible effect of --temperature).
+    // `allow_hyphen_values` so `--top-k -1` reads as a value, not a flag.
+    #[arg(long, allow_hyphen_values = true)]
+    pub top_k: Option<i32>,
 
     /// Run the stop-condition proof (same prompt, off vs on) and exit.
     #[arg(long)]
@@ -114,7 +124,19 @@ impl Cli {
             s.stop = self.stop.iter().map(|s| config::unescape(s)).collect();
         }
         if let Some(t) = self.temperature {
-            s.temperature = Some(t);
+            s.temperature = Some(config::parse_temperature(t)?);
+        }
+        if let Some(p) = self.top_p {
+            if !(0.0..=1.0).contains(&p) {
+                return Err(format!("top_p must be between 0.0 and 1.0 (got {p})"));
+            }
+            s.top_p = Some(p);
+        }
+        if let Some(k) = self.top_k {
+            if k == 0 || k < -1 {
+                return Err(format!("top_k must be -1 (off) or a positive count (got {k})"));
+            }
+            s.top_k = Some(k);
         }
         Ok(s)
     }

@@ -220,6 +220,15 @@ pub fn build_body(
     if let Some(t) = settings.temperature {
         obj.insert("temperature".into(), json!(t));
     }
+    // Only sent when explicitly set: left alone, the provider applies its own
+    // truncation defaults, which is exactly what hides the effect of a high
+    // temperature (see README, "Temperature").
+    if let Some(p) = settings.top_p {
+        obj.insert("top_p".into(), json!(p));
+    }
+    if let Some(k) = settings.top_k {
+        obj.insert("top_k".into(), json!(k));
+    }
 
     if !settings.thinking() {
         // Two independent switches: the OpenAI-style one and the Qwen chat-template
@@ -525,6 +534,31 @@ mod tests {
         let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn sampling_knobs_are_sent_only_when_set() {
+        let plain = build_body(
+            "model",
+            &Settings::default(),
+            "",
+            &[ChatMessage::user("hi")],
+            None,
+        );
+        assert!(plain.get("temperature").is_none());
+        assert!(plain.get("top_p").is_none());
+        assert!(plain.get("top_k").is_none());
+
+        let settings = Settings {
+            temperature: Some(1.2),
+            top_p: Some(1.0),
+            top_k: Some(-1),
+            ..Settings::default()
+        };
+        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
+        assert!((body["temperature"].as_f64().unwrap() - 1.2).abs() < 1e-6);
+        assert_eq!(body["top_p"], 1.0);
+        assert_eq!(body["top_k"], -1);
     }
 
     #[test]

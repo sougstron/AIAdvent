@@ -106,7 +106,34 @@ pub struct Settings {
     /// Literal stop strings — the other stop-condition lever. The provider
     /// halts generation the instant one is emitted (`finish_reason=stop`).
     pub stop: Vec<String>,
+    /// Sampling temperature. The provider accepts `TEMP_MIN..=TEMP_MAX` and
+    /// rejects anything outside with HTTP 400, so it is validated client-side.
     pub temperature: Option<f32>,
+    /// Nucleus sampling cutoff. `None` leaves the provider's default in place.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Top-k cutoff; `-1` disables it (full vocabulary). `None` leaves the
+    /// provider's default in place — and that default is what makes a high
+    /// temperature look like it does nothing, since it truncates the
+    /// distribution before temperature ever gets to widen it.
+    #[serde(default)]
+    pub top_k: Option<i32>,
+}
+
+/// Range the provider validates `temperature` against — outside it the call
+/// fails with `temperature: Validation error: range`, confirmed live.
+pub const TEMP_MIN: f32 = 0.0;
+pub const TEMP_MAX: f32 = 2.0;
+
+/// Parses a temperature and rejects out-of-range values here rather than
+/// letting the provider answer with an HTTP 400.
+pub fn parse_temperature(t: f32) -> Res<f32> {
+    if !(TEMP_MIN..=TEMP_MAX).contains(&t) {
+        return Err(format!(
+            "temperature must be between {TEMP_MIN} and {TEMP_MAX} (got {t})"
+        ));
+    }
+    Ok(t)
 }
 
 impl Default for Settings {
@@ -118,6 +145,8 @@ impl Default for Settings {
             budget_tokens: None,
             stop: Vec::new(),
             temperature: None,
+            top_p: None,
+            top_k: None,
         }
     }
 }
@@ -147,6 +176,16 @@ impl Settings {
         } else {
             format!("stop={}", render_stops(&self.stop))
         });
+        parts.push(match self.temperature {
+            Some(t) => format!("temp={t}"),
+            None => "temp=off".into(),
+        });
+        if let Some(p) = self.top_p {
+            parts.push(format!("top_p={p}"));
+        }
+        if let Some(k) = self.top_k {
+            parts.push(format!("top_k={}", render_top_k(k)));
+        }
         parts.join("  ")
     }
 
@@ -157,6 +196,16 @@ impl Settings {
         s.budget_tokens = None;
         s.stop.clear();
         s
+    }
+}
+
+/// `-1` is the provider's "no top-k cutoff at all" value; spell that out
+/// instead of showing a bare negative number in the UI.
+pub fn render_top_k(k: i32) -> String {
+    if k < 0 {
+        "full".into()
+    } else {
+        k.to_string()
     }
 }
 
@@ -203,6 +252,28 @@ mod tests {
         }
         assert_eq!(Effort::None.cycle(1), Effort::Low);
         assert_eq!(Effort::None.cycle(-1), Effort::High);
+    }
+
+    #[test]
+    fn temperature_range_matches_the_provider() {
+        assert_eq!(parse_temperature(0.0).unwrap(), 0.0);
+        assert_eq!(parse_temperature(2.0).unwrap(), 2.0);
+        // 2.01 is what the endpoint itself rejects with HTTP 400.
+        assert!(parse_temperature(2.01).is_err());
+        assert!(parse_temperature(-0.1).is_err());
+    }
+
+    #[test]
+    fn summary_shows_temperature_and_only_set_sampling_knobs() {
+        let mut s = Settings::default();
+        assert!(s.summary().contains("temp=off"));
+        assert!(!s.summary().contains("top_k"));
+        s.temperature = Some(1.2);
+        s.top_k = Some(-1);
+        let summary = s.summary();
+        assert!(summary.contains("temp=1.2"));
+        assert!(summary.contains("top_k=full"));
+        assert!(!summary.contains("top_p"));
     }
 
     #[test]
