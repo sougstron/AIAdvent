@@ -12,6 +12,11 @@ tree/task-4/target/*
 !tree/task-4/target/release/
 tree/task-4/target/release/*
 !tree/task-4/target/release/ask
+!tree/task-5/target/
+tree/task-5/target/*
+!tree/task-5/target/release/
+tree/task-5/target/release/*
+!tree/task-5/target/release/ask
 # the current-task pointer is tracked even though docs/ is ignored
 !docs/
 docs/*
@@ -21,3 +26,4 @@ PLAN.md
 
 # tauri-build генерирует их при каждой сборке
 tree/task-4/gen/schemas/
+tree/task-5/gen/schemas/
