@@ -2,35 +2,31 @@
 
 const invoke = window.__TAURI__?.core?.invoke;
 
-const TONES = { 0: "var(--t0)", 0.7: "var(--t07)", 1.2: "var(--t12)" };
-const HINTS = {
-  0: "жёсткий детерминизм",
-  0.7: "рабочий баланс",
-  1.2: "широкий сэмплинг",
-};
+const TONES = { weak: "var(--weak)", medium: "var(--medium)", strong: "var(--strong)" };
 
 const PRESETS = [
-  ["Факты", "Что такое temperature в языковой модели? Ответь в 3 предложениях."],
-  ["Творчество", "Придумай название и слоган для кофейни на берегу моря."],
-  ["Код", "Напиши функцию на Python, которая разворачивает односвязный список. Только код."],
-  ["Идеи", "Дай 5 идей, чем занять ребёнка 7 лет в дождливый день."],
+  ["Техника", "Объясни разницу между HTTP-кэшированием по ETag и по Last-Modified: когда какой выбрать и какие ошибки чаще всего допускают. До 200 слов."],
+  ["Разбор", "Почему транзакция в базе может пройти успешно, но данные всё равно потеряются? Разбери по шагам."],
+  ["Код", "Напиши функцию на Python, которая находит цикл в односвязном списке за O(1) памяти. Только код и короткий комментарий."],
+  ["Творчество", "Придумай название и слоган для сервиса, который сравнивает языковые модели по цене."],
 ];
 
 const VERDICTS = {
-  honored: ["ok", "temperature применяется"],
-  ignored: ["bad", "temperature игнорируется"],
-  inconclusive: ["meh", "проверка не показательна"],
+  confirmed: ["ok", "лестница подтверждена"],
+  substituted: ["bad", "площадка ответила другой моделью"],
+  flat: ["meh", "проба не различила ступени"],
+  inverted: ["meh", "порядок ступеней не подтверждён"],
 };
 
 const $ = (id) => document.getElementById(id);
-let lastComparison = null;
-/** Провайдеры, для которых проба уже прогонялась в этой сессии. */
-const checked = new Set();
+let lastLadder = null;
+/** Проверка не зависит от запроса — гоняем её один раз за сессию. */
+let checked = false;
 
 /* ---------- разметка ---------- */
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) =>
+  return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
@@ -69,64 +65,52 @@ function renderMarkdown(src) {
   return out.join("");
 }
 
+/** Шкала всегда относительно худшей ступени: важно не значение, а во сколько раз. */
 function meter(label, value, fraction, tone) {
   const pct = Math.max(0, Math.min(1, fraction)) * 100;
   return `<div>
-    <div class="meter-label"><span>${label}</span><b>${value}</b></div>
+    <div class="meter-label"><span>${label}</span><b>${escapeHtml(value)}</b></div>
     <div class="bar"><i style="width:${pct.toFixed(1)}%;background:${tone}"></i></div>
   </div>`;
 }
 
-function cardHtml(branch, maxWords) {
-  const t = branch.temperature;
-  const tone = TONES[t] ?? "var(--accent)";
-  const m = branch.metrics;
+function money(usd) {
+  return usd >= 0.01 ? `$${usd.toFixed(3)}` : `$${usd.toFixed(5)}`;
+}
 
-  // «Разнообразие» — обратная величина совпадения повторных прогонов.
-  const diversity =
-    m.self_similarity === null || m.self_similarity === undefined
-      ? null
-      : 1 - m.self_similarity;
+function cardHtml(rung, max) {
+  const tone = TONES[rung.tier] ?? "var(--accent)";
+  const m = rung.measure;
+  const cost = rung.billing === "subscription"
+    ? `подписка · по прайсу ${money(m.cost_usd)}`
+    : money(m.cost_usd);
 
   const meters = [
-    meter("лексическое богатство", `${Math.round(m.distinct_ratio * 100)}%`, m.distinct_ratio, tone),
-    meter("объём", `${m.words} слов`, maxWords ? m.words / maxWords : 0, tone),
-    diversity === null
-      ? ""
-      : meter("разнообразие прогонов", `${Math.round(diversity * 100)}%`, diversity, tone),
+    meter("время ответа", `${(m.latency_ms / 1000).toFixed(1)} с`, m.latency_ms / max.latency_ms, tone),
+    meter("токенов на ответ", `${m.completion_tokens}`, m.completion_tokens / max.completion_tokens, tone),
+    meter("стоимость", cost, m.cost_usd / max.cost_usd, tone),
+    meter("скорость", `${m.tokens_per_sec.toFixed(0)} ток./с`, m.tokens_per_sec / max.tokens_per_sec, tone),
   ].join("");
 
-  const extras = branch.runs.slice(1);
-  const extrasHtml = extras.length
-    ? `<details class="extra">
-         <summary>ещё ${extras.length} прогон(а) при этой же температуре</summary>
-         ${extras
-           .map(
-             (r, i) =>
-               `<div class="run-tag">прогон ${i + 2}</div><div class="answer">${escapeHtml(r.content)}</div>`
-           )
-           .join("")}
-       </details>`
-    : "";
-
-  const first = branch.runs[0];
   return `<article class="card tcard" style="--tone:${tone}">
-    <h3>temperature<b>${t}</b></h3>
-    <div class="facts">
-      <span class="fact">${HINTS[t] ?? ""}</span>
-      <span class="fact">${first.completion_tokens} ток.</span>
-      <span class="fact">${(first.latency_ms / 1000).toFixed(1)} с</span>
-      <span class="fact">${first.finish_reason}</span>
+    <h3>${escapeHtml(rung.label)}<b>${rung.score === null ? "—" : rung.score + "/10"}</b></h3>
+    <div class="model-line">
+      <a href="${escapeHtml(rung.model_url)}" target="_blank" rel="noreferrer">${escapeHtml(rung.model)}</a>
+      ${rung.effort ? `<span class="fact">${escapeHtml(rung.effort)}</span>` : ""}
     </div>
-    <div class="answer">${escapeHtml(branch.answer)}</div>
+    <div class="facts">
+      <span class="fact">${escapeHtml(rung.provider)}</span>
+      <span class="fact">${m.reasoning_tokens} ток. рассуждений</span>
+      <span class="fact">${escapeHtml(rung.finish_reason)}</span>
+    </div>
+    <div class="answer">${escapeHtml(rung.answer)}</div>
     <div class="meters">${meters}</div>
-    ${extrasHtml}
   </article>`;
 }
 
-/* ---------- проверка температуры ---------- */
+/* ---------- проверка лестницы ---------- */
 
-/** Показывает результат пробы: без него «различия» между ветками ничего не значат. */
+/** Без неё замеры не значат ничего: неизвестно даже, та ли это модель. */
 function renderCheck(c) {
   const [tone, label] = VERDICTS[c.verdict] ?? ["meh", c.verdict];
   const verdict = $("verdict");
@@ -134,24 +118,35 @@ function renderCheck(c) {
   verdict.textContent = label;
   verdict.classList.remove("hidden");
 
+  const rows = c.rungs
+    .map(
+      (r) => `<tr>
+        <td>${escapeHtml(r.label)}</td>
+        <td>${r.model_matches ? "✅" : "❌"} <code>${escapeHtml(r.served_model)}</code></td>
+        <td><b>${r.score}/${c.questions.length}</b></td>
+        <td>${r.answers
+          .map((a, i) => `<span class="${r.correct[i] ? "ok" : "bad"}">${escapeHtml(a.split("\n")[0].slice(0, 24))}</span>`)
+          .join(" ")}</td>
+      </tr>`
+    )
+    .join("");
+
   const el = $("check");
   el.className = `check ${tone}`;
   el.innerHTML = `
-    <div><b>${escapeHtml(label)}</b> — <code>${escapeHtml(c.provider)}</code> / <code>${escapeHtml(c.model)}</code></div>
-    <div class="probe">
-      <span>temperature=${c.cold_temperature} → <b>${escapeHtml(c.cold_answers.join(" "))}</b> (${c.cold_distinct} разных)</span>
-      <span>temperature=${c.hot_temperature} → <b>${escapeHtml(c.hot_answers.join(" "))}</b> (${c.hot_distinct} разных)</span>
-    </div>
+    <div><b>${escapeHtml(label)}</b> — ${c.questions.length} вопроса с известным ответом при temperature = 0</div>
+    <table class="probe-table"><tbody>${rows}</tbody></table>
     <div class="muted">${escapeHtml(c.explanation)}</div>`;
   el.classList.remove("hidden");
 }
 
-async function verifyTemperature() {
+async function verifyLadder() {
   const btn = $("verify");
   btn.disabled = true;
-  setStatus("Проба: по 6 коротких запросов при temperature 0 и 2.0", false);
+  setStatus("Проба: по 4 коротких вопроса на каждую из трёх ступеней", false);
   try {
-    renderCheck(await invoke("check_temperature", { provider: $("provider").value }));
+    renderCheck(await invoke("check_ladder"));
+    checked = true;
     $("status").classList.add("hidden");
   } catch (e) {
     setStatus(String(e), true);
@@ -169,19 +164,22 @@ function setStatus(text, isError) {
   el.classList.remove("hidden");
 }
 
-function render(c) {
-  lastComparison = c;
-  const maxWords = Math.max(...c.branches.map((b) => b.metrics.words), 1);
-  $("cards").innerHTML = c.branches.map((b) => cardHtml(b, maxWords)).join("");
-  $("judge-name").textContent = c.judge_model;
-  $("worker-model").textContent = c.worker_model;
-  $("judge-model").textContent = c.judge_model;
-  $("timing").textContent = `${c.branches.length * c.runs_per_temperature + 1} запрос(ов) · ${(
-    c.total_ms / 1000
-  ).toFixed(1)} с`;
-  $("summary").innerHTML = renderMarkdown(c.summary);
+function render(l) {
+  lastLadder = l;
+  // Шкалы метрик общие на все карточки, иначе «в 20 раз быстрее» не видно.
+  const max = {
+    latency_ms: Math.max(...l.rungs.map((r) => r.measure.latency_ms), 1),
+    completion_tokens: Math.max(...l.rungs.map((r) => r.measure.completion_tokens), 1),
+    cost_usd: Math.max(...l.rungs.map((r) => r.measure.cost_usd), 1e-9),
+    tokens_per_sec: Math.max(...l.rungs.map((r) => r.measure.tokens_per_sec), 1),
+  };
+  $("cards").innerHTML = l.rungs.map((r) => cardHtml(r, max)).join("");
+  $("judge-name").textContent = l.judge_model;
+  const total = l.rungs.reduce((s, r) => s + r.measure.cost_usd, 0);
+  $("timing").textContent = `${l.rungs.length + 1} запрос(ов) · ${(l.total_ms / 1000).toFixed(1)} с · ${money(total)}`;
+  $("summary").innerHTML = renderMarkdown(l.summary);
   $("results").classList.remove("hidden");
-  if (c.temp_check) renderCheck(c.temp_check);
+  if (l.check) renderCheck(l.check);
 }
 
 async function compare() {
@@ -195,21 +193,18 @@ async function compare() {
     return;
   }
 
-  const provider = $("provider").value;
-  const runs = Number($("runs").value);
-  // Проверку гоняем один раз на провайдера: она не зависит от запроса.
-  const verify = !checked.has(provider);
+  const verify = !checked;
   $("go").disabled = true;
   $("results").classList.add("hidden");
   setStatus(
-    `Идут ${3 * runs + 1} запроса: три температуры по ${runs} прогон(а), затем разбор` +
-      (verify ? ", плюс проверка температуры" : ""),
+    "Один запрос уходит на три модели параллельно, затем разбор судьёй" +
+      (verify ? ", плюс проверка лестницы" : ""),
     false
   );
 
   try {
-    render(await invoke("compare_temperatures", { prompt, runs, provider, verify }));
-    checked.add(provider);
+    render(await invoke("run_ladder", { prompt, verify }));
+    checked = true;
     $("status").classList.add("hidden");
   } catch (e) {
     setStatus(String(e), true);
@@ -219,8 +214,8 @@ async function compare() {
 }
 
 async function copyReport() {
-  if (!lastComparison || !invoke) return;
-  const md = await invoke("markdown_report", { comparison: lastComparison });
+  if (!lastLadder || !invoke) return;
+  const md = await invoke("markdown_report", { ladder: lastLadder });
   await navigator.clipboard.writeText(md);
   const btn = $("copy");
   btn.textContent = "Скопировано";
@@ -238,30 +233,29 @@ $("presets").addEventListener("click", (e) => {
 });
 
 $("go").addEventListener("click", compare);
-$("verify").addEventListener("click", verifyTemperature);
+$("verify").addEventListener("click", verifyLadder);
 $("copy").addEventListener("click", copyReport);
 $("prompt").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) compare();
 });
 
-// Смена провайдера обесценивает и вердикт, и показанные ответы.
-$("provider").addEventListener("change", () => {
-  $("check").classList.add("hidden");
-  $("verdict").classList.add("hidden");
-  $("results").classList.add("hidden");
-  $("worker-model").textContent = $("provider").selectedOptions[0].dataset.model;
-});
-
-$("prompt").value = PRESETS[1][1];
+$("prompt").value = PRESETS[0][1];
 
 (async () => {
   if (!invoke) {
     setStatus("Нет моста Tauri — откройте приложение, а не файл в браузере.", true);
     return;
   }
-  const list = await invoke("providers");
-  $("provider").innerHTML = list
-    .map((p) => `<option value="${p.id}" data-model="${p.answer_model}">${p.id}</option>`)
-    .join("");
-  $("worker-model").textContent = list[0].answer_model;
+  const list = await invoke("tiers");
+  $("tier-pills").insertAdjacentHTML(
+    "afterbegin",
+    list
+      .map(
+        (t) =>
+          `<span class="pill" style="--tone:${TONES[t.tier]}">${escapeHtml(t.label)}: <b>${escapeHtml(
+            t.model
+          )}</b>${t.effort ? ` · ${escapeHtml(t.effort)}` : ""}</span>`
+      )
+      .join("")
+  );
 })();

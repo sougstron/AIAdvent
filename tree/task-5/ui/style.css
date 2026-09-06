@@ -1,4 +1,4 @@
-/* Тёмная тема; каждая температура получает свой оттенок — от холодного к тёплому. */
+/* Тёмная тема; каждая ступень лестницы получает свой оттенок — снизу вверх. */
 :root {
   --bg: #0e1116;
   --panel: #161b23;
@@ -8,9 +8,9 @@
   --muted: #8b95a7;
   --accent: #6aa6ff;
 
-  --t0: #58a6ff;   /* temperature 0   — холодный */
-  --t07: #b892ff;  /* temperature 0.7 — переход */
-  --t12: #ff9d5c;  /* temperature 1.2 — тёплый */
+  --weak: #6ee7a8;   /* слабая  — дешёвая и простая */
+  --medium: #b892ff; /* средняя — переход */
+  --strong: #ff9d5c; /* сильная — дорогая */
 }
 
 * { box-sizing: border-box; }
@@ -45,7 +45,7 @@ h1 {
   margin: 0;
   font-size: 22px;
   letter-spacing: -0.02em;
-  background: linear-gradient(92deg, var(--t0), var(--t07) 55%, var(--t12));
+  background: linear-gradient(92deg, var(--weak), var(--medium) 55%, var(--strong));
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -114,36 +114,8 @@ textarea:focus { border-color: var(--accent); }
 .presets button:hover { color: var(--text); border-color: var(--accent); }
 
 .controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.runs {
-  font-size: 12.5px;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  white-space: nowrap;
-}
-/* WebKitGTK рисует свой контрол и игнорирует цвета, пока не снять appearance —
-   без этого текст в списке серый по серому и не читается. */
-select {
-  -webkit-appearance: none;
-  appearance: none;
-  background: var(--panel-2)
-    url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath fill='%238b95a7' d='M0 0h10L5 6z'/%3E%3C/svg%3E")
-    no-repeat right 9px center;
-  background-size: 9px;
-  color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 6px 26px 6px 9px;
-  font: inherit;
-  font-size: 12.5px;
-  cursor: pointer;
-}
-select:hover { border-color: var(--accent); }
-/* Выпадающий список рисуется системой — задаём цвета и ему. */
-select option { background: var(--panel-2); color: var(--text); }
 .go {
-  background: linear-gradient(92deg, var(--t0), var(--t12));
+  background: linear-gradient(92deg, var(--weak), var(--strong));
   color: #0e1116;
   font: inherit;
   font-weight: 650;
@@ -165,7 +137,7 @@ select option { background: var(--panel-2); color: var(--text); }
 }
 .ghost:hover { color: var(--text); border-color: var(--accent); }
 
-/* ---------- вердикт проверки температуры ---------- */
+/* ---------- вердикт проверки лестницы ---------- */
 .verdict.ok { color: #7ee2a8; border-color: #2f5d43; }
 .verdict.bad { color: #ff9d9d; border-color: #6d3a3a; }
 .verdict.meh { color: #ffd479; border-color: #6b5a2c; }
@@ -185,15 +157,34 @@ select option { background: var(--panel-2); color: var(--text); }
 .check.bad { border-left-color: #ff9d9d; }
 .check.meh { border-left-color: #ffd479; }
 .check b { font-weight: 650; }
-.check .probe {
-  display: flex;
-  gap: 18px;
-  flex-wrap: wrap;
-  font-family: "JetBrains Mono", ui-monospace, monospace;
-  font-size: 12px;
+.probe-table {
+  border-collapse: collapse;
+  font-size: 12.5px;
   color: var(--muted);
 }
-.check .probe b { color: var(--text); font-weight: 500; }
+.probe-table td { padding: 3px 14px 3px 0; vertical-align: top; }
+.probe-table b { color: var(--text); font-weight: 600; }
+.probe-table code { font-size: 11.5px; }
+.probe-table .ok, .probe-table .bad {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  border-radius: 5px;
+  padding: 1px 6px;
+  margin-right: 3px;
+  white-space: nowrap;
+}
+.probe-table .ok { background: #17301f; color: #7ee2a8; }
+.probe-table .bad { background: #2b1a1a; color: #ff9d9d; }
+
+.blind {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  vertical-align: middle;
+}
 
 /* ---------- статус ---------- */
 .status {
@@ -226,8 +217,30 @@ select option { background: var(--panel-2); color: var(--text); }
   padding: 15px 16px;
 }
 .tcard { border-top: 3px solid var(--tone); display: flex; flex-direction: column; gap: 11px; }
-.tcard h3 { margin: 0; font-size: 14px; color: var(--muted); font-weight: 500; }
-.tcard h3 b { color: var(--tone); font-size: 20px; font-weight: 700; margin-left: 6px; }
+.tcard h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--muted);
+  font-weight: 500;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tcard h3 b { color: var(--tone); font-size: 20px; font-weight: 700; }
+
+.model-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.model-line a {
+  color: var(--text);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 13px;
+  text-decoration: none;
+  border-bottom: 1px dotted var(--line);
+}
+.model-line a:hover { color: var(--tone); border-bottom-color: var(--tone); }
+
+/* Пилюля ступени в шапке подсвечивается её же цветом. */
+.pill[style*="--tone"] b { color: var(--tone); }
 
 .answer {
   white-space: pre-wrap;
@@ -257,19 +270,6 @@ select option { background: var(--panel-2); color: var(--text); }
   border-radius: 6px;
   padding: 3px 8px;
 }
-
-details.extra { border-top: 1px solid var(--line); padding-top: 9px; }
-details.extra summary {
-  cursor: pointer;
-  font-size: 12.5px;
-  color: var(--muted);
-  list-style: none;
-}
-details.extra summary:hover { color: var(--text); }
-details.extra summary::before { content: "▸ "; }
-details.extra[open] summary::before { content: "▾ "; }
-details.extra .answer { max-height: 220px; margin-top: 9px; font-size: 13px; }
-details.extra .run-tag { font-size: 11.5px; color: var(--tone); margin-top: 10px; }
 
 /* ---------- разбор ---------- */
 .summary-head {
