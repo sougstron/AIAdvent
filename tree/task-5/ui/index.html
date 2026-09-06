@@ -3,18 +3,16 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Temperature Lab</title>
+  <title>Model Ladder</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="top">
     <div>
-      <h1>Temperature Lab</h1>
-      <p class="sub">Один запрос уходит трижды — меняется только <code>temperature</code>.</p>
+      <h1>Model Ladder</h1>
+      <p class="sub">Один запрос уходит на три модели — меняется только <code>модель</code>.</p>
     </div>
-    <div class="models">
-      <span class="pill">ответы: <b id="worker-model">—</b></span>
-      <span class="pill">разбор: <b id="judge-model">glm-5.3</b></span>
+    <div class="models" id="tier-pills">
       <span id="verdict" class="pill verdict hidden"></span>
     </div>
   </header>
@@ -22,22 +20,11 @@
   <div id="check" class="check hidden"></div>
 
   <section class="composer">
-    <textarea id="prompt" rows="3" placeholder="Что спросить у модели?" spellcheck="false"></textarea>
+    <textarea id="prompt" rows="3" placeholder="Что спросить у трёх моделей?" spellcheck="false"></textarea>
     <div class="composer-row">
       <div class="presets" id="presets"></div>
       <div class="controls">
-        <label class="runs">
-          провайдер
-          <select id="provider"></select>
-        </label>
-        <label class="runs">
-          прогонов на температуру
-          <select id="runs">
-            <option value="1">1 — быстро</option>
-            <option value="3" selected>3 — с замером разнообразия</option>
-          </select>
-        </label>
-        <button id="verify" class="ghost">Проверить температуру</button>
+        <button id="verify" class="ghost">Проверить лестницу</button>
         <button id="go" class="go">Сравнить</button>
       </div>
     </div>
@@ -50,7 +37,7 @@
 
     <section class="summary card">
       <div class="summary-head">
-        <h2>Разбор от <span id="judge-name"></span></h2>
+        <h2>Разбор от <span id="judge-name"></span> <span class="blind">вслепую</span></h2>
         <div class="summary-actions">
           <span id="timing" class="muted"></span>
           <button id="copy" class="ghost">Скопировать отчёт</button>

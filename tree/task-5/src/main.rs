@@ -2,13 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
-mod compare;
+mod ladder;
 mod report;
 mod verify;
 
 use std::process::ExitCode;
-
-use api::{Client, Provider};
 
 /// WebKitGTK на некоторых Wayland/GPU-конфигурациях открывает пустое окно.
 /// Применяем тот же workaround, что использует эталонный balance-editor, чтобы
@@ -16,7 +14,7 @@ use api::{Client, Provider};
 fn apply_linux_display_workarounds() {
     #[cfg(target_os = "linux")]
     {
-        let native_wayland = std::env::var_os("TEMPERATURE_LAB_NATIVE_WAYLAND").is_some();
+        let native_wayland = std::env::var_os("MODEL_LADDER_NATIVE_WAYLAND").is_some();
         let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
             || std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("wayland");
 
@@ -32,47 +30,44 @@ fn apply_linux_display_workarounds() {
     }
 }
 
-/// Кнопка «Сравнить»: три температуры, затем разбор старшей моделью.
+/// Кнопка «Сравнить»: один запрос на три ступени, затем разбор судьёй.
 #[tauri::command]
-async fn compare_temperatures(
-    prompt: String,
-    runs: usize,
-    provider: String,
-    verify: bool,
-) -> Result<compare::Comparison, String> {
+async fn run_ladder(prompt: String, verify: bool) -> Result<ladder::Ladder, String> {
     // Сеть блокирующая (ureq), поэтому уводим её с асинхронного рантайма.
     tauri::async_runtime::spawn_blocking(move || {
-        let client = Client::new(Provider::parse(&provider)?)?;
-        let mut comparison = compare::run(&client, &prompt, runs)?;
+        let mut l = ladder::run(&prompt)?;
         if verify {
-            comparison.temp_check = Some(verify::check_temperature(&client)?);
+            l.check = Some(verify::check_ladder()?);
         }
-        Ok(comparison)
+        Ok(l)
     })
     .await
     .map_err(|e| format!("задача не завершилась: {e}"))?
 }
 
-/// Кнопка «Проверить температуру» — отдельно от сравнения, чтобы можно было
-/// сначала убедиться, что рычаг вообще работает.
+/// Кнопка «Проверить лестницу» — отдельно от сравнения, чтобы можно было
+/// сначала убедиться, что ступени вообще различаются.
 #[tauri::command]
-async fn check_temperature(provider: String) -> Result<verify::TempCheck, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        verify::check_temperature(&Client::new(Provider::parse(&provider)?)?)
-    })
-    .await
-    .map_err(|e| format!("задача не завершилась: {e}"))?
+async fn check_ladder() -> Result<verify::LadderCheck, String> {
+    tauri::async_runtime::spawn_blocking(verify::check_ladder)
+        .await
+        .map_err(|e| format!("задача не завершилась: {e}"))?
 }
 
-/// Список провайдеров с моделями — фронт не должен их хардкодить.
+/// Состав лестницы — фронт не должен его хардкодить.
 #[tauri::command]
-fn providers() -> Vec<serde_json::Value> {
-    Provider::ALL
+fn tiers() -> Vec<serde_json::Value> {
+    ladder::LADDER
         .iter()
-        .map(|p| {
+        .map(|s| {
             serde_json::json!({
-                "id": p.id(),
-                "answer_model": p.answer_model(),
+                "tier": s.tier,
+                "label": s.label,
+                "provider": s.provider.id(),
+                "model": s.model,
+                "effort": s.effort.map(|e| e.as_str()),
+                "model_url": s.model_url,
+                "price_url": s.price_url,
             })
         })
         .collect()
@@ -80,8 +75,8 @@ fn providers() -> Vec<serde_json::Value> {
 
 /// Кнопка «Скопировать отчёт».
 #[tauri::command]
-fn markdown_report(comparison: compare::Comparison) -> String {
-    report::to_markdown(&comparison)
+fn markdown_report(ladder: ladder::Ladder) -> String {
+    report::to_markdown(&ladder)
 }
 
 fn main() -> ExitCode {
@@ -92,16 +87,16 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some("--cli") => return cli(&args[1..]),
-        Some("--verify-temp") => return verify_temp(&args[1..]),
+        Some("--verify-ladder") => return verify_ladder(),
         _ => {}
     }
 
     apply_linux_display_workarounds();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            compare_temperatures,
-            check_temperature,
-            providers,
+            run_ladder,
+            check_ladder,
+            tiers,
             markdown_report
         ])
         .run(tauri::generate_context!())
@@ -111,73 +106,47 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "Temperature Lab — один запрос при temperature {:?}\n\n\
-         ask                                     окно приложения (Tauri)\n\
-         ask --cli \"запрос\" [опции]               то же самое в терминале\n\
-         ask --verify-temp [-p провайдер]        доказать, применяется ли temperature\n\n\
+        "Model Ladder — один запрос на слабой, средней и сильной модели\n\n\
+         ask                             окно приложения (Tauri)\n\
+         ask --cli \"запрос\" [опции]       то же самое в терминале\n\
+         ask --verify-ladder             доказать, что ступени различимы\n\n\
          Опции --cli:\n\
-         \x20 -n, --runs N        прогонов на температуру (по умолчанию 1)\n\
-         \x20 -p, --provider P    openrouter (по умолчанию) | zai\n\
-         \x20 -o, --out ФАЙЛ      записать markdown-отчёт вместо вывода в stdout\n\
-         \x20 --verify            добавить в отчёт проверку температуры\n\n\
-         Ответы даёт выбранный провайдер, разбор — всегда {} ({}).\n\
-         Ключи берутся из ~/.pi/agent/auth.json.\n",
-        compare::TEMPERATURES,
-        api::JUDGE_MODEL,
-        api::JUDGE_PROVIDER.id()
-    );
-}
-
-/// Провайдер по умолчанию для ответов. Не Z.AI: подписочный endpoint
-/// игнорирует temperature (доказывается через `--verify-temp`), а на нём
-/// сравнение температур бессмысленно.
-const DEFAULT_PROVIDER: Provider = Provider::OpenRouter;
-
-fn parse_provider(args: &[String], i: &mut usize) -> Result<Provider, String> {
-    *i += 1;
-    args.get(*i)
-        .ok_or_else(|| "-p ждёт имя провайдера".to_string())
-        .and_then(|v| Provider::parse(v))
-}
-
-fn verify_temp(args: &[String]) -> ExitCode {
-    let mut provider = DEFAULT_PROVIDER;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-p" | "--provider" => match parse_provider(args, &mut i) {
-                Ok(p) => provider = p,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::FAILURE;
+         \x20 -o, --out ФАЙЛ    записать markdown-отчёт вместо вывода в stdout\n\
+         \x20 --verify          добавить в отчёт проверку лестницы\n\n\
+         Ступени:\n{}\
+         \x20 судья    {} ({})\n\n\
+         Ключи берутся из ~/.pi/agent/{{auth,models}}.json и \
+         ~/.local/share/opencode/auth.json.\n",
+        ladder::LADDER
+            .iter()
+            .map(|s| format!(
+                "\x20 {:<8} {} ({}{})\n",
+                s.label,
+                s.model,
+                s.provider.id(),
+                match s.effort {
+                    Some(e) => format!(", {}", e.as_str()),
+                    None => String::new(),
                 }
-            },
-            other => {
-                eprintln!("лишний аргумент: {other}");
-                return ExitCode::FAILURE;
-            }
-        }
-        i += 1;
-    }
-
-    let client = match Client::new(provider) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("нет доступа к API: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    eprintln!(
-        "проверяю {} / {}: по 6 прогонов при temperature 0 и 2.0…",
-        provider.id(),
-        provider.answer_model()
+            ))
+            .collect::<String>(),
+        ladder::JUDGE_MODEL,
+        ladder::JUDGE_PROVIDER.id()
     );
-    match verify::check_temperature(&client) {
+}
+
+fn verify_ladder() -> ExitCode {
+    eprintln!(
+        "проверяю {} ступени: по {} коротких вопроса с известным ответом при temperature=0…",
+        ladder::LADDER.len(),
+        4
+    );
+    match verify::check_ladder() {
         Ok(c) => {
             print!("{}", verify::to_text(&c));
-            // Ненулевой код, если рычаг не подтверждён: удобно в скриптах.
+            // Ненулевой код, если лестница не подтверждена: удобно в скриптах.
             match c.verdict {
-                verify::Verdict::Honored => ExitCode::SUCCESS,
+                verify::Verdict::Confirmed => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
             }
         }
@@ -190,31 +159,12 @@ fn verify_temp(args: &[String]) -> ExitCode {
 
 fn cli(args: &[String]) -> ExitCode {
     let mut prompt = String::new();
-    let mut runs = 1usize;
     let mut out_path: Option<String> = None;
-    let mut provider = DEFAULT_PROVIDER;
     let mut with_check = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-n" | "--runs" => {
-                i += 1;
-                match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
-                    Some(n) => runs = n,
-                    None => {
-                        eprintln!("-n ждёт число");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            "-p" | "--provider" => match parse_provider(args, &mut i) {
-                Ok(p) => provider = p,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::FAILURE;
-                }
-            },
             "-o" | "--out" => {
                 i += 1;
                 match args.get(i) {
@@ -243,24 +193,14 @@ fn cli(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let client = match Client::new(provider) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("нет доступа к API: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     eprintln!(
-        "→ {} / {} × {} прогон(а) при temperature {:?}, затем разбор через {}…",
-        provider.id(),
-        provider.answer_model(),
-        runs,
-        compare::TEMPERATURES,
-        api::JUDGE_MODEL
+        "→ один запрос на {} ступени параллельно, затем разбор через {}…",
+        ladder::LADDER.len(),
+        ladder::JUDGE_MODEL
     );
 
-    let mut comparison = match compare::run(&client, &prompt, runs) {
-        Ok(c) => c,
+    let mut l = match ladder::run(&prompt) {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("сравнение не удалось: {e}");
             return ExitCode::FAILURE;
@@ -268,14 +208,14 @@ fn cli(args: &[String]) -> ExitCode {
     };
 
     if with_check {
-        eprintln!("→ проверяю, доезжает ли temperature до сэмплера…");
-        match verify::check_temperature(&client) {
-            Ok(c) => comparison.temp_check = Some(c),
-            Err(e) => eprintln!("проверка температуры не удалась: {e}"),
+        eprintln!("→ проверяю, различимы ли ступени…");
+        match verify::check_ladder() {
+            Ok(c) => l.check = Some(c),
+            Err(e) => eprintln!("проверка лестницы не удалась: {e}"),
         }
     }
 
-    let md = report::to_markdown(&comparison);
+    let md = report::to_markdown(&l);
     match out_path {
         Some(p) => match std::fs::write(&p, &md) {
             Ok(()) => eprintln!("отчёт записан: {p}"),

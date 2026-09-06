@@ -1,8 +1,8 @@
 [package]
 name = "ask"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Temperature Lab — сравнение ответов LLM при temperature 0 / 0.7 / 1.2"
+description = "Model Ladder — один запрос на слабой, средней и сильной модели: время, токены, стоимость"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
