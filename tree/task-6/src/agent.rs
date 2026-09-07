@@ -11,6 +11,7 @@ use crate::api::{
 };
 use crate::config::{Res, Settings};
 use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
+use crate::session::Session;
 
 /// Assistant turn plus the provider metadata the app already displays.
 #[derive(Clone, Debug)]
@@ -132,6 +133,15 @@ impl Agent {
 
     pub fn reset(&mut self) {
         self.history.clear();
+    }
+
+    /// Restore a saved chat: settings snapshot, message history, and the
+    /// context-ingestion toggle. Instruction files are re-read from disk.
+    pub fn resume(&mut self, session: &Session) {
+        self.settings = session.settings.clone();
+        self.settings.clamp();
+        self.history = session.history();
+        self.refresh_context();
     }
 
     pub fn context(&self) -> &ContextBundle {
@@ -264,6 +274,41 @@ mod tests {
         assert_eq!(agent.settings().temperature, Some(1.0));
         assert!(agent.history().is_empty());
         assert_eq!(agent.settings().model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn resume_restores_history_and_settings() {
+        let settings = Settings {
+            model: "glm-5".into(),
+            system_prompt: "be terse".into(),
+            context_enabled: false,
+            effort: Effort::High,
+            temperature: Some(0.3),
+            top_p: Some(0.5),
+            top_k: Some(20),
+            budget_tokens: Some(128),
+            ..Settings::default()
+        };
+        let mut session = Session::new(settings);
+        session.push_user("hello".into());
+        session.push_assistant("hi".into());
+        session.context_files = vec!["/tmp/AGENTS.md".into()];
+        let mut agent = Agent::dummy();
+        agent.settings_mut().temperature = Some(0.7);
+        agent.set_history(vec![ChatMessage::user("stale")]);
+        agent.resume(&session);
+        assert_eq!(agent.settings().model, "glm-5");
+        assert_eq!(agent.settings().system_prompt, "be terse");
+        assert!(!agent.settings().context_enabled);
+        assert_eq!(agent.settings().effort, Effort::High);
+        assert_eq!(agent.settings().temperature, Some(0.3));
+        assert_eq!(agent.settings().top_p, Some(0.5));
+        assert_eq!(agent.settings().top_k, Some(20));
+        assert_eq!(agent.settings().budget_tokens, Some(128));
+        assert_eq!(agent.history().len(), 2);
+        assert_eq!(agent.history()[0].content, "hello");
+        assert_eq!(agent.history()[1].content, "hi");
+        assert!(agent.context_files().is_empty());
     }
 
     #[test]
