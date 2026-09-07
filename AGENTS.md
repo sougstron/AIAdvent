@@ -50,17 +50,16 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is no longer this chat TUI.** `tree/task-5/` is
-*Model Ladder*, a Tauri desktop app that fires one prompt at three models of
-different classes at once (weak `qwen3.8-27b` via yolo, medium `grok-4.6` on
-xai, strong `anthropic/claude-opus-5` via openrouter), measures latency,
-tokens and cost, and has `hf:moonshotai/Kimi-K3` from synthetic grade the
-answers blind. It has its own `README.md` covering its build, its four key
-sources, and the traps found while building it — chief among them that xAI
-reports reasoning tokens *outside* `completion_tokens`, so taking that field
-at face value understates a reasoning model's cost and speed threefold.
-`tree/task-4/` is the previous state (*Temperature Lab*). Everything below in
-this file describes the older TUI that still lives in the repo root `src/`.
+**The active snapshot is `tree/task-6/`.** It is a working agent: a ratatui
+chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
+`Agent` entity (settings, history, AGENTS.md in the system message) rather
+than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
+rest of the catalog is selectable but refused at send time because those
+ids cost money. Its `README.md` covers the Agent shape, key resolution,
+runtime settings, and the live lever self-test (temperature confirmed;
+top_p flat; top_k unsupported). `tree/task-5/` is the previous state
+(*Model Ladder*). Everything below in this file describes the older TUI
+that still lives in the repo root `src/`.
 
 ## Layout
 
