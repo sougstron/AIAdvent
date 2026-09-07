@@ -51,10 +51,11 @@ pub const MAX_TOKENS_MAX: u32 = 131_072;
 ///
 /// `None` / `Medium` stay in the enum so older saved sessions still
 /// deserialize; [`Effort::wire`] maps them onto a legal value.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Effort {
     /// Saved-session / `/effort none` alias — cannot actually disable thinking.
     None,
+    #[default]
     Low,
     /// Saved-session / `/effort medium` alias — the API rejects `medium`.
     Medium,
@@ -170,6 +171,7 @@ const fn default_context_enabled() -> bool {
 /// Everything one turn of generation needs. Built once per app, mutated live
 /// by `/effort`, `/json`, `/settings`, and persisted per session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     #[serde(default = "default_model")]
     pub model: String,

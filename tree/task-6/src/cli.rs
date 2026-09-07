@@ -22,7 +22,9 @@ use crate::verify;
         ask                                   open the chat TUI\n  \
         ask \"what is the capital of France?\"   one-shot question\n  \
         ask --verify-stop                     prove the stop condition works\n  \
-        ask --sessions                        list saved chat sessions"
+        ask --sessions                        list saved chat sessions\n  \
+        ask --resume ID                       resume a saved session\n  \
+        ask --continue                        resume the most recent session"
 )]
 pub struct Cli {
     /// Question for a one-shot answer. With none, opens the chat TUI.
@@ -87,6 +89,14 @@ pub struct Cli {
     /// List saved chat sessions and exit.
     #[arg(long)]
     pub sessions: bool,
+
+    /// Resume a saved session by id (TUI, or one-shot if a question is given).
+    #[arg(long)]
+    pub resume: Option<String>,
+
+    /// Resume the most recently updated session.
+    #[arg(long = "continue")]
+    pub continue_last: bool,
 
     /// Print the full API response instead of just the answer.
     #[arg(long)]
@@ -177,16 +187,36 @@ pub fn run() -> Res<()> {
         return Ok(());
     }
 
+    let dir = session::sessions_dir();
+    let loaded = if let Some(id) = cli.resume.as_deref() {
+        Some(session::load_session(&dir, id)?)
+    } else if cli.continue_last {
+        Some(session::continue_last(&dir)?)
+    } else {
+        None
+    };
+
     let question = read_question(&cli.question)?;
     if question.is_empty() {
-        return crate::tui::run(settings);
+        return crate::tui::run(settings, loaded);
     }
 
-    one_shot(&cli, settings, &question)
+    one_shot(&cli, settings, &question, loaded)
 }
 
-fn one_shot(cli: &Cli, settings: Settings, question: &str) -> Res<()> {
+fn one_shot(
+    cli: &Cli,
+    settings: Settings,
+    question: &str,
+    loaded: Option<session::Session>,
+) -> Res<()> {
     let mut agent = Agent::new(settings.clone())?;
+    let mut sess = if let Some(s) = loaded {
+        agent.resume(&s);
+        s
+    } else {
+        session::Session::new(agent.settings().clone())
+    };
     let reply = agent.ask(question)?;
 
     if cli.raw {
@@ -242,6 +272,17 @@ fn one_shot(cli: &Cli, settings: Settings, question: &str) -> Res<()> {
     if let Some(r) = reply.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
         eprintln!("« reasoning: {} chars", r.trim().chars().count());
     }
+    sess.capture_from(
+        agent.settings(),
+        agent
+            .context_files()
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned()),
+        agent.history(),
+    );
+    if let Err(e) = sess.save(&session::sessions_dir()) {
+        eprintln!("warning: could not save session: {e}");
+    }
     Ok(())
 }
 
@@ -253,7 +294,7 @@ fn print_sessions() -> Res<()> {
         return Ok(());
     }
     for s in list {
-        println!("{:<20} {:<32} {} msgs", s.id, s.title, s.message_count);
+        println!("{}", s.line());
     }
     Ok(())
 }

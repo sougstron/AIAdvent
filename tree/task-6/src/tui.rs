@@ -56,8 +56,8 @@ const SETTINGS_ROWS: &[&str] = &[
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
 const COMMANDS: &[&str] = &[
-    "context", "effort", "help", "json", "new", "personas", "quit", "sessions", "settings", "stop",
-    "temp", "verify",
+    "context", "effort", "help", "json", "new", "personas", "quit", "rename", "sessions", "settings",
+    "stop", "temp", "verify",
 ];
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
@@ -82,11 +82,17 @@ fn default_personas() -> Vec<String> {
     DEFAULT_PERSONAS.iter().map(|s| s.to_string()).collect()
 }
 
-pub fn run(settings: Settings) -> Res<()> {
+pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("interactive chat requires a terminal".into());
     }
-    let agent = Agent::new(settings.clone())?;
+    let mut agent = Agent::new(settings.clone())?;
+    let settings = if let Some(ref session) = loaded {
+        agent.resume(session);
+        session.settings.clone()
+    } else {
+        settings
+    };
     let mut terminal = ratatui::try_init().map_err(|e| {
         let _ = ratatui::try_restore();
         format!("cannot start TUI: {e}")
@@ -102,7 +108,7 @@ pub fn run(settings: Settings) -> Res<()> {
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
-    let result = App::new(agent, settings).event_loop(&mut terminal);
+    let result = App::new(agent, settings, loaded).event_loop(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         PopKeyboardEnhancementFlags,
@@ -160,18 +166,30 @@ struct App {
 }
 
 impl App {
-    fn new(agent: Agent, settings: Settings) -> App {
+    fn new(agent: Agent, settings: Settings, loaded: Option<Session>) -> App {
+        let (session, entries, status) = match loaded {
+            Some(s) => {
+                let status = format!("Resumed '{}'", s.title);
+                let entries = entries_from_session(&s);
+                (s, entries, status)
+            }
+            None => (
+                Session::new(settings.clone()),
+                Vec::new(),
+                "Type a message and press Enter · /help for commands".into(),
+            ),
+        };
         App {
             agent,
-            session: Session::new(settings.clone()),
+            session,
             settings,
-            sessions_dir: session::sessions_dir(),
-            entries: Vec::new(),
+            sessions_dir: crate::session::sessions_dir(),
+            entries,
             input: String::new(),
             cursor: 0,
             input_scroll: 0,
             focus: Focus::Input,
-            status: "Type a message and press Enter · /help for commands".into(),
+            status,
             scroll: 0,
             follow: true,
             settings_selected: 0,
@@ -568,8 +586,13 @@ impl App {
         }
         let mut s = self.session.clone();
         s.settings = self.settings.clone();
+        s.context_files = self
+            .agent
+            .context_files()
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
         if let Err(e) = s.save(&self.sessions_dir) {
-            // Best-effort: a save failure should not lose the in-memory chat.
             eprintln!("warning: could not save session: {e}");
         }
     }
@@ -583,23 +606,8 @@ impl App {
             Ok(s) => {
                 self.save_session();
                 self.settings = s.settings.clone();
-                self.agent.set_history(s.history());
-                *self.agent.settings_mut() = s.settings.clone();
-                self.agent.reload_context();
-                self.entries = s
-                    .messages
-                    .iter()
-                    .map(|m| {
-                        if m.role == "user" {
-                            Entry::User(m.content.clone())
-                        } else {
-                            Entry::Assistant {
-                                text: m.content.clone(),
-                                note: None,
-                            }
-                        }
-                    })
-                    .collect();
+                self.agent.resume(&s);
+                self.entries = entries_from_session(&s);
                 self.status = format!("Loaded '{}'", s.title);
                 self.session = s;
                 self.scroll_to_bottom(terminal);
@@ -614,6 +622,7 @@ impl App {
         let rest = rest.trim();
         match name.to_ascii_lowercase().as_str() {
             "new" => self.new_chat(),
+            "rename" => self.cmd_rename(rest),
             "sessions" => {
                 self.save_session();
                 self.sessions_list = session::list_sessions(&self.sessions_dir);
@@ -637,6 +646,23 @@ impl App {
             other => self
                 .entries
                 .push(Entry::Info(format!("unknown command /{other} — try /help"))),
+        }
+    }
+
+    fn cmd_rename(&mut self, rest: &str) {
+        match session::rename_session(&self.sessions_dir, &self.session.id, rest) {
+            Ok(s) => {
+                self.session.title = s.title;
+                self.session.updated_at = s.updated_at;
+                self.status = format!("renamed to '{}'", self.session.title);
+            }
+            Err(_) => match self.session.rename(rest) {
+                Ok(()) => {
+                    self.save_session();
+                    self.status = format!("renamed to '{}'", self.session.title);
+                }
+                Err(e) => self.status = format!("rename failed: {e} (usage: /rename <title>)"),
+            },
         }
     }
 
@@ -1174,7 +1200,7 @@ impl App {
                 *text = capped.clone();
                 *n = Some(note);
             }
-            self.session.push_assistant(capped);
+            self.session.push_assistant_interrupted(capped);
             self.status = "generation stopped by Esc — partial reply kept".into();
         }
         self.save_session();
@@ -1432,17 +1458,14 @@ impl App {
     }
 
     fn draw_sessions_overlay(&self, f: &mut Frame, area: Rect) {
-        let popup = centered(area, 70, 12.min(area.height.saturating_sub(2)).max(4));
+        let popup = centered(area, 78, 12.min(area.height.saturating_sub(2)).max(4));
         let items: Vec<ListItem> = if self.sessions_list.is_empty() {
             vec![ListItem::new("(no saved sessions yet)")]
         } else {
             self.sessions_list
                 .iter()
                 .enumerate()
-                .map(|(i, s)| {
-                    let marker = if i == self.sessions_selected { "▸ " } else { "  " };
-                    ListItem::new(format!("{marker}{:<32} {} msgs", s.title, s.message_count))
-                })
+                .map(|(i, s)| ListItem::new(s.panel_line(i == self.sessions_selected)))
                 .collect()
         };
         let mut state = ListState::default();
@@ -1523,6 +1546,7 @@ impl App {
 
 const HELP: &str = "\
 /new                      start a new chat session
+/rename <title>           rename the current chat session
 /sessions                 list and switch between saved sessions
 /effort [none|low|medium|high]   get or set reasoning effort
 /json on|off              toggle structured JSON output
@@ -1541,6 +1565,20 @@ const HELP: &str = "\
 /quit                     exit
 Esc while generating      stop the current generation (partial reply is kept)
 Ctrl-Q                    quit, even mid-generation";
+
+fn entries_from_session(s: &Session) -> Vec<Entry> {
+    s.messages
+        .iter()
+        .filter_map(|m| match m.role.as_str() {
+            "user" => Some(Entry::User(m.content.clone())),
+            "assistant" => Some(Entry::Assistant {
+                text: m.content.clone(),
+                note: m.interrupted.then(|| "interrupted".to_string()),
+            }),
+            _ => None,
+        })
+        .collect()
+}
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(2)).max(10);
@@ -1738,7 +1776,7 @@ mod tests {
 
     #[test]
     fn sampling_rows_render_and_cycle() {
-        let mut app = App::new(Agent::dummy(), config::Settings::default());
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         let temp_row = SETTINGS_ROWS.iter().position(|r| *r == "temperature").unwrap();
         let top_p_row = SETTINGS_ROWS.iter().position(|r| *r == "top_p").unwrap();
         let top_k_row = SETTINGS_ROWS.iter().position(|r| *r == "top_k").unwrap();
@@ -1754,7 +1792,7 @@ mod tests {
 
     #[test]
     fn context_command_toggles_injection() {
-        let mut app = App::new(Agent::dummy(), config::Settings::default());
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         assert!(app.settings.context_enabled);
         app.cmd_context("off");
         assert!(!app.settings.context_enabled);
