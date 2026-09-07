@@ -44,6 +44,7 @@ const TEMP_CHOICES: &[Option<f32>] = &[
 const TOP_P_CHOICES: &[Option<f32>] = &[None, Some(0.5), Some(0.8), Some(0.95), Some(1.0)];
 const TOP_K_CHOICES: &[Option<i32>] = &[None, Some(20), Some(50), Some(100), Some(-1)];
 const SETTINGS_ROWS: &[&str] = &[
+    "model",
     "effort",
     "json mode",
     "max_chars",
@@ -52,12 +53,13 @@ const SETTINGS_ROWS: &[&str] = &[
     "temperature",
     "top_p",
     "top_k",
+    "system_prompt",
 ];
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
 const COMMANDS: &[&str] = &[
-    "context", "effort", "help", "json", "new", "personas", "quit", "rename", "sessions", "settings",
-    "stop", "temp", "verify",
+    "context", "effort", "help", "json", "max-tokens", "model", "new", "personas", "quit", "rename",
+    "sessions", "settings", "stop", "system", "temp", "top-k", "top-p", "verify",
 ];
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
@@ -130,6 +132,7 @@ enum Focus {
     Input,
     Settings,
     Sessions,
+    Model,
 }
 
 struct App {
@@ -152,6 +155,10 @@ struct App {
     /// back down to the last line.
     follow: bool,
     settings_selected: usize,
+    /// Cursor inside the model-picker overlay (independent of `settings_selected`).
+    model_selected: usize,
+    /// When true, the input box is editing `settings.system_prompt` instead of a chat message.
+    editing_system_prompt: bool,
     sessions_list: Vec<SessionSummary>,
     sessions_selected: usize,
     /// Index into `sessions_list` awaiting a y/n confirmation before delete.
@@ -193,6 +200,8 @@ impl App {
             scroll: 0,
             follow: true,
             settings_selected: 0,
+            model_selected: 0,
+            editing_system_prompt: false,
             sessions_list: Vec::new(),
             sessions_selected: 0,
             sessions_pending_delete: None,
@@ -239,6 +248,7 @@ impl App {
             Focus::Input => self.handle_input_key(key, terminal),
             Focus::Settings => self.handle_settings_key(key.code),
             Focus::Sessions => self.handle_sessions_key(key.code, terminal),
+            Focus::Model => self.handle_model_key(key.code),
         }
     }
 
@@ -295,6 +305,13 @@ impl App {
 
         let width = terminal.size().map(|s| s.width).unwrap_or(80);
         match key.code {
+            KeyCode::Esc if self.editing_system_prompt => {
+                self.editing_system_prompt = false;
+                self.input.clear();
+                self.cursor = 0;
+                self.input_scroll = 0;
+                self.status = "system prompt edit cancelled".into();
+            }
             KeyCode::Esc => self.quit = true,
             KeyCode::Tab => {
                 self.focus = Focus::Settings;
@@ -304,6 +321,16 @@ impl App {
                 self.insert_char('\n');
                 self.cmd_selected = 0;
                 self.sync_input_scroll(width);
+            }
+            KeyCode::Enter if self.editing_system_prompt => {
+                self.settings.system_prompt = std::mem::take(&mut self.input);
+                self.cursor = 0;
+                self.input_scroll = 0;
+                self.editing_system_prompt = false;
+                self.status = format!(
+                    "system prompt updated ({} chars)",
+                    self.settings.system_prompt.chars().count()
+                );
             }
             KeyCode::Enter if !self.input.trim().is_empty() => {
                 let line = std::mem::take(&mut self.input);
@@ -457,7 +484,8 @@ impl App {
     /// still composing the command name (no space yet), not dismissed with
     /// Left, and at least one command matches the typed prefix.
     fn command_popup_active(&self) -> bool {
-        !self.cmd_popup_dismissed
+        !self.editing_system_prompt
+            && !self.cmd_popup_dismissed
             && self.input.starts_with('/')
             && !self.input[1..].contains(char::is_whitespace)
             && !self.filtered_commands().is_empty()
@@ -492,6 +520,7 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, code: KeyCode) {
+        let row = SETTINGS_ROWS.get(self.settings_selected).copied().unwrap_or("");
         match code {
             KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Input,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -502,6 +531,10 @@ impl App {
                 self.settings_selected = (self.settings_selected + 1) % SETTINGS_ROWS.len()
             }
             KeyCode::Left | KeyCode::Char('h') => self.adjust_setting(-1),
+            KeyCode::Enter | KeyCode::Char(' ') if row == "model" => self.open_model_picker(),
+            KeyCode::Enter | KeyCode::Char(' ') if row == "system_prompt" => {
+                self.open_system_prompt_editor()
+            }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') | KeyCode::Enter => {
                 self.adjust_setting(1)
             }
@@ -634,8 +667,13 @@ impl App {
                 self.settings_selected = 0;
             }
             "effort" => self.cmd_effort(rest),
+            "model" => self.cmd_model(rest),
+            "system" => self.cmd_system(rest),
             "context" => self.cmd_context(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
+            "top-p" | "top_p" => self.cmd_top_p(rest),
+            "top-k" | "top_k" => self.cmd_top_k(rest),
+            "max-tokens" | "max_tokens" => self.cmd_max_tokens(rest),
             "json" => self.cmd_json(rest, terminal),
             "stop" => self.cmd_stop(rest),
             "verify" => self.cmd_verify(rest, terminal),
@@ -664,6 +702,200 @@ impl App {
                 Err(e) => self.status = format!("rename failed: {e} (usage: /rename <title>)"),
             },
         }
+    }
+
+    fn cmd_model(&mut self, rest: &str) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.open_model_picker();
+            return;
+        }
+        match config::MODEL_CATALOG.iter().find(|m| m.eq_ignore_ascii_case(rest)) {
+            Some(id) => {
+                self.settings.model = (*id).to_string();
+                self.status = if *id == config::DEFAULT_MODEL {
+                    format!("model set to {id}")
+                } else {
+                    format!(
+                        "model set to {id} — only {} is enabled for live calls; this one is refused at send time",
+                        config::DEFAULT_MODEL
+                    )
+                };
+            }
+            None => self.entries.push(Entry::Info(format!(
+                "unknown model `{rest}`; catalog: {}",
+                config::MODEL_CATALOG.join(", ")
+            ))),
+        }
+    }
+
+    fn cmd_system(&mut self, rest: &str) {
+        match rest.trim() {
+            "" => {
+                self.entries.push(Entry::Info(format!(
+                    "current system prompt:\n{}",
+                    self.settings.system_prompt
+                )));
+                self.status = format!(
+                    "system_prompt: {} chars (usage: /system <text> | /system edit | /system clear)",
+                    self.settings.system_prompt.chars().count()
+                );
+            }
+            "edit" => self.open_system_prompt_editor(),
+            "clear" => {
+                self.settings.system_prompt.clear();
+                self.status = "system prompt cleared".into();
+            }
+            text => {
+                self.settings.system_prompt = config::unescape(text);
+                self.status = format!(
+                    "system prompt set ({} chars)",
+                    self.settings.system_prompt.chars().count()
+                );
+            }
+        }
+    }
+
+    fn cmd_top_p(&mut self, rest: &str) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.status = format!(
+                "top_p={} (usage: /top-p off | /top-p {}-{})",
+                self.settings
+                    .top_p
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "provider default".into()),
+                config::TOP_P_MIN,
+                config::TOP_P_MAX
+            );
+            return;
+        }
+        if rest.eq_ignore_ascii_case("off") {
+            self.settings.top_p = None;
+            self.status = "top_p off (provider default)".into();
+            return;
+        }
+        match rest
+            .parse::<f32>()
+            .map_err(|_| format!("not a number: {rest}"))
+            .and_then(config::parse_top_p)
+        {
+            Ok(p) => {
+                self.settings.top_p = Some(p);
+                self.status = format!("top_p set to {p}");
+            }
+            Err(e) => self.entries.push(Entry::Info(e)),
+        }
+    }
+
+    fn cmd_top_k(&mut self, rest: &str) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.status = format!(
+                "top_k={} (usage: /top-k off | /top-k full | /top-k <positive int>)",
+                self.settings
+                    .top_k
+                    .map(config::render_top_k)
+                    .unwrap_or_else(|| "provider default".into())
+            );
+            return;
+        }
+        if rest.eq_ignore_ascii_case("off") {
+            self.settings.top_k = None;
+            self.status = "top_k off (provider default)".into();
+            return;
+        }
+        if rest.eq_ignore_ascii_case("full") {
+            self.settings.top_k = Some(-1);
+            self.status = "top_k set to full".into();
+            return;
+        }
+        match rest.parse::<i32>() {
+            Ok(k) if k > 0 => {
+                self.settings.top_k = Some(k);
+                self.status = format!("top_k set to {k}");
+            }
+            Ok(k) => self.status = format!("top_k must be -1 (off) or a positive count (got {k})"),
+            Err(_) => self.status = format!("not a number: {rest}"),
+        }
+    }
+
+    fn cmd_max_tokens(&mut self, rest: &str) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.status = format!(
+                "max_tokens={} (usage: /max-tokens off | /max-tokens {}-{})",
+                self.settings
+                    .budget_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "off".into()),
+                config::MAX_TOKENS_MIN,
+                config::MAX_TOKENS_MAX
+            );
+            return;
+        }
+        if rest.eq_ignore_ascii_case("off") {
+            self.settings.budget_tokens = None;
+            self.status = "max_tokens off".into();
+            return;
+        }
+        match rest
+            .parse::<u32>()
+            .map_err(|_| format!("not a number: {rest}"))
+            .and_then(config::parse_max_tokens)
+        {
+            Ok(n) => {
+                self.settings.budget_tokens = Some(n);
+                self.status = format!("max_tokens set to {n}");
+            }
+            Err(e) => self.entries.push(Entry::Info(e)),
+        }
+    }
+
+    fn open_model_picker(&mut self) {
+        self.model_selected = config::MODEL_CATALOG
+            .iter()
+            .position(|m| *m == self.settings.model)
+            .unwrap_or(0);
+        self.focus = Focus::Model;
+    }
+
+    fn handle_model_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.focus = Focus::Settings,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.model_selected = (self.model_selected + config::MODEL_CATALOG.len() - 1)
+                    % config::MODEL_CATALOG.len()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.model_selected = (self.model_selected + 1) % config::MODEL_CATALOG.len()
+            }
+            KeyCode::Enter => self.apply_model_choice(),
+            _ => {}
+        }
+    }
+
+    fn apply_model_choice(&mut self) {
+        let id = config::MODEL_CATALOG[self.model_selected];
+        self.settings.model = id.to_string();
+        self.status = if id == config::DEFAULT_MODEL {
+            format!("model set to {id}")
+        } else {
+            format!(
+                "model set to {id} — only {} is enabled for live calls; this one is refused at send time",
+                config::DEFAULT_MODEL
+            )
+        };
+        self.focus = Focus::Settings;
+    }
+
+    fn open_system_prompt_editor(&mut self) {
+        self.input = self.settings.system_prompt.clone();
+        self.cursor = self.input.chars().count();
+        self.input_scroll = 0;
+        self.editing_system_prompt = true;
+        self.focus = Focus::Input;
+        self.status = "editing system prompt — Enter save · Shift+Enter newline · Esc cancel".into();
     }
 
     fn cmd_effort(&mut self, rest: &str) {
@@ -1020,17 +1252,21 @@ impl App {
     }
 
     fn adjust_setting(&mut self, delta: i32) {
-        match self.settings_selected {
-            0 => self.settings.effort = self.settings.effort.cycle(delta),
-            1 => self.settings.json_mode.enabled = !self.settings.json_mode.enabled,
-            2 => {
+        match SETTINGS_ROWS.get(self.settings_selected).copied().unwrap_or("") {
+            "model" => {
+                self.settings.model =
+                    cycle_choice(config::MODEL_CATALOG, self.settings.model.as_str(), delta).to_string();
+            }
+            "effort" => self.settings.effort = self.settings.effort.cycle(delta),
+            "json mode" => self.settings.json_mode.enabled = !self.settings.json_mode.enabled,
+            "max_chars" => {
                 self.settings.max_chars = cycle_choice(MAX_CHARS_CHOICES, self.settings.max_chars, delta)
             }
-            3 => {
+            "budget_tokens" => {
                 self.settings.budget_tokens =
                     cycle_choice(BUDGET_CHOICES, self.settings.budget_tokens, delta)
             }
-            4 => {
+            "stop" => {
                 let current = STOP_PRESETS
                     .iter()
                     .position(|p| p.iter().map(|s| s.to_string()).collect::<Vec<_>>() == self.settings.stop)
@@ -1039,9 +1275,12 @@ impl App {
                 let next = STOP_PRESETS[(current + delta).rem_euclid(n) as usize];
                 self.settings.stop = next.iter().map(|s| s.to_string()).collect();
             }
-            5 => self.settings.temperature = cycle_float(TEMP_CHOICES, self.settings.temperature, delta),
-            6 => self.settings.top_p = cycle_float(TOP_P_CHOICES, self.settings.top_p, delta),
-            7 => self.settings.top_k = cycle_choice(TOP_K_CHOICES, self.settings.top_k, delta),
+            "temperature" => {
+                self.settings.temperature = cycle_float(TEMP_CHOICES, self.settings.temperature, delta)
+            }
+            "top_p" => self.settings.top_p = cycle_float(TOP_P_CHOICES, self.settings.top_p, delta),
+            "top_k" => self.settings.top_k = cycle_choice(TOP_K_CHOICES, self.settings.top_k, delta),
+            "system_prompt" => {}
             _ => {}
         }
     }
@@ -1286,6 +1525,8 @@ impl App {
             self.draw_settings_overlay(f, body);
         } else if self.focus == Focus::Sessions {
             self.draw_sessions_overlay(f, body);
+        } else if self.focus == Focus::Model {
+            self.draw_model_overlay(f, body);
         } else if self.focus == Focus::Input && self.command_popup_active() {
             self.draw_command_popup(f, body);
         }
@@ -1312,10 +1553,15 @@ impl App {
             .take(view)
             .map(|(_, text)| Line::raw(text.clone()))
             .collect();
+        let title = if self.editing_system_prompt {
+            " system prompt — Enter save · Shift+Enter newline · Esc cancel "
+        } else {
+            " message — /help for commands "
+        };
         f.render_widget(
             Paragraph::new(visible)
                 .style(input_style)
-                .block(Block::bordered().title(" message — /help for commands ")),
+                .block(Block::bordered().title(title)),
             area,
         );
         if self.focus == Focus::Input {
@@ -1328,6 +1574,23 @@ impl App {
         }
     }
 
+    fn context_indicator(&self) -> String {
+        let bundle = self.agent.context();
+        if !bundle.enabled {
+            return "ctx:off".into();
+        }
+        if bundle.files.is_empty() {
+            return "ctx:on (no files)".into();
+        }
+        let chars: usize = bundle.files.iter().map(|f| f.chars).sum();
+        format!(
+            "ctx:on {} file{} {} chars",
+            bundle.files.len(),
+            if bundle.files.len() == 1 { "" } else { "s" },
+            chars
+        )
+    }
+
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1337,6 +1600,8 @@ impl App {
                 ),
                 Span::raw("  "),
                 Span::raw(&self.session.title),
+                Span::raw("   "),
+                Span::styled(self.context_indicator(), Style::default().fg(Color::DarkGray)),
                 Span::raw("   "),
                 Span::styled(self.settings.summary(), Style::default().fg(Color::DarkGray)),
             ]))
@@ -1436,25 +1701,78 @@ impl App {
     }
 
     fn setting_value(&self, row: usize) -> String {
-        match row {
-            0 => self.settings.effort.to_string(),
-            1 => if self.settings.json_mode.enabled { "on" } else { "off" }.into(),
-            2 => self.settings.max_chars.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
-            3 => self.settings.budget_tokens.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
-            4 => config::render_stops(&self.settings.stop),
-            5 => self.settings.temperature.map(|t| t.to_string()).unwrap_or_else(|| "off".into()),
-            6 => self
+        match SETTINGS_ROWS.get(row).copied().unwrap_or("") {
+            "model" => format!(
+                "{}  ({} in catalog — Enter opens picker)",
+                self.settings.model,
+                config::MODEL_CATALOG.len()
+            ),
+            "effort" => self.settings.effort.to_string(),
+            "json mode" => if self.settings.json_mode.enabled { "on" } else { "off" }.into(),
+            "max_chars" => self.settings.max_chars.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
+            "budget_tokens" => {
+                self.settings.budget_tokens.map(|n| n.to_string()).unwrap_or_else(|| "off".into())
+            }
+            "stop" => config::render_stops(&self.settings.stop),
+            "temperature" => {
+                self.settings.temperature.map(|t| t.to_string()).unwrap_or_else(|| "off".into())
+            }
+            "top_p" => self
                 .settings
                 .top_p
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "provider default".into()),
-            7 => self
+            "top_k" => self
                 .settings
                 .top_k
                 .map(config::render_top_k)
                 .unwrap_or_else(|| "provider default".into()),
+            "system_prompt" => {
+                let text = &self.settings.system_prompt;
+                let preview: String = text.chars().take(40).collect();
+                let suffix = if text.chars().count() > 40 { "…" } else { "" };
+                format!("{preview}{suffix}  ({} chars, Enter to edit)", text.chars().count())
+            }
             _ => String::new(),
         }
+    }
+
+    fn draw_model_overlay(&self, f: &mut Frame, area: Rect) {
+        let popup = centered(
+            area,
+            64,
+            (config::MODEL_CATALOG.len() as u16 + 2)
+                .min(area.height.saturating_sub(2))
+                .max(4),
+        );
+        let items: Vec<ListItem> = config::MODEL_CATALOG
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let cursor = if i == self.model_selected { "▸ " } else { "  " };
+                let applied = *id == self.settings.model;
+                let mark = if applied { "● " } else { "  " };
+                let style = if applied {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(cursor),
+                    Span::styled(format!("{mark}{id}"), style),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.model_selected));
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_stateful_widget(
+            List::new(items).block(Block::bordered().title(
+                " model — ↑↓ select, Enter apply, Esc cancel (only glm-5.3-flash is live) ",
+            )),
+            popup,
+            &mut state,
+        );
     }
 
     fn draw_sessions_overlay(&self, f: &mut Frame, area: Rect) {
@@ -1549,12 +1867,17 @@ const HELP: &str = "\
 /rename <title>           rename the current chat session
 /sessions                 list and switch between saved sessions
 /effort [none|low|medium|high]   get or set reasoning effort
+/model [id]               get, set, or open the model picker (only glm-5.3-flash is live)
+/system [text|edit|clear] get, set, edit, or clear the system prompt
 /json on|off              toggle structured JSON output
 /json fields a,b,c        set a flat schema with these string fields
 /json schema <json>       set a full JSON Schema
 /json edit <instruction>  ask the model to rewrite the schema
 /json show                print the active schema
 /temp [off|0.0-2.0]       get or set sampling temperature (2.0 is the provider's max)
+/top-p [off|0.01-1.0]     get or set nucleus sampling
+/top-k [off|full|N]       get or set top-k cutoff
+/max-tokens [off|1-131072] get or set the answer token cap
 /stop add <seq>           add a stop sequence (max 4)
 /stop clear               clear stop sequences
 /verify [prompt]          prove the stop condition changes the output
@@ -1791,6 +2114,15 @@ mod tests {
     }
 
     #[test]
+    fn context_indicator_reports_off_and_empty() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_context("off");
+        assert_eq!(app.context_indicator(), "ctx:off");
+        app.cmd_context("on");
+        assert_eq!(app.context_indicator(), "ctx:on (no files)");
+    }
+
+    #[test]
     fn context_command_toggles_injection() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         assert!(app.settings.context_enabled);
@@ -1802,6 +2134,108 @@ mod tests {
         assert!(app.agent.context().enabled);
         app.cmd_context("reload");
         assert!(app.context_listing().contains("cwd="));
+    }
+
+    #[test]
+    fn model_row_cycles_the_catalog_both_ways() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        let model_row = SETTINGS_ROWS.iter().position(|r| *r == "model").unwrap();
+        app.settings_selected = model_row;
+        assert_eq!(app.settings.model, config::DEFAULT_MODEL);
+        app.adjust_setting(1);
+        assert_eq!(app.settings.model, config::MODEL_CATALOG[0]);
+        app.settings.model = config::DEFAULT_MODEL.to_string();
+        app.adjust_setting(-1);
+        assert_eq!(
+            app.settings.model,
+            config::MODEL_CATALOG[config::MODEL_CATALOG.len() - 2]
+        );
+    }
+
+    #[test]
+    fn cmd_model_sets_catalog_id_and_rejects_unknown() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_model("glm-4.6");
+        assert_eq!(app.settings.model, "glm-4.6");
+        app.cmd_model("nope");
+        assert_eq!(app.settings.model, "glm-4.6");
+        let Some(Entry::Info(info)) = app.entries.last() else {
+            panic!("expected Info entry after unknown model");
+        };
+        assert!(info.contains("unknown model `nope`"));
+        assert!(info.contains("glm-5.3-flash"));
+    }
+
+    #[test]
+    fn open_model_picker_seeds_cursor_at_current_model() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.settings.model = "glm-4.6".into();
+        app.open_model_picker();
+        assert!(matches!(app.focus, Focus::Model));
+        assert_eq!(
+            app.model_selected,
+            config::MODEL_CATALOG.iter().position(|m| *m == "glm-4.6").unwrap()
+        );
+    }
+
+    #[test]
+    fn cmd_system_edit_show_and_set() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        let original = app.settings.system_prompt.clone();
+        app.cmd_system("");
+        assert_eq!(app.settings.system_prompt, original);
+        app.cmd_system("edit");
+        assert!(app.editing_system_prompt);
+        assert_eq!(app.input, original);
+        assert!(matches!(app.focus, Focus::Input));
+        app.cmd_system("new text");
+        assert_eq!(app.settings.system_prompt, "new text");
+    }
+
+    #[test]
+    fn cmd_top_p_empty_off_set_and_reject() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_top_p("");
+        assert!(app.settings.top_p.is_none());
+        assert!(app.status.contains("usage: /top-p"));
+        app.cmd_top_p("0.8");
+        assert_eq!(app.settings.top_p, Some(0.8));
+        app.cmd_top_p("1.5");
+        assert_eq!(app.settings.top_p, Some(0.8));
+        app.cmd_top_p("off");
+        assert!(app.settings.top_p.is_none());
+    }
+
+    #[test]
+    fn cmd_top_k_empty_off_full_set_and_reject() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_top_k("");
+        assert!(app.settings.top_k.is_none());
+        assert!(app.status.contains("usage: /top-k"));
+        app.cmd_top_k("full");
+        assert_eq!(app.settings.top_k, Some(-1));
+        app.cmd_top_k("40");
+        assert_eq!(app.settings.top_k, Some(40));
+        app.cmd_top_k("0");
+        assert_eq!(app.settings.top_k, Some(40));
+        app.cmd_top_k("nope");
+        assert_eq!(app.settings.top_k, Some(40));
+        app.cmd_top_k("off");
+        assert!(app.settings.top_k.is_none());
+    }
+
+    #[test]
+    fn cmd_max_tokens_empty_off_set_and_reject() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_max_tokens("");
+        assert!(app.settings.budget_tokens.is_none());
+        assert!(app.status.contains("usage: /max-tokens"));
+        app.cmd_max_tokens("256");
+        assert_eq!(app.settings.budget_tokens, Some(256));
+        app.cmd_max_tokens("0");
+        assert_eq!(app.settings.budget_tokens, Some(256));
+        app.cmd_max_tokens("off");
+        assert!(app.settings.budget_tokens.is_none());
     }
 
     #[test]
