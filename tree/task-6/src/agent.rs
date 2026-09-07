@@ -1,7 +1,8 @@
 //! The agent is the conversation entity: it owns settings, the system prompt,
-//! message history, and (later) injected context files. CLI and TUI talk to
-//! this type, not to HTTP.
+//! message history, and injected AGENTS.md context. CLI and TUI talk to this
+//! type, not to HTTP.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use crate::api::{
     self, ChatMessage, ChatStream, Endpoint, Outcome, Usage,
 };
 use crate::config::{Res, Settings};
+use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
 
 /// Assistant turn plus the provider metadata the app already displays.
 #[derive(Clone, Debug)]
@@ -53,41 +55,63 @@ pub struct Agent {
     endpoint: Endpoint,
     settings: Settings,
     history: Vec<ChatMessage>,
-    context_files: Vec<String>,
+    cwd: PathBuf,
+    home: PathBuf,
+    context: ContextBundle,
 }
 
 impl Agent {
     pub fn new(settings: Settings) -> Res<Agent> {
         let mut settings = settings;
         settings.clamp();
-        Ok(Agent {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let mut agent = Agent {
             endpoint: Endpoint::resolve()?,
             settings,
             history: Vec::new(),
-            context_files: Vec::new(),
-        })
+            cwd,
+            home,
+            context: ContextBundle::empty(PathBuf::from(".")),
+        };
+        agent.refresh_context();
+        Ok(agent)
     }
 
     #[cfg(test)]
     pub fn dummy() -> Agent {
-        Agent {
-            endpoint: Endpoint::dummy(),
-            settings: Settings::default(),
-            history: Vec::new(),
-            context_files: Vec::new(),
-        }
+        Agent::dummy_at(
+            PathBuf::from("/nonexistent-ask-cwd"),
+            PathBuf::from("/nonexistent-ask-home"),
+            Settings::default(),
+        )
     }
 
     #[cfg(test)]
     pub fn dummy_with(settings: Settings) -> Agent {
+        Agent::dummy_at(
+            PathBuf::from("/nonexistent-ask-cwd"),
+            PathBuf::from("/nonexistent-ask-home"),
+            settings,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn dummy_at(cwd: PathBuf, home: PathBuf, settings: Settings) -> Agent {
         let mut settings = settings;
         settings.clamp();
-        Agent {
+        let mut agent = Agent {
             endpoint: Endpoint::dummy(),
             settings,
             history: Vec::new(),
-            context_files: Vec::new(),
-        }
+            cwd,
+            home,
+            context: ContextBundle::empty(PathBuf::from(".")),
+        };
+        agent.refresh_context();
+        agent
     }
 
     pub fn settings(&self) -> &Settings {
@@ -108,11 +132,44 @@ impl Agent {
 
     pub fn reset(&mut self) {
         self.history.clear();
-        self.context_files.clear();
     }
 
-    pub fn context_files(&self) -> &[String] {
-        &self.context_files
+    pub fn context(&self) -> &ContextBundle {
+        &self.context
+    }
+
+    pub fn context_files(&self) -> &[LoadedFile] {
+        &self.context.files
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    fn refresh_context(&mut self) {
+        self.context = if self.settings.context_enabled {
+            ContextBundle::load(&self.cwd, &self.home, MAX_FILE_CHARS)
+        } else {
+            ContextBundle::empty(self.cwd.clone())
+        };
+    }
+
+    /// Re-read global + local instruction files from disk.
+    pub fn reload_context(&mut self) -> &ContextBundle {
+        self.refresh_context();
+        &self.context
+    }
+
+    /// Working-directory change recomputes the local walk.
+    pub fn set_cwd(&mut self, cwd: impl AsRef<Path>) {
+        self.cwd = cwd.as_ref().to_path_buf();
+        self.refresh_context();
+    }
+
+    /// Toggle recomputes (or drops) the loaded files.
+    pub fn set_context_enabled(&mut self, enabled: bool) {
+        self.settings.context_enabled = enabled;
+        self.refresh_context();
     }
 
     /// One-shot turn: append the user message, call the provider, append the
@@ -138,16 +195,10 @@ impl Agent {
         Ok(Reply::from_outcome(outcome, self.settings.max_chars))
     }
 
-    fn system_for_request(&self) -> String {
-        let mut system = self.settings.system_prompt.clone();
-        for path in self.context_files() {
-            if system.is_empty() {
-                system = format!("Context file: {path}");
-            } else {
-                system = format!("{system}\n\nContext file: {path}");
-            }
-        }
-        system
+    /// System prompt + AGENTS.md files. Sent as `role: system` (see
+    /// `context.rs`), never pushed onto `history`.
+    pub(crate) fn system_for_request(&self) -> String {
+        self.context.assemble(&self.settings.system_prompt)
     }
 
     pub fn complete_outcome(&self, history: &[ChatMessage]) -> Res<Outcome> {
@@ -279,5 +330,75 @@ mod tests {
         assert!(reply.stopped_by_sequence());
         assert_eq!(reply.usage.total_tokens, 3);
         assert!(reply.raw.is_null());
+    }
+
+    fn write_tree(root: &std::path::Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ask-agent-ctx-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn system_prompt_contains_global_and_local_exactly_once() {
+        let home = scratch("home");
+        write_tree(&home, ".pi/agent/AGENTS.md", "AGENT_GLOBAL");
+        let cwd = scratch("cwd");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_tree(&cwd, "AGENTS.md", "AGENT_LOCAL");
+        let agent = Agent::dummy_at(cwd.clone(), home.clone(), Settings::default());
+        assert_eq!(agent.cwd(), cwd.as_path());
+        assert_eq!(agent.context().cwd, cwd);
+        assert!(agent.context().enabled);
+        let system = agent.system_for_request();
+        assert_eq!(system.matches("AGENT_GLOBAL").count(), 1);
+        assert_eq!(system.matches("AGENT_LOCAL").count(), 1);
+        assert_eq!(agent.context_files().len(), 2);
+        assert!(agent.history().is_empty());
+        let again = agent.system_for_request();
+        assert_eq!(again.matches("AGENT_GLOBAL").count(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn toggle_and_cwd_recompute_context() {
+        let home = scratch("tog-home");
+        write_tree(&home, ".pi/agent/AGENTS.md", "G");
+        let a = scratch("tog-a");
+        std::fs::create_dir_all(a.join(".git")).unwrap();
+        write_tree(&a, "AGENTS.md", "LOCAL_A");
+        let b = scratch("tog-b");
+        std::fs::create_dir_all(b.join(".git")).unwrap();
+        write_tree(&b, "AGENTS.md", "LOCAL_B");
+        let mut agent = Agent::dummy_at(a.clone(), home.clone(), Settings::default());
+        assert!(agent.system_for_request().contains("LOCAL_A"));
+        agent.set_cwd(&b);
+        let system = agent.system_for_request();
+        assert!(system.contains("LOCAL_B"));
+        assert!(!system.contains("LOCAL_A"));
+        agent.set_context_enabled(false);
+        assert!(!agent.settings().context_enabled);
+        assert!(agent.context_files().is_empty());
+        assert!(!agent.system_for_request().contains("LOCAL_B"));
+        agent.set_context_enabled(true);
+        assert!(agent.system_for_request().contains("LOCAL_B"));
+        write_tree(&b, "AGENTS.md", "LOCAL_B_RELOADED");
+        agent.reload_context();
+        assert!(agent.system_for_request().contains("LOCAL_B_RELOADED"));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 }

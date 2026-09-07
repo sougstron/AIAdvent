@@ -163,6 +163,10 @@ fn default_system_prompt() -> String {
     DEFAULT_SYSTEM_PROMPT.to_string()
 }
 
+const fn default_context_enabled() -> bool {
+    true
+}
+
 /// Everything one turn of generation needs. Built once per app, mutated live
 /// by `/effort`, `/json`, `/settings`, and persisted per session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +175,10 @@ pub struct Settings {
     pub model: String,
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
+    /// When true, `Agent` injects discovered AGENTS.md / CLAUDE.md files
+    /// into the system message. Toggled at runtime via `set_context_enabled`.
+    #[serde(default = "default_context_enabled")]
+    pub context_enabled: bool,
     pub effort: Effort,
     pub json_mode: JsonMode,
     /// Hard character cap on the *visible* answer. Enforced twice: as a
@@ -229,6 +237,7 @@ impl Default for Settings {
         Settings {
             model: default_model(),
             system_prompt: default_system_prompt(),
+            context_enabled: true,
             effort: Effort::Low,
             json_mode: JsonMode::default(),
             max_chars: None,
@@ -294,6 +303,10 @@ impl Settings {
         parts.push(format!(
             "json={}",
             if self.json_mode.enabled { "on" } else { "off" }
+        ));
+        parts.push(format!(
+            "context={}",
+            if self.context_enabled { "on" } else { "off" }
         ));
         parts.push(match self.max_chars {
             Some(n) => format!("max_chars={n}"),

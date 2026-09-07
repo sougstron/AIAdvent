@@ -223,6 +223,15 @@ fn one_shot(cli: &Cli, settings: Settings, question: &str) -> Res<()> {
             reply.latency_ms,
             agent.settings().summary(),
         );
+        for f in agent.context_files() {
+            eprintln!(
+                "« context {}: {} ({} chars{})",
+                f.scope.as_str(),
+                f.path.display(),
+                f.chars,
+                if f.truncated { ", truncated" } else { "" }
+            );
+        }
     }
     if reply.truncated() {
         eprintln!("! cut by max_tokens — the answer may be incomplete by construction");

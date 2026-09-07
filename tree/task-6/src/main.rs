@@ -2,6 +2,7 @@ mod agent;
 mod api;
 mod cli;
 mod config;
+mod context;
 mod render;
 mod session;
 mod tui;

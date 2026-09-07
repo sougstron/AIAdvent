@@ -56,8 +56,8 @@ const SETTINGS_ROWS: &[&str] = &[
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
 const COMMANDS: &[&str] = &[
-    "effort", "help", "json", "new", "personas", "quit", "sessions", "settings", "stop", "temp",
-    "verify",
+    "context", "effort", "help", "json", "new", "personas", "quit", "sessions", "settings", "stop",
+    "temp", "verify",
 ];
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
@@ -553,6 +553,7 @@ impl App {
         self.save_session();
         self.agent.reset();
         *self.agent.settings_mut() = self.settings.clone();
+        self.agent.reload_context();
         self.session = Session::new(self.settings.clone());
         self.entries.clear();
         self.scroll = 0;
@@ -584,6 +585,7 @@ impl App {
                 self.settings = s.settings.clone();
                 self.agent.set_history(s.history());
                 *self.agent.settings_mut() = s.settings.clone();
+                self.agent.reload_context();
                 self.entries = s
                     .messages
                     .iter()
@@ -623,6 +625,7 @@ impl App {
                 self.settings_selected = 0;
             }
             "effort" => self.cmd_effort(rest),
+            "context" => self.cmd_context(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
             "json" => self.cmd_json(rest, terminal),
             "stop" => self.cmd_stop(rest),
@@ -748,7 +751,57 @@ impl App {
         let mut agent = self.agent.clone();
         *agent.settings_mut() = self.settings.clone();
         agent.settings_mut().clamp();
+        agent.reload_context();
         agent
+    }
+
+    fn context_listing(&self) -> String {
+        let bundle = self.agent.context();
+        let mut lines = vec![format!(
+            "context={}  cwd={}",
+            if bundle.enabled { "on" } else { "off" },
+            bundle.cwd.display()
+        )];
+        if bundle.files.is_empty() {
+            lines.push("no instruction files loaded".into());
+        } else {
+            for f in self.agent.context_files() {
+                lines.push(format!(
+                    "{}  {}  {} chars{}",
+                    f.scope.as_str(),
+                    f.path.display(),
+                    f.chars,
+                    if f.truncated { "  truncated" } else { "" }
+                ));
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn cmd_context(&mut self, rest: &str) {
+        match rest.trim() {
+            "" | "show" => {
+                self.entries.push(Entry::Info(self.context_listing()));
+            }
+            "on" => {
+                self.agent.set_context_enabled(true);
+                self.settings.context_enabled = true;
+                self.status = "context on".into();
+                self.entries.push(Entry::Info(self.context_listing()));
+            }
+            "off" => {
+                self.agent.set_context_enabled(false);
+                self.settings.context_enabled = false;
+                self.status = "context off".into();
+            }
+            "reload" => {
+                let cwd = self.agent.cwd().to_path_buf();
+                self.agent.set_cwd(&cwd);
+                self.status = "context reloaded".into();
+                self.entries.push(Entry::Info(self.context_listing()));
+            }
+            _ => self.status = "usage: /context [show|on|off|reload]".into(),
+        }
     }
 
     fn json_edit(&mut self, instruction: &str, terminal: &mut DefaultTerminal) {
@@ -1483,6 +1536,7 @@ const HELP: &str = "\
 /verify [prompt]          prove the stop condition changes the output
 /personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
 /personas a,b,c: <question>   same, with your own cast instead of the default three
+/context [show|on|off|reload]  AGENTS.md files in the system prompt
 /settings                 open the settings panel (Tab does the same)
 /quit                     exit
 Esc while generating      stop the current generation (partial reply is kept)
@@ -1696,6 +1750,20 @@ mod tests {
         app.adjust_setting(-1); // one step back from "off" is the "full" end
         assert_eq!(app.settings.top_k, Some(-1));
         assert_eq!(app.setting_value(top_k_row), "full");
+    }
+
+    #[test]
+    fn context_command_toggles_injection() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default());
+        assert!(app.settings.context_enabled);
+        app.cmd_context("off");
+        assert!(!app.settings.context_enabled);
+        assert!(!app.agent.context().enabled);
+        app.cmd_context("on");
+        assert!(app.settings.context_enabled);
+        assert!(app.agent.context().enabled);
+        app.cmd_context("reload");
+        assert!(app.context_listing().contains("cwd="));
     }
 
     #[test]
