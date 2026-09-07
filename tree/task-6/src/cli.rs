@@ -1,5 +1,5 @@
 //! Argument parsing and the non-interactive entry points: one-shot questions,
-//! `--sessions`, and `--verify-stop` (the stop-condition proof from a script).
+//! `--sessions`, and `--verify` (the live z.ai lever proof from a script).
 
 use clap::Parser;
 use serde_json::Value;
@@ -21,7 +21,7 @@ use crate::verify;
     after_help = "Examples:\n  \
         ask                                   open the chat TUI\n  \
         ask \"what is the capital of France?\"   one-shot question\n  \
-        ask --verify-stop                     prove the stop condition works\n  \
+        ask --verify                          prove z.ai levers with causal signatures\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
         ask --continue                        resume the most recent session"
@@ -82,9 +82,9 @@ pub struct Cli {
     #[arg(long, allow_hyphen_values = true)]
     pub top_k: Option<i32>,
 
-    /// Run the stop-condition proof (same prompt, off vs on) and exit.
-    #[arg(long)]
-    pub verify_stop: bool,
+    /// Run the live z.ai lever proof (glm-5.3-flash only) and exit.
+    #[arg(long, visible_alias = "verify-stop")]
+    pub verify: bool,
 
     /// List saved chat sessions and exit.
     #[arg(long)]
@@ -176,13 +176,8 @@ pub fn run() -> Res<()> {
 
     let settings = cli.to_settings()?;
 
-    if cli.verify_stop {
-        let prompt = if cli.question.is_empty() {
-            verify::DEFAULT_PROMPT.to_string()
-        } else {
-            cli.question.join(" ")
-        };
-        let report = verify::run(&settings, &prompt)?;
+    if cli.verify {
+        let report = verify::run()?;
         println!("{}", report.render());
         return Ok(());
     }

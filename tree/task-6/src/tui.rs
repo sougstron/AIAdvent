@@ -1094,23 +1094,15 @@ impl App {
         }
     }
 
-    fn cmd_verify(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
-        let prompt = if rest.is_empty() {
-            verify::DEFAULT_PROMPT.to_string()
-        } else {
-            rest.to_string()
-        };
-        let settings = self.settings.clone();
-        let result = self.with_spinner(terminal, "verifying stop condition (2 calls)", move || {
-            verify::run(&settings, &prompt)
-        });
+    fn cmd_verify(&mut self, _rest: &str, terminal: &mut DefaultTerminal) {
+        let result = self.with_spinner(
+            terminal,
+            "verifying z.ai levers (live glm-5.3-flash)",
+            verify::run,
+        );
         match result {
             Some(Ok(report)) => {
-                self.status = if report.stop_condition_had_effect() {
-                    "verify: stop condition CONFIRMED working".into()
-                } else {
-                    "verify: stop condition had NO effect — check budget_tokens/stop".into()
-                };
+                self.status = report.status_line();
                 self.entries.push(Entry::Info(report.render()));
                 self.scroll_to_bottom(terminal);
             }
@@ -1880,7 +1872,7 @@ const HELP: &str = "\
 /max-tokens [off|1-131072] get or set the answer token cap
 /stop add <seq>           add a stop sequence (max 4)
 /stop clear               clear stop sequences
-/verify [prompt]          prove the stop condition changes the output
+/verify                   prove the agent reaches z.ai and that levers are honoured
 /personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
 /personas a,b,c: <question>   same, with your own cast instead of the default three
 /context [show|on|off|reload]  AGENTS.md files in the system prompt
