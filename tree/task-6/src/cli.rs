@@ -5,7 +5,7 @@ use clap::Parser;
 use serde_json::Value;
 use std::io::{IsTerminal, Read};
 
-use crate::api::{self, ChatMessage, Endpoint};
+use crate::agent::Agent;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
 use crate::render;
 use crate::session;
@@ -29,6 +29,10 @@ pub struct Cli {
     #[arg(trailing_var_arg = true)]
     pub question: Vec<String>,
 
+    /// Model id from the z.ai catalog. Only glm-5.3-flash may be called live.
+    #[arg(long)]
+    pub model: Option<String>,
+
     /// Reasoning effort: none | low | medium | high.
     #[arg(long, env = "ASK_EFFORT")]
     pub effort: Option<String>,
@@ -50,14 +54,19 @@ pub struct Cli {
     pub max_chars: Option<usize>,
 
     /// Stop-condition token budget (counts reasoning + visible tokens).
+    /// Sent as `max_tokens`.
     #[arg(long, env = "ASK_BUDGET_TOKENS")]
     pub budget_tokens: Option<u32>,
+
+    /// Alias for --budget-tokens: cap on generated tokens.
+    #[arg(long, env = "ASK_MAX_TOKENS")]
+    pub max_tokens: Option<u32>,
 
     /// Stop sequence; repeatable, max 4. `\n`/`\t` escapes are understood.
     #[arg(long = "stop", env = "ASK_STOP", value_delimiter = ',')]
     pub stop: Vec<String>,
 
-    /// Sampling temperature, 0.0 to 2.0 (the provider's own range).
+    /// Sampling temperature, 0.0 to 1.0 (z.ai documented range).
     #[arg(long)]
     pub temperature: Option<f32>,
 
@@ -91,6 +100,15 @@ pub struct Cli {
 impl Cli {
     pub fn to_settings(&self) -> Res<Settings> {
         let mut s = Settings::default();
+        if let Some(m) = &self.model {
+            if !config::MODEL_CATALOG.contains(&m.as_str()) {
+                return Err(format!(
+                    "unknown model `{m}`; catalog: {}",
+                    config::MODEL_CATALOG.join(", ")
+                ));
+            }
+            s.model = m.clone();
+        }
         if let Some(e) = &self.effort {
             s.effort = Effort::parse(e)?;
         }
@@ -114,8 +132,8 @@ impl Cli {
         if let Some(n) = self.max_chars {
             s.max_chars = Some(n);
         }
-        if let Some(n) = self.budget_tokens {
-            s.budget_tokens = Some(n);
+        if let Some(n) = self.max_tokens.or(self.budget_tokens) {
+            s.budget_tokens = Some(config::parse_max_tokens(n)?);
         }
         if !self.stop.is_empty() {
             if self.stop.len() > 4 {
@@ -127,10 +145,7 @@ impl Cli {
             s.temperature = Some(config::parse_temperature(t)?);
         }
         if let Some(p) = self.top_p {
-            if !(0.0..=1.0).contains(&p) {
-                return Err(format!("top_p must be between 0.0 and 1.0 (got {p})"));
-            }
-            s.top_p = Some(p);
+            s.top_p = Some(config::parse_top_p(p)?);
         }
         if let Some(k) = self.top_k {
             if k == 0 || k < -1 {
@@ -152,13 +167,12 @@ pub fn run() -> Res<()> {
     let settings = cli.to_settings()?;
 
     if cli.verify_stop {
-        let ep = Endpoint::resolve()?;
         let prompt = if cli.question.is_empty() {
             verify::DEFAULT_PROMPT.to_string()
         } else {
             cli.question.join(" ")
         };
-        let report = verify::run(&ep, &settings, &prompt)?;
+        let report = verify::run(&settings, &prompt)?;
         println!("{}", report.render());
         return Ok(());
     }
@@ -172,27 +186,23 @@ pub fn run() -> Res<()> {
 }
 
 fn one_shot(cli: &Cli, settings: Settings, question: &str) -> Res<()> {
-    let ep = Endpoint::resolve()?;
-    let history = vec![ChatMessage::user(question)];
-    let schema = settings.json_mode.enabled.then(|| settings.json_mode.schema.clone());
-    let outcome = api::chat(&ep, &settings, "", &history, schema.as_ref())?;
+    let mut agent = Agent::new(settings.clone())?;
+    let reply = agent.ask(question)?;
 
     if cli.raw {
-        println!("{}", serde_json::to_string_pretty(&outcome.raw).unwrap_or_default());
+        println!("{}", serde_json::to_string_pretty(&reply.raw).unwrap_or_default());
     } else {
-        let raw_text = outcome.text();
         let (display, parse_note) = if settings.json_mode.enabled {
-            render::render_json_reply(raw_text)
+            render::render_json_reply(&reply.text)
         } else {
-            (raw_text.to_string(), None)
+            (reply.text.clone(), None)
         };
-        let (capped, was_cut) = api::enforce_max_chars(&display, settings.max_chars);
-        if capped.is_empty() {
+        if display.is_empty() {
             println!("(no content)");
         } else {
-            println!("{capped}");
+            println!("{display}");
         }
-        if was_cut {
+        if reply.truncated_by_max_chars {
             eprintln!("! truncated to max_chars={}", settings.max_chars.unwrap_or(0));
         }
         if let Some(e) = parse_note {
@@ -201,22 +211,26 @@ fn one_shot(cli: &Cli, settings: Settings, question: &str) -> Res<()> {
     }
 
     if !cli.quiet {
-        let u = &outcome.usage;
+        let u = &reply.usage;
         eprintln!(
-            "« finish={}  tokens: prompt={} completion={} (reasoning={}) total={}  {}ms  |  {}",
-            outcome.finish_reason.as_deref().unwrap_or("?"),
+            "« model={}  finish={}  tokens: prompt={} completion={} (reasoning={}) total={}  {}ms  |  {}",
+            if reply.model.is_empty() { "?" } else { &reply.model },
+            reply.finish_reason.as_deref().unwrap_or("?"),
             u.prompt_tokens,
             u.completion_tokens,
             u.reasoning_tokens,
             u.total_tokens,
-            outcome.latency_ms,
-            settings.summary(),
+            reply.latency_ms,
+            agent.settings().summary(),
         );
     }
-    if outcome.truncated() {
-        eprintln!("! cut by budget_tokens — the answer may be incomplete by construction");
+    if reply.truncated() {
+        eprintln!("! cut by max_tokens — the answer may be incomplete by construction");
     }
-    if let Some(r) = outcome.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
+    if reply.stopped_by_sequence() && !settings.stop.is_empty() {
+        eprintln!("! stopped on a stop sequence");
+    }
+    if let Some(r) = reply.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
         eprintln!("« reasoning: {} chars", r.trim().chars().count());
     }
     Ok(())

@@ -1,4 +1,4 @@
-//! Chat settings shared by the CLI, the TUI and the stop-condition self-test.
+//! Chat settings shared by the CLI, the TUI and the agent.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6,19 +6,64 @@ use std::fmt;
 
 pub type Res<T> = Result<T, String>;
 
-/// How much the model is allowed to reason before answering.
-/// Maps straight onto the provider's `reasoning_effort` field.
+/// Default and only model that may be used for live completions.
+pub const DEFAULT_MODEL: &str = "glm-5.3-flash";
+
+/// Catalog from `GET https://api.z.ai/api/paas/v4/models` on 2026-09-07
+/// (10 ids, `object: list`). Only `glm-5.3-flash` is cheap enough to call;
+/// the rest are exposed as selectable settings but refused at send time.
+pub const MODEL_CATALOG: &[&str] = &[
+    "glm-4.5",
+    "glm-4.5-air",
+    "glm-4.6",
+    "glm-4.7",
+    "glm-5",
+    "glm-5-turbo",
+    "glm-5.1",
+    "glm-5.2",
+    "glm-5.3",
+    "glm-5.3-flash",
+];
+
+pub const DEFAULT_SYSTEM_PROMPT: &str = "Ты — полезный ассистент. Отвечай ясно и по делу.";
+
+/// Documented z.ai range for `temperature` is `[0.0, 1.0]`. Live, 1.5 and 2.0
+/// returned HTTP 200 on `glm-5.3-flash` (the endpoint does not 400 the way
+/// yolo-auto did at 2.01) — we still clamp to the documented range rather
+/// than send values the docs say are invalid.
+pub const TEMP_MIN: f32 = 0.0;
+pub const TEMP_MAX: f32 = 1.0;
+
+/// Documented `top_p` range on the Chat Completions schema: `[0.01, 1.0]`.
+pub const TOP_P_MIN: f32 = 0.01;
+pub const TOP_P_MAX: f32 = 1.0;
+
+pub const MAX_TOKENS_MIN: u32 = 1;
+pub const MAX_TOKENS_MAX: u32 = 131_072;
+
+/// Reasoning effort sent as `reasoning_effort`.
+///
+/// Live against `glm-5.3-flash` (HTTP 400, error code 1210):
+/// `thinking.type: disabled`, `reasoning_effort: none`, and
+/// `reasoning_effort: medium` are all rejected with
+/// "This model always engages in thinking and cannot be disabled;
+/// please use low, high, or max".
+///
+/// `None` / `Medium` stay in the enum so older saved sessions still
+/// deserialize; [`Effort::wire`] maps them onto a legal value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Effort {
-    /// Reasoning forced off (`reasoning_effort: none` + `enable_thinking: false`).
+    /// Saved-session / `/effort none` alias — cannot actually disable thinking.
     None,
     Low,
+    /// Saved-session / `/effort medium` alias — the API rejects `medium`.
     Medium,
     High,
+    Max,
 }
 
 impl Effort {
-    pub const ALL: [Effort; 4] = [Effort::None, Effort::Low, Effort::Medium, Effort::High];
+    pub const ALL: [Effort; 3] = [Effort::Low, Effort::High, Effort::Max];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -26,21 +71,42 @@ impl Effort {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::Max => "max",
+        }
+    }
+
+    /// Value actually put on the wire. Never `none` or `medium`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Effort::None | Effort::Low => "low",
+            Effort::Medium | Effort::High => "high",
+            Effort::Max => "max",
         }
     }
 
     pub fn parse(s: &str) -> Res<Effort> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "none" | "off" => Ok(Effort::None),
+            "none" | "off" => Ok(Effort::Low),
             "low" => Ok(Effort::Low),
-            "medium" | "med" => Ok(Effort::Medium),
+            "medium" | "med" => Ok(Effort::High),
             "high" => Ok(Effort::High),
-            other => Err(format!("unknown effort `{other}` (none|low|medium|high)")),
+            "max" => Ok(Effort::Max),
+            other => Err(format!(
+                "unknown effort `{other}` (low|high|max; none/medium are aliases — glm-5.3-flash rejects them)"
+            )),
         }
     }
 
     pub fn cycle(self, delta: i32) -> Effort {
-        let i = Effort::ALL.iter().position(|e| *e == self).unwrap_or(0) as i32;
+        let current = match self {
+            Effort::None | Effort::Low => Effort::Low,
+            Effort::Medium | Effort::High => Effort::High,
+            Effort::Max => Effort::Max,
+        };
+        let i = Effort::ALL
+            .iter()
+            .position(|e| *e == current)
+            .unwrap_or(0) as i32;
         let n = Effort::ALL.len() as i32;
         Effort::ALL[(i + delta).rem_euclid(n) as usize]
     }
@@ -52,8 +118,11 @@ impl fmt::Display for Effort {
     }
 }
 
-/// The structured-output mode: off (free prose) or on with a JSON Schema the
-/// model must fill. The schema is editable at runtime via `/json`.
+/// Structured-output mode: off (free prose) or on with a JSON Schema the
+/// model is asked to fill. z.ai documents `response_format.type: json_object`
+/// for GLM-5.3; live, `json_schema`/`strict` was accepted but not enforced
+/// (fenced JSON plus extra fields). The schema is therefore a prompt hint
+/// plus client-side flattening, not a provider guarantee.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonMode {
     pub enabled: bool,
@@ -69,8 +138,6 @@ impl Default for JsonMode {
     }
 }
 
-/// A flat, all-string-fields schema — the common case from the spec example
-/// (`{title, game, publisher, summary}`), buildable with `/json fields a,b,c`.
 pub fn flat_string_schema(fields: &[String]) -> Value {
     let mut properties = serde_json::Map::new();
     for f in fields {
@@ -88,45 +155,48 @@ fn default_schema() -> Value {
     flat_string_schema(&["title".into(), "summary".into()])
 }
 
+fn default_model() -> String {
+    DEFAULT_MODEL.to_string()
+}
+
+fn default_system_prompt() -> String {
+    DEFAULT_SYSTEM_PROMPT.to_string()
+}
+
 /// Everything one turn of generation needs. Built once per app, mutated live
 /// by `/effort`, `/json`, `/settings`, and persisted per session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_system_prompt")]
+    pub system_prompt: String,
     pub effort: Effort,
     pub json_mode: JsonMode,
     /// Hard character cap on the *visible* answer. Enforced twice: as a
-    /// system-prompt hint (soft, helps the model wrap up cleanly) and as a
-    /// client-side truncation after the fact (hard, always true regardless
-    /// of what the model does).
+    /// system-prompt hint and as client-side truncation after the fact.
     pub max_chars: Option<usize>,
-    /// Generation token budget — counts reasoning *and* visible tokens.
-    /// This is the primary "stop condition" lever: set low enough and the
-    /// model is cut off mid-thought, deterministically (`finish_reason=length`).
+    /// Cap on generated tokens (reasoning + visible). Sent as `max_tokens`.
+    /// Kept under this name so existing TUI/CLI/`/verify` wiring still compiles;
+    /// `max_tokens` is accepted as a serde alias for older/newer session files.
+    #[serde(default, alias = "max_tokens")]
     pub budget_tokens: Option<u32>,
-    /// Literal stop strings — the other stop-condition lever. The provider
-    /// halts generation the instant one is emitted (`finish_reason=stop`).
+    /// Literal stop strings. Confirmed live: `stop: ["3"]` on a counting
+    /// prompt returned `finish_reason=stop` with content cut before `3`.
     pub stop: Vec<String>,
-    /// Sampling temperature. The provider accepts `TEMP_MIN..=TEMP_MAX` and
-    /// rejects anything outside with HTTP 400, so it is validated client-side.
+    /// Sampling temperature, clamped to [`TEMP_MIN`]..=[`TEMP_MAX`].
     pub temperature: Option<f32>,
-    /// Nucleus sampling cutoff. `None` leaves the provider's default in place.
+    /// Nucleus sampling cutoff. `None` leaves the provider default (0.95).
     #[serde(default)]
     pub top_p: Option<f32>,
-    /// Top-k cutoff; `-1` disables it (full vocabulary). `None` leaves the
-    /// provider's default in place — and that default is what makes a high
-    /// temperature look like it does nothing, since it truncates the
-    /// distribution before temperature ever gets to widen it.
+    /// Top-k cutoff; `-1` is "full vocabulary". Not in the public Chat
+    /// Completions docs, but the Java request class has the field: sending
+    /// `top_k: "nope"` returned HTTP 400 naming
+    /// `ChatCompletionRequest["top_k"]`. Sent when set.
     #[serde(default)]
     pub top_k: Option<i32>,
 }
 
-/// Range the provider validates `temperature` against — outside it the call
-/// fails with `temperature: Validation error: range`, confirmed live.
-pub const TEMP_MIN: f32 = 0.0;
-pub const TEMP_MAX: f32 = 2.0;
-
-/// Parses a temperature and rejects out-of-range values here rather than
-/// letting the provider answer with an HTTP 400.
 pub fn parse_temperature(t: f32) -> Res<f32> {
     if !(TEMP_MIN..=TEMP_MAX).contains(&t) {
         return Err(format!(
@@ -136,10 +206,30 @@ pub fn parse_temperature(t: f32) -> Res<f32> {
     Ok(t)
 }
 
+pub fn parse_top_p(p: f32) -> Res<f32> {
+    if !(TOP_P_MIN..=TOP_P_MAX).contains(&p) {
+        return Err(format!(
+            "top_p must be between {TOP_P_MIN} and {TOP_P_MAX} (got {p})"
+        ));
+    }
+    Ok(p)
+}
+
+pub fn parse_max_tokens(n: u32) -> Res<u32> {
+    if !(MAX_TOKENS_MIN..=MAX_TOKENS_MAX).contains(&n) {
+        return Err(format!(
+            "max_tokens must be between {MAX_TOKENS_MIN} and {MAX_TOKENS_MAX} (got {n})"
+        ));
+    }
+    Ok(n)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            effort: Effort::None,
+            model: default_model(),
+            system_prompt: default_system_prompt(),
+            effort: Effort::Low,
             json_mode: JsonMode::default(),
             max_chars: None,
             budget_tokens: None,
@@ -152,13 +242,55 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub fn thinking(&self) -> bool {
-        self.effort != Effort::None
+    /// Token cap sent as `max_tokens`.
+    pub fn max_tokens(&self) -> Option<u32> {
+        self.budget_tokens
     }
 
-    /// One-line status strip, shown in the TUI header and CLI stats.
+    pub fn thinking(&self) -> bool {
+        // glm-5.3-flash cannot disable thinking (HTTP 400 / 1210).
+        true
+    }
+
+    /// Clamp every lever into the range the endpoint documents. Called by
+    /// the agent before building a body so TUI cycling cannot smuggle 2.0.
+    pub fn clamp(&mut self) {
+        if self.model.trim().is_empty() {
+            self.model = default_model();
+        }
+        self.effort = match self.effort {
+            Effort::None => Effort::Low,
+            Effort::Medium => Effort::High,
+            other => other,
+        };
+        if let Some(t) = self.temperature {
+            self.temperature = Some(t.clamp(TEMP_MIN, TEMP_MAX));
+        }
+        if let Some(p) = self.top_p {
+            self.top_p = Some(p.clamp(TOP_P_MIN, TOP_P_MAX));
+        }
+        if let Some(n) = self.budget_tokens {
+            self.budget_tokens = Some(n.clamp(MAX_TOKENS_MIN, MAX_TOKENS_MAX));
+        }
+        if let Some(k) = self.top_k {
+            if k == 0 || k < -1 {
+                self.top_k = None;
+            }
+        }
+        if self.stop.len() > 4 {
+            self.stop.truncate(4);
+        }
+    }
+
     pub fn summary(&self) -> String {
-        let mut parts = vec![format!("effort={}", self.effort)];
+        let mut parts = vec![
+            format!("model={}", self.model),
+            format!("effort={}", self.effort.wire()),
+        ];
+        parts.push(format!(
+            "thinking={}",
+            if self.thinking() { "on" } else { "off" }
+        ));
         parts.push(format!(
             "json={}",
             if self.json_mode.enabled { "on" } else { "off" }
@@ -168,8 +300,8 @@ impl Settings {
             None => "max_chars=off".into(),
         });
         parts.push(match self.budget_tokens {
-            Some(n) => format!("budget={n}tok"),
-            None => "budget=off".into(),
+            Some(n) => format!("max_tokens={n}"),
+            None => "max_tokens=off".into(),
         });
         parts.push(if self.stop.is_empty() {
             "stop=off".into()
@@ -189,8 +321,6 @@ impl Settings {
         parts.join("  ")
     }
 
-    /// A copy with both stop-condition levers cleared — the "off" side of
-    /// the `/verify` comparison.
     pub fn without_stop_condition(&self) -> Settings {
         let mut s = self.clone();
         s.budget_tokens = None;
@@ -199,8 +329,6 @@ impl Settings {
     }
 }
 
-/// `-1` is the provider's "no top-k cutoff at all" value; spell that out
-/// instead of showing a bare negative number in the UI.
 pub fn render_top_k(k: i32) -> String {
     if k < 0 {
         "full".into()
@@ -209,7 +337,6 @@ pub fn render_top_k(k: i32) -> String {
     }
 }
 
-/// Escapes control characters so stop sequences stay readable on one line.
 pub fn render_stops(stop: &[String]) -> String {
     stop.iter()
         .map(|s| format!("\"{}\"", s.replace('\n', "\\n").replace('\t', "\\t")))
@@ -217,7 +344,6 @@ pub fn render_stops(stop: &[String]) -> String {
         .join(",")
 }
 
-/// Turns the literal two-character `\n` typed at a prompt into a real newline.
 pub fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -246,41 +372,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effort_cycles_and_round_trips_through_label() {
+    fn effort_cycles_real_wire_values() {
         for e in Effort::ALL {
             assert_eq!(Effort::parse(e.label()).unwrap(), e);
         }
-        assert_eq!(Effort::None.cycle(1), Effort::Low);
-        assert_eq!(Effort::None.cycle(-1), Effort::High);
+        assert_eq!(Effort::Low.cycle(1), Effort::High);
+        assert_eq!(Effort::Low.cycle(-1), Effort::Max);
+        assert_eq!(Effort::Max.cycle(1), Effort::Low);
     }
 
     #[test]
-    fn temperature_range_matches_the_provider() {
+    fn effort_aliases_map_onto_legal_wire_values() {
+        assert_eq!(Effort::parse("none").unwrap(), Effort::Low);
+        assert_eq!(Effort::parse("off").unwrap(), Effort::Low);
+        assert_eq!(Effort::parse("medium").unwrap(), Effort::High);
+        assert_eq!(Effort::None.wire(), "low");
+        assert_eq!(Effort::Medium.wire(), "high");
+        assert_eq!(Effort::Max.wire(), "max");
+    }
+
+    #[test]
+    fn temperature_range_matches_z_ai_docs() {
         assert_eq!(parse_temperature(0.0).unwrap(), 0.0);
-        assert_eq!(parse_temperature(2.0).unwrap(), 2.0);
-        // 2.01 is what the endpoint itself rejects with HTTP 400.
-        assert!(parse_temperature(2.01).is_err());
+        assert_eq!(parse_temperature(1.0).unwrap(), 1.0);
+        assert!(parse_temperature(1.5).is_err());
+        assert!(parse_temperature(2.0).is_err());
         assert!(parse_temperature(-0.1).is_err());
     }
 
     #[test]
-    fn summary_shows_temperature_and_only_set_sampling_knobs() {
+    fn clamp_pulls_legacy_levers_into_range() {
+        let mut s = Settings {
+            effort: Effort::None,
+            temperature: Some(2.0),
+            top_p: Some(0.0),
+            budget_tokens: Some(0),
+            top_k: Some(0),
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.effort, Effort::Low);
+        assert_eq!(s.temperature, Some(1.0));
+        assert!((s.top_p.unwrap() - TOP_P_MIN).abs() < 1e-6);
+        assert_eq!(s.budget_tokens, Some(MAX_TOKENS_MIN));
+        assert_eq!(s.top_k, None);
+    }
+
+    #[test]
+    fn summary_shows_model_and_only_set_sampling_knobs() {
         let mut s = Settings::default();
+        assert!(s.summary().contains("model=glm-5.3-flash"));
         assert!(s.summary().contains("temp=off"));
         assert!(!s.summary().contains("top_k"));
-        s.temperature = Some(1.2);
+        s.temperature = Some(0.7);
         s.top_k = Some(-1);
         let summary = s.summary();
-        assert!(summary.contains("temp=1.2"));
+        assert!(summary.contains("temp=0.7"));
         assert!(summary.contains("top_k=full"));
         assert!(!summary.contains("top_p"));
     }
 
     #[test]
-    fn thinking_is_off_only_at_effort_none() {
+    fn thinking_cannot_be_turned_off() {
         let mut s = Settings::default();
-        assert!(!s.thinking());
-        s.effort = Effort::Low;
+        assert!(s.thinking());
+        s.effort = Effort::None;
         assert!(s.thinking());
     }
 
@@ -295,6 +451,12 @@ mod tests {
         let cleared = s.without_stop_condition();
         assert_eq!(cleared.budget_tokens, None);
         assert!(cleared.stop.is_empty());
-        assert_eq!(cleared.max_chars, Some(200)); // unrelated setting untouched
+        assert_eq!(cleared.max_chars, Some(200));
+    }
+
+    #[test]
+    fn catalog_includes_the_live_default() {
+        assert!(MODEL_CATALOG.contains(&DEFAULT_MODEL));
+        assert_eq!(MODEL_CATALOG.len(), 10);
     }
 }

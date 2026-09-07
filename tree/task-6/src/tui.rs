@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::api::{self, ChatMessage, Endpoint, Outcome};
+use crate::agent::Agent;
+use crate::api::{self, ChatMessage, Outcome};
 use crate::config::{self, Effort, Res, Settings};
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
@@ -32,17 +33,13 @@ const MAX_CHARS_CHOICES: &[Option<usize>] =
 const BUDGET_CHOICES: &[Option<u32>] =
     &[None, Some(32), Some(64), Some(128), Some(256), Some(512), Some(1024), Some(4096)];
 const STOP_PRESETS: &[&[&str]] = &[&[], &["\n\n"], &["\n---\n"], &["\n\n\n"]];
-/// Up to the provider's hard ceiling (`config::TEMP_MAX`); 2.01 is rejected
-/// with HTTP 400, so 2.0 is the last usable step.
+/// Up to the documented z.ai ceiling (`config::TEMP_MAX` = 1.0).
 const TEMP_CHOICES: &[Option<f32>] = &[
     None,
     Some(0.0),
     Some(0.3),
     Some(0.7),
     Some(1.0),
-    Some(1.2),
-    Some(1.5),
-    Some(2.0),
 ];
 const TOP_P_CHOICES: &[Option<f32>] = &[None, Some(0.5), Some(0.8), Some(0.95), Some(1.0)];
 const TOP_K_CHOICES: &[Option<i32>] = &[None, Some(20), Some(50), Some(100), Some(-1)];
@@ -89,7 +86,7 @@ pub fn run(settings: Settings) -> Res<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("interactive chat requires a terminal".into());
     }
-    let ep = Endpoint::resolve()?;
+    let agent = Agent::new(settings.clone())?;
     let mut terminal = ratatui::try_init().map_err(|e| {
         let _ = ratatui::try_restore();
         format!("cannot start TUI: {e}")
@@ -105,7 +102,7 @@ pub fn run(settings: Settings) -> Res<()> {
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
-    let result = App::new(ep, settings).event_loop(&mut terminal);
+    let result = App::new(agent, settings).event_loop(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         PopKeyboardEnhancementFlags,
@@ -130,7 +127,7 @@ enum Focus {
 }
 
 struct App {
-    ep: Endpoint,
+    agent: Agent,
     settings: Settings,
     session: Session,
     sessions_dir: PathBuf,
@@ -163,9 +160,9 @@ struct App {
 }
 
 impl App {
-    fn new(ep: Endpoint, settings: Settings) -> App {
+    fn new(agent: Agent, settings: Settings) -> App {
         App {
-            ep,
+            agent,
             session: Session::new(settings.clone()),
             settings,
             sessions_dir: session::sessions_dir(),
@@ -554,6 +551,8 @@ impl App {
 
     fn new_chat(&mut self) {
         self.save_session();
+        self.agent.reset();
+        *self.agent.settings_mut() = self.settings.clone();
         self.session = Session::new(self.settings.clone());
         self.entries.clear();
         self.scroll = 0;
@@ -583,6 +582,8 @@ impl App {
             Ok(s) => {
                 self.save_session();
                 self.settings = s.settings.clone();
+                self.agent.set_history(s.history());
+                *self.agent.settings_mut() = s.settings.clone();
                 self.entries = s
                     .messages
                     .iter()
@@ -743,6 +744,13 @@ impl App {
 
     /// Asks the model to rewrite the current schema per a natural-language
     /// instruction — the "the model can edit the JSON on request" path.
+    fn prepared_agent(&self) -> Agent {
+        let mut agent = self.agent.clone();
+        *agent.settings_mut() = self.settings.clone();
+        agent.settings_mut().clamp();
+        agent
+    }
+
     fn json_edit(&mut self, instruction: &str, terminal: &mut DefaultTerminal) {
         let system = format!(
             "You maintain a JSON Schema (draft-like: type/properties/required/additionalProperties). \
@@ -751,12 +759,9 @@ impl App {
             serde_json::to_string(&self.settings.json_mode.schema).unwrap_or_default()
         );
         let history = vec![ChatMessage::user(instruction)];
-        let mut plain = self.settings.without_stop_condition();
-        plain.json_mode.enabled = false;
-        plain.max_chars = None;
-        let ep = self.ep.clone();
+        let agent = self.prepared_agent();
         let result = self.with_spinner(terminal, "updating schema", move || {
-            api::chat(&ep, &plain, &system, &history, None)
+            agent.complete_with_system(&system, &history)
         });
         match result {
             Some(Ok(outcome)) => {
@@ -784,10 +789,9 @@ impl App {
         } else {
             rest.to_string()
         };
-        let ep = self.ep.clone();
         let settings = self.settings.clone();
         let result = self.with_spinner(terminal, "verifying stop condition (2 calls)", move || {
-            verify::run(&ep, &settings, &prompt)
+            verify::run(&settings, &prompt)
         });
         match result {
             Some(Ok(report)) => {
@@ -844,12 +848,11 @@ impl App {
                  independent of any other perspective — don't mention or defer to other viewpoints. \
                  Be concise but substantive."
             );
-            let ep = self.ep.clone();
-            let settings = self.settings.clone();
+            let agent = self.prepared_agent();
             let history = vec![ChatMessage::user(question.clone())];
             let label = format!("thinking as {persona} ({}/{n})", i + 1);
             let result = self.with_spinner(terminal, &label, move || {
-                api::chat(&ep, &settings, &system, &history, None)
+                agent.complete_with_system(&system, &history)
             });
             match result {
                 Some(Ok(outcome)) => {
@@ -968,19 +971,18 @@ impl App {
         self.session.push_user(question.clone());
         self.entries.push(Entry::User(question));
         self.follow = true;
-        let history = self.session.history();
+        self.agent.set_history(self.session.history());
+        let history = self.agent.history().to_vec();
 
         // JSON mode stays on the blocking path: streamed fragments of a JSON
         // object aren't valid JSON until the last token, so there's nothing
         // meaningful to render live, and `render_json_reply` needs the whole
         // body to flatten anyway.
         if self.settings.json_mode.enabled {
-            let schema = self.settings.json_mode.schema.clone();
-            let ep = self.ep.clone();
-            let settings = self.settings.clone();
+            let agent = self.prepared_agent();
             let hist = history.clone();
             let result = self.with_spinner(terminal, "model is thinking", move || {
-                api::chat(&ep, &settings, "", &hist, Some(&schema))
+                agent.complete_outcome(&hist)
             });
             match result {
                 Some(Ok(outcome)) => self.finish_reply(outcome, terminal),
@@ -1008,12 +1010,11 @@ impl App {
         // next SSE line, which drops the stream and closes the connection.
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
-        let ep = self.ep.clone();
-        let settings = self.settings.clone();
+        let agent = self.prepared_agent();
         let cancel_worker = cancel.clone();
         thread::spawn(move || {
             let mut stream =
-                match api::chat_stream(&ep, &settings, "", &history, None, Some(cancel_worker)) {
+                match agent.stream(&history, Some(cancel_worker)) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = tx.send(StreamEvent::Done(Err(e)));
@@ -1683,7 +1684,7 @@ mod tests {
 
     #[test]
     fn sampling_rows_render_and_cycle() {
-        let mut app = App::new(api::Endpoint::dummy(), config::Settings::default());
+        let mut app = App::new(Agent::dummy(), config::Settings::default());
         let temp_row = SETTINGS_ROWS.iter().position(|r| *r == "temperature").unwrap();
         let top_p_row = SETTINGS_ROWS.iter().position(|r| *r == "top_p").unwrap();
         let top_k_row = SETTINGS_ROWS.iter().position(|r| *r == "top_k").unwrap();

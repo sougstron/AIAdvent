@@ -1,85 +1,121 @@
-//! Talking to the OpenAI-compatible endpoint. Multi-turn: the whole visible
-//! history is resent every call, exactly like a real chat client.
+//! Thin z.ai transport: assemble the OpenAI-compatible body, POST / stream
+//! `/chat/completions`, parse the response. Conversation policy lives in
+//! `agent.rs`. The coding-plan base (`/api/coding/paas/v4`) is never used.
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::{Res, Settings};
+use crate::config::{Res, Settings, DEFAULT_MODEL};
 
-const DEFAULT_BASE_URL: &str = "https://yolo-auto.com/v1";
-const DEFAULT_MODEL: &str = "qwen3.8-27b";
+/// Plain (non-coding-plan) OpenAI-compatible base.
+pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 
-#[derive(Deserialize)]
-struct PiModels {
-    providers: std::collections::BTreeMap<String, PiProvider>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PiProvider {
-    #[serde(default)]
-    api_key: Option<String>,
-}
+/// Only this id may be sent on a live completion. The rest of
+/// [`config::MODEL_CATALOG`] is selectable but expensive.
+pub const LIVE_COMPLETION_MODEL: &str = DEFAULT_MODEL;
 
 #[derive(Clone)]
 pub struct Endpoint {
     pub base_url: String,
-    pub model: String,
     api_key: String,
 }
 
 impl Endpoint {
-    /// Unusable for actual requests — only for tests that need an `Endpoint`
-    /// value but return before making a call.
+    /// Unusable for actual requests — tests that return before a call.
     #[cfg(test)]
     pub fn dummy() -> Endpoint {
         Endpoint {
             base_url: "http://unused.invalid".into(),
-            model: "unused".into(),
             api_key: String::new(),
         }
     }
 
-    /// Resolution order: `$YOLO_BASE_URL` / `$YOLO_MODEL` / `$YOLO_API_KEY`,
-    /// falling back to the `Yolo-Auto` provider in `~/.pi/agent/models.json`.
     pub fn resolve() -> Res<Endpoint> {
         Ok(Endpoint {
-            base_url: env::var("YOLO_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into()),
-            model: env::var("YOLO_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
+            base_url: DEFAULT_BASE_URL.into(),
             api_key: resolve_api_key()?,
         })
     }
 }
 
-fn resolve_api_key() -> Res<String> {
-    if let Ok(key) = env::var("YOLO_API_KEY") {
-        if !key.is_empty() {
+pub fn resolve_api_key() -> Res<String> {
+    let home = env::var("HOME").unwrap_or_default();
+    let pi = PathBuf::from(&home).join(".pi/agent/auth.json");
+    let omp = PathBuf::from(&home).join(".omp/agent/auth.json");
+    resolve_api_key_from(env::var("ZAI_API_KEY").ok().as_deref(), Some(&pi), Some(&omp))
+}
+
+/// Resolution order, never printing the key:
+/// 1. `$ZAI_API_KEY`
+/// 2. `~/.pi/agent/auth.json` → `["zai-coding-cn"]["key"]`
+/// 3. `~/.omp/agent/auth.json` equivalent
+pub fn resolve_api_key_from(
+    env_key: Option<&str>,
+    pi_auth: Option<&Path>,
+    omp_auth: Option<&Path>,
+) -> Res<String> {
+    if let Some(key) = env_key.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(key.to_string());
+    }
+    if let Some(path) = pi_auth {
+        if let Some(key) = key_from_auth_file(path)? {
             return Ok(key);
         }
     }
-    let path = pi_models_path()?;
-    let raw =
-        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    let models: PiModels = serde_json::from_str(&raw)
-        .map_err(|e| format!("cannot parse {}: {}", path.display(), e))?;
-    models
-        .providers
-        .get("Yolo-Auto")
-        .and_then(|p| p.api_key.clone())
-        .ok_or_else(|| format!("no Yolo-Auto apiKey found in {}", path.display()))
+    if let Some(path) = omp_auth {
+        if let Some(key) = key_from_auth_file(path)? {
+            return Ok(key);
+        }
+    }
+    Err(missing_key_error(pi_auth, omp_auth))
 }
 
-fn pi_models_path() -> Res<PathBuf> {
-    env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".pi/agent/models.json"))
-        .map_err(|_| "HOME not set".to_string())
+fn missing_key_error(pi_auth: Option<&Path>, omp_auth: Option<&Path>) -> String {
+    let pi = pi_auth
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.pi/agent/auth.json".into());
+    let omp = omp_auth
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.omp/agent/auth.json".into());
+    format!(
+        "no z.ai API key found. Set $ZAI_API_KEY, or put an `{{\"type\":\"api_key\",\"key\":\"...\"}}` \
+entry at [\"zai-coding-cn\"][\"key\"] in {pi} or {omp}. \
+Using {DEFAULT_BASE_URL} (the plain API, not the coding-plan endpoint)."
+    )
+}
+
+fn key_from_auth_file(path: &Path) -> Res<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let v: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    let key = v
+        .get("zai-coding-cn")
+        .and_then(|e| e.get("key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(key)
+}
+
+pub fn guard_live_model(model: &str) -> Res<()> {
+    if model != LIVE_COMPLETION_MODEL {
+        return Err(format!(
+            "refusing to call `{model}`: only `{LIVE_COMPLETION_MODEL}` may be used for live \
+completions (other catalog models are expensive)"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,32 +160,27 @@ impl ChatMessage {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    /// Part of `completion_tokens` spent thinking, not in the visible answer.
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
 }
 
-/// One generation, with everything needed to judge whether the stop
-/// condition and length cap actually fired.
 #[derive(Clone, Debug)]
 pub struct Outcome {
-    /// `None` when the budget ran out before any visible token was produced.
     pub content: Option<String>,
     pub reasoning: Option<String>,
     pub finish_reason: Option<String>,
+    /// Model id the provider echoed (`glm-5.3-flash` live).
+    pub model: Option<String>,
     pub usage: Usage,
     pub raw: Value,
     pub latency_ms: u128,
 }
 
 impl Outcome {
-    /// True when the token budget cut generation off mid-thought, rather
-    /// than the model finishing on its own.
     pub fn truncated(&self) -> bool {
         matches!(self.finish_reason.as_deref(), Some("length"))
     }
 
-    /// True when a literal stop sequence ended generation early.
     pub fn stopped_by_sequence(&self) -> bool {
         matches!(self.finish_reason.as_deref(), Some("stop"))
     }
@@ -159,8 +190,9 @@ impl Outcome {
     }
 }
 
-/// Builds the request body. Kept separate from `chat` so `--show-request`
-/// and tests can inspect it without a network call.
+/// Builds the request body. Kept separate from `chat` so tests can inspect
+/// it without a network call. The agent decides *what* goes in; this just
+/// serializes the settings onto z.ai's parameter names.
 pub fn build_body(
     model: &str,
     settings: &Settings,
@@ -168,21 +200,36 @@ pub fn build_body(
     history: &[ChatMessage],
     schema: Option<&Value>,
 ) -> Value {
-    let mut messages = Vec::new();
+    let mut settings = settings.clone();
+    settings.clamp();
 
-    let budget_note = settings.budget_tokens.map(|n| format!(
-        "The entire generation, including reasoning and the final answer, has a hard budget of {n} tokens. Plan accordingly and finish the final answer before that limit; never stop mid-answer."
-    ));
-    let chars_note = settings
-        .max_chars
-        .map(|n| format!("Keep your entire final answer under {n} characters."));
+    let mut messages = Vec::new();
     let mut system = system.to_string();
-    for note in [budget_note, chars_note].into_iter().flatten() {
-        if system.is_empty() {
-            system = note;
-        } else {
-            system = format!("{system}\n\n{note}");
-        }
+
+    if let Some(n) = settings.max_tokens() {
+        let note = format!(
+            "The entire generation, including reasoning and the final answer, has a hard budget of {n} tokens. Plan accordingly and finish the final answer before that limit; never stop mid-answer."
+        );
+        append_system(&mut system, &note);
+    }
+    if let Some(n) = settings.max_chars {
+        append_system(
+            &mut system,
+            &format!("Keep your entire final answer under {n} characters."),
+        );
+    }
+    if settings.json_mode.enabled {
+        let schema = schema
+            .cloned()
+            .unwrap_or_else(|| settings.json_mode.schema.clone());
+        // Live: `response_format.json_schema` was HTTP 200 but not enforced
+        // (markdown fences + extra fields). Ask in the prompt instead.
+        append_system(
+            &mut system,
+            &format!(
+                "Reply with a single JSON object matching this schema, no markdown fences:\n{schema}"
+            ),
+        );
     }
     if !system.is_empty() {
         messages.push(json!({ "role": "system", "content": system }));
@@ -194,54 +241,44 @@ pub fn build_body(
     let mut body = json!({
         "model": model,
         "messages": messages,
+        // glm-5.3-flash: thinking.type only supports enabled (HTTP 400 / 1210
+        // if disabled). clear_thinking: false is the flash-doc recommendation.
+        "thinking": { "type": "enabled", "clear_thinking": false },
+        "reasoning_effort": settings.effort.wire(),
     });
-    let obj = body.as_object_mut().expect("object");
-
-    if settings.json_mode.enabled {
-        obj.insert(
-            "response_format".into(),
-            json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "answer",
-                    "strict": true,
-                    "schema": schema.cloned().unwrap_or(json!({ "type": "object" })),
-                }
-            }),
-        );
-    }
-
-    if let Some(n) = settings.budget_tokens {
-        obj.insert("max_tokens".into(), json!(n));
-    }
-    if !settings.stop.is_empty() {
-        obj.insert("stop".into(), json!(settings.stop));
-    }
-    if let Some(t) = settings.temperature {
-        obj.insert("temperature".into(), json!(t));
-    }
-    // Only sent when explicitly set: left alone, the provider applies its own
-    // truncation defaults, which is exactly what hides the effect of a high
-    // temperature (see README, "Temperature").
-    if let Some(p) = settings.top_p {
-        obj.insert("top_p".into(), json!(p));
-    }
-    if let Some(k) = settings.top_k {
-        obj.insert("top_k".into(), json!(k));
-    }
-
-    if !settings.thinking() {
-        // Two independent switches: the OpenAI-style one and the Qwen chat-template
-        // one. Both were verified live to zero out reasoning_tokens on this provider.
-        obj.insert("reasoning_effort".into(), json!("none"));
-        obj.insert(
-            "chat_template_kwargs".into(),
-            json!({ "enable_thinking": false }),
-        );
-    } else {
-        obj.insert("reasoning_effort".into(), json!(settings.effort.label()));
+    if let Some(obj) = body.as_object_mut() {
+        if settings.json_mode.enabled {
+            obj.insert(
+                "response_format".into(),
+                json!({ "type": "json_object" }),
+            );
+        }
+        if let Some(n) = settings.max_tokens() {
+            obj.insert("max_tokens".into(), json!(n));
+        }
+        if !settings.stop.is_empty() {
+            obj.insert("stop".into(), json!(settings.stop));
+        }
+        if let Some(t) = settings.temperature {
+            obj.insert("temperature".into(), json!(t));
+        }
+        if let Some(p) = settings.top_p {
+            obj.insert("top_p".into(), json!(p));
+        }
+        if let Some(k) = settings.top_k {
+            obj.insert("top_k".into(), json!(k));
+        }
     }
     body
+}
+
+fn append_system(system: &mut String, note: &str) {
+    if system.is_empty() {
+        *system = note.to_string();
+    } else {
+        system.push_str("\n\n");
+        system.push_str(note);
+    }
 }
 
 pub fn chat(
@@ -251,38 +288,33 @@ pub fn chat(
     history: &[ChatMessage],
     schema: Option<&Value>,
 ) -> Res<Outcome> {
-    let body = build_body(&ep.model, settings, system, history, schema);
-    let url = format!("{}/chat/completions", ep.base_url);
+    guard_live_model(&settings.model)?;
+    let body = build_body(&settings.model, settings, system, history, schema);
+    post_completion(ep, body)
+}
 
+fn post_completion(ep: &Endpoint, body: Value) -> Res<Outcome> {
+    let url = format!("{}/chat/completions", ep.base_url);
     let started = Instant::now();
     let resp = ureq::post(&url)
         .set("Authorization", &format!("Bearer {}", ep.api_key))
         .set("Content-Type", "application/json")
+        .set("Accept-Language", "en-US,en")
         .send_json(body);
     let latency_ms = started.elapsed().as_millis();
+    let raw = read_json_response(resp, &url)?;
+    parse_outcome(raw, latency_ms)
+}
 
-    let resp = match resp {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let detail = r.into_string().unwrap_or_default();
-            return Err(format!("HTTP {code} from {url}: {}", detail.trim()));
-        }
-        Err(e) => return Err(format!("request failed: {e}")),
-    };
-
-    let raw: Value = resp
-        .into_json()
-        .map_err(|e| format!("response was not JSON: {e}"))?;
-
+pub fn parse_outcome(raw: Value, latency_ms: u128) -> Res<Outcome> {
+    if let Some(err) = raw.get("error") {
+        return Err(format_error_value(err));
+    }
     let choice = raw
         .get("choices")
         .and_then(|c| c.get(0))
         .ok_or_else(|| format!("no choices in response: {raw}"))?;
     let message = choice.get("message");
-
-    // `content` is null whenever generation stopped before any visible token — a
-    // real case here, since both the token budget and stop sequences can fire
-    // while the model is still inside `reasoning_content`.
     let content = message
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
@@ -295,9 +327,24 @@ pub fn chat(
         .get("finish_reason")
         .and_then(|f| f.as_str())
         .map(str::to_string);
-
+    let model = raw
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
     let u = raw.get("usage");
-    let usage = Usage {
+    Ok(Outcome {
+        content,
+        reasoning,
+        finish_reason,
+        model,
+        usage: usage_from(u),
+        raw,
+        latency_ms,
+    })
+}
+
+fn usage_from(u: Option<&Value>) -> Usage {
+    Usage {
         prompt_tokens: field(u, "prompt_tokens"),
         completion_tokens: field(u, "completion_tokens"),
         reasoning_tokens: u
@@ -306,45 +353,64 @@ pub fn chat(
             .and_then(Value::as_u64)
             .unwrap_or_else(|| field(u, "reasoning_tokens")),
         total_tokens: field(u, "total_tokens"),
-    };
-
-    Ok(Outcome {
-        content,
-        reasoning,
-        finish_reason,
-        usage,
-        raw,
-        latency_ms,
-    })
+    }
 }
 
-/// A live chat-completion stream: pull visible-text deltas with `next_chunk`
-/// until it returns `Ok(None)`, then call `into_outcome` for the same
-/// `Outcome` shape `chat` returns (usage, finish_reason, full text) — the
-/// streaming and non-streaming paths converge there so callers downstream of
-/// "the reply is done" don't need to care which path produced it.
+pub fn format_http_error(code: u16, url: &str, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some(err) = v.get("error") {
+            return format!("HTTP {code} from {url}: {}", format_error_value(err));
+        }
+    }
+    format!("HTTP {code} from {url}: {}", body.trim())
+}
+
+fn format_error_value(err: &Value) -> String {
+    let msg = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match err.get("code") {
+        Some(Value::String(c)) if !c.is_empty() => format!("[{c}] {msg}"),
+        Some(Value::Number(n)) => format!("[{n}] {msg}"),
+        _ if !msg.is_empty() => msg.to_string(),
+        _ => err.to_string(),
+    }
+}
+
+fn read_json_response(resp: Result<ureq::Response, ureq::Error>, url: &str) -> Res<Value> {
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            return Err(format_http_error(code, url, &detail));
+        }
+        Err(e) => return Err(format!("request failed: {e}")),
+    };
+    resp.into_json()
+        .map_err(|e| format!("response was not JSON: {e}"))
+}
+
 pub struct ChatStream {
     lines: std::io::Lines<BufReader<Box<dyn Read + Send + Sync>>>,
     started: Instant,
     content: String,
     reasoning: String,
     finish_reason: Option<String>,
+    model: Option<String>,
     usage: Usage,
-    /// Set by the caller (e.g. the TUI on Esc) to stop consuming the stream;
-    /// checked between SSE lines so the read loop — and with it the
-    /// connection — ends promptly instead of draining the whole reply.
     cancel: Option<Arc<AtomicBool>>,
 }
 
 impl ChatStream {
-    /// Blocks until the next visible-content delta arrives, returning `None`
-    /// once the stream ends. Usage, `reasoning_content`, and `finish_reason`
-    /// are accumulated internally along the way and surface through
-    /// `into_outcome` — a caller updating a live view only ever needs the
-    /// text.
     pub fn next_chunk(&mut self) -> Res<Option<String>> {
         loop {
-            if self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
+            {
                 return Ok(None);
             }
             let Some(line) = self.lines.next() else {
@@ -361,17 +427,14 @@ impl ChatStream {
                 continue;
             };
 
+            if let Some(m) = chunk.get("model").and_then(Value::as_str) {
+                self.model = Some(m.to_string());
+            }
             if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
-                self.usage = Usage {
-                    prompt_tokens: field(Some(u), "prompt_tokens"),
-                    completion_tokens: field(Some(u), "completion_tokens"),
-                    reasoning_tokens: u
-                        .get("completion_tokens_details")
-                        .and_then(|d| d.get("reasoning_tokens"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or_else(|| field(Some(u), "reasoning_tokens")),
-                    total_tokens: field(Some(u), "total_tokens"),
-                };
+                self.usage = usage_from(Some(u));
+            }
+            if let Some(err) = chunk.get("error") {
+                return Err(format_error_value(err));
             }
 
             let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
@@ -398,14 +461,12 @@ impl ChatStream {
         }
     }
 
-    /// Everything accumulated so far, in the same shape `chat` returns —
-    /// callable after `next_chunk` returns `Ok(None)`, or early (e.g. after
-    /// a read error) to keep whatever text streamed in before the failure.
     pub fn into_outcome(self) -> Outcome {
         Outcome {
             content: (!self.content.is_empty()).then_some(self.content),
             reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
             finish_reason: self.finish_reason,
+            model: self.model,
             usage: self.usage,
             raw: Value::Null,
             latency_ms: self.started.elapsed().as_millis(),
@@ -413,13 +474,6 @@ impl ChatStream {
     }
 }
 
-/// Same request as `chat`, but with `stream: true` — returns a `ChatStream`
-/// to pull deltas from as they arrive over the wire, instead of blocking for
-/// the whole body. `schema` is unused by streaming replies today (JSON mode
-/// stays on the non-streaming path in the TUI, since flattening structured
-/// output only makes sense once it's complete) but kept for signature parity.
-/// `cancel`, when given, is polled between SSE lines: once set, `next_chunk`
-/// stops and the stream (and its connection) can be dropped by the caller.
 pub fn chat_stream(
     ep: &Endpoint,
     settings: &Settings,
@@ -428,34 +482,34 @@ pub fn chat_stream(
     schema: Option<&Value>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Res<ChatStream> {
-    let mut body = build_body(&ep.model, settings, system, history, schema);
-    let obj = body.as_object_mut().expect("object");
-    obj.insert("stream".into(), json!(true));
-    obj.insert("stream_options".into(), json!({ "include_usage": true }));
+    guard_live_model(&settings.model)?;
+    let mut body = build_body(&settings.model, settings, system, history, schema);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("stream".into(), json!(true));
+        obj.insert("stream_options".into(), json!({ "include_usage": true }));
+    }
     let url = format!("{}/chat/completions", ep.base_url);
-
     let started = Instant::now();
     let resp = ureq::post(&url)
         .set("Authorization", &format!("Bearer {}", ep.api_key))
         .set("Content-Type", "application/json")
+        .set("Accept-Language", "en-US,en")
         .send_json(body);
-
     let resp = match resp {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
             let detail = r.into_string().unwrap_or_default();
-            return Err(format!("HTTP {code} from {url}: {}", detail.trim()));
+            return Err(format_http_error(code, url.as_str(), &detail));
         }
         Err(e) => return Err(format!("request failed: {e}")),
     };
-
-    let lines = BufReader::new(resp.into_reader()).lines();
     Ok(ChatStream {
-        lines,
+        lines: BufReader::new(resp.into_reader()).lines(),
         started,
         content: String::new(),
         reasoning: String::new(),
         finish_reason: None,
+        model: None,
         usage: Usage::default(),
         cancel,
     })
@@ -463,9 +517,6 @@ pub fn chat_stream(
 
 #[cfg(test)]
 impl ChatStream {
-    /// Builds a stream over canned SSE bytes, bypassing the network — lets
-    /// `next_chunk`/`into_outcome` be tested against a captured real response
-    /// without a live endpoint.
     fn from_sse(data: &'static str) -> ChatStream {
         let reader: Box<dyn Read + Send + Sync> = Box::new(data.as_bytes());
         ChatStream {
@@ -474,6 +525,7 @@ impl ChatStream {
             content: String::new(),
             reasoning: String::new(),
             finish_reason: None,
+            model: None,
             usage: Usage::default(),
             cancel: None,
         }
@@ -486,9 +538,6 @@ fn field(v: Option<&Value>, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Applies the hard character cap client-side. Deterministic and independent
-/// of whatever the model actually did — this is what makes `max_chars` a real
-/// guarantee rather than a hint the model can ignore.
 pub fn enforce_max_chars(text: &str, max_chars: Option<usize>) -> (String, bool) {
     match max_chars {
         Some(n) if text.chars().count() > n => {
@@ -503,62 +552,91 @@ pub fn enforce_max_chars(text: &str, max_chars: Option<usize>) -> (String, bool)
 mod tests {
     use super::*;
     use crate::config::{Effort, Settings};
+    use std::io::Write;
+
+    fn body_for(settings: &Settings) -> Value {
+        build_body(
+            &settings.model,
+            settings,
+            &settings.system_prompt,
+            &[ChatMessage::user("hi")],
+            None,
+        )
+    }
 
     #[test]
-    fn token_budget_is_sent_and_explained_to_model() {
+    fn token_budget_is_sent_as_max_tokens() {
         let settings = Settings {
             budget_tokens: Some(8192),
             ..Settings::default()
         };
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
+        let body = body_for(&settings);
         assert_eq!(body["max_tokens"], 8192);
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("entire generation"));
         assert!(system.contains("8192 tokens"));
     }
 
     #[test]
-    fn effort_none_disables_thinking_switches() {
-        let settings = Settings::default(); // Effort::None
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
-        assert_eq!(body["reasoning_effort"], "none");
-        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
-    }
-
-    #[test]
-    fn effort_high_passes_through_without_forcing_thinking_off() {
-        let settings = Settings {
-            effort: Effort::High,
-            ..Settings::default()
-        };
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
-        assert_eq!(body["reasoning_effort"], "high");
+    fn thinking_is_always_enabled_with_legal_effort() {
+        let body = body_for(&Settings::default());
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["clear_thinking"], false);
+        assert_eq!(body["reasoning_effort"], "low");
         assert!(body.get("chat_template_kwargs").is_none());
     }
 
     #[test]
+    fn effort_max_is_sent_as_max() {
+        let settings = Settings {
+            effort: Effort::Max,
+            ..Settings::default()
+        };
+        let body = body_for(&settings);
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn legacy_none_and_medium_are_rewritten_before_the_wire() {
+        let none = Settings {
+            effort: Effort::None,
+            ..Settings::default()
+        };
+        assert_eq!(body_for(&none)["reasoning_effort"], "low");
+        let med = Settings {
+            effort: Effort::Medium,
+            ..Settings::default()
+        };
+        assert_eq!(body_for(&med)["reasoning_effort"], "high");
+    }
+
+    #[test]
     fn sampling_knobs_are_sent_only_when_set() {
-        let plain = build_body(
-            "model",
-            &Settings::default(),
-            "",
-            &[ChatMessage::user("hi")],
-            None,
-        );
+        let plain = body_for(&Settings::default());
         assert!(plain.get("temperature").is_none());
         assert!(plain.get("top_p").is_none());
         assert!(plain.get("top_k").is_none());
 
         let settings = Settings {
-            temperature: Some(1.2),
-            top_p: Some(1.0),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
             top_k: Some(-1),
             ..Settings::default()
         };
-        let body = build_body("model", &settings, "", &[ChatMessage::user("hi")], None);
-        assert!((body["temperature"].as_f64().unwrap() - 1.2).abs() < 1e-6);
-        assert_eq!(body["top_p"], 1.0);
+        let body = body_for(&settings);
+        assert!((body["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+        assert!((body["top_p"].as_f64().unwrap() - 0.95).abs() < 1e-5);
         assert_eq!(body["top_k"], -1);
+    }
+
+    #[test]
+    fn temperature_above_docs_range_is_clamped_not_sent_raw() {
+        let settings = Settings {
+            temperature: Some(2.0),
+            ..Settings::default()
+        };
+        let body = body_for(&settings);
+        assert!((body["temperature"].as_f64().unwrap() - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -569,12 +647,53 @@ mod tests {
             ChatMessage::assistant("reply"),
             ChatMessage::user("second"),
         ];
-        let body = build_body("model", &settings, "", &history, None);
+        let body = build_body("glm-5.3-flash", &settings, "", &history, None);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "first");
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[2]["content"], "second");
+    }
+
+    #[test]
+    fn default_system_prompt_is_the_first_message() {
+        let body = body_for(&Settings::default());
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(
+            body["messages"][0]["content"],
+            crate::config::DEFAULT_SYSTEM_PROMPT
+        );
+    }
+
+    #[test]
+    fn json_mode_sends_json_object_not_json_schema() {
+        let settings = Settings {
+            json_mode: crate::config::JsonMode {
+                enabled: true,
+                schema: json!({"type": "object"}),
+            },
+            ..Settings::default()
+        };
+        let schema = json!({"type": "object", "properties": {"title": {"type": "string"}}});
+        let body = build_body(
+            "glm-5.3-flash",
+            &settings,
+            "",
+            &[ChatMessage::user("hi")],
+            Some(&schema),
+        );
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert!(body["response_format"].get("json_schema").is_none());
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("title"));
+    }
+
+    #[test]
+    fn model_field_is_the_settings_model() {
+        let settings = Settings::default();
+        let body = build_body("glm-5.3-flash", &settings, "", &[ChatMessage::user("hi")], None);
+        assert_eq!(body["model"], "glm-5.3-flash");
     }
 
     #[test]
@@ -587,13 +706,124 @@ mod tests {
         assert!(!cut);
     }
 
-    /// Captured live from the Yolo-Auto endpoint (see AGENTS.md live
-    /// verification) with `reasoning_effort: "none"` — exercises the exact
-    /// wire shape `next_chunk`/`into_outcome` need to handle: an empty
-    /// role-priming delta, multi-token content deltas, a finish-only delta,
-    /// a usage-only trailing chunk with empty `choices`, then `[DONE]`.
+    #[test]
+    fn parse_outcome_reads_model_usage_and_reasoning() {
+        let raw = json!({
+            "model": "glm-5.3-flash",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "OK",
+                    "reasoning_content": "brief thought"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 19,
+                "completion_tokens": 19,
+                "total_tokens": 38,
+                "completion_tokens_details": { "reasoning_tokens": 16 }
+            }
+        });
+        let out = parse_outcome(raw, 12).unwrap();
+        assert_eq!(out.model.as_deref(), Some("glm-5.3-flash"));
+        assert_eq!(out.text(), "OK");
+        assert_eq!(out.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(out.usage.prompt_tokens, 19);
+        assert_eq!(out.usage.completion_tokens, 19);
+        assert_eq!(out.usage.reasoning_tokens, 16);
+        assert_eq!(out.usage.total_tokens, 38);
+        assert_eq!(out.reasoning.as_deref(), Some("brief thought"));
+        assert_eq!(out.raw["model"], "glm-5.3-flash");
+    }
+
+    #[test]
+    fn parse_outcome_surfaces_error_payloads() {
+        let raw = json!({
+            "error": { "code": "1210", "message": "This model always engages in thinking and cannot be disabled; please use low, high, or max" }
+        });
+        let err = parse_outcome(raw, 0).unwrap_err();
+        assert!(err.contains("1210"));
+        assert!(err.contains("cannot be disabled"));
+    }
+
+    #[test]
+    fn format_http_error_reads_z_ai_error_object() {
+        let body = r#"{"error":{"code":"1210","message":"please use low, high, or max"}}"#;
+        let s = format_http_error(400, "https://api.z.ai/api/paas/v4/chat/completions", body);
+        assert!(s.contains("HTTP 400"));
+        assert!(s.contains("1210"));
+        assert!(s.contains("please use low, high, or max"));
+    }
+
+    #[test]
+    fn guard_rejects_expensive_catalog_models() {
+        assert!(guard_live_model("glm-5.3-flash").is_ok());
+        let err = guard_live_model("glm-5.3").unwrap_err();
+        assert!(err.contains("glm-5.3-flash"));
+        assert!(err.contains("expensive"));
+    }
+
+    #[test]
+    fn key_env_wins_over_auth_files() {
+        let dir = std::env::temp_dir().join(format!("ask-key-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pi = dir.join("pi.json");
+        let mut f = fs::File::create(&pi).unwrap();
+        write!(f, r#"{{"zai-coding-cn":{{"type":"api_key","key":"from-file"}}}}"#).unwrap();
+        let key = resolve_api_key_from(Some("from-env"), Some(&pi), None).unwrap();
+        assert_eq!(key, "from-env");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_falls_through_pi_then_omp() {
+        let dir = std::env::temp_dir().join(format!("ask-key2-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pi = dir.join("pi.json");
+        let omp = dir.join("omp.json");
+        fs::write(&pi, "{}").unwrap();
+        fs::write(
+            &omp,
+            r#"{"zai-coding-cn":{"type":"api_key","key":"from-omp"}}"#,
+        )
+        .unwrap();
+        let key = resolve_api_key_from(None, Some(&pi), Some(&omp)).unwrap();
+        assert_eq!(key, "from-omp");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_missing_names_the_locations() {
+        let dir = std::env::temp_dir().join(format!("ask-key3-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pi = dir.join("missing-pi.json");
+        let omp = dir.join("missing-omp.json");
+        let err = resolve_api_key_from(None, Some(&pi), Some(&omp)).unwrap_err();
+        assert!(err.contains("ZAI_API_KEY"));
+        assert!(err.contains("zai-coding-cn"));
+        assert!(err.contains(&pi.display().to_string()));
+        assert!(err.contains(&omp.display().to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_env_key_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("ask-key4-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pi = dir.join("pi.json");
+        fs::write(
+            &pi,
+            r#"{"zai-coding-cn":{"type":"api_key","key":"from-pi"}}"#,
+        )
+        .unwrap();
+        let key = resolve_api_key_from(Some("  "), Some(&pi), None).unwrap();
+        assert_eq!(key, "from-pi");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     const SAMPLE_SSE: &str = concat!(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"content\":\"1\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"content\":\"\\n2\\n3\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null},\"finish_reason\":\"stop\"}]}\n\n",
@@ -618,6 +848,7 @@ mod tests {
         let outcome = stream.into_outcome();
         assert_eq!(outcome.text(), "1\n2\n3");
         assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(outcome.model.as_deref(), Some("glm-5.3-flash"));
         assert_eq!(outcome.usage.prompt_tokens, 25);
         assert_eq!(outcome.usage.completion_tokens, 10);
         assert_eq!(outcome.usage.total_tokens, 35);
@@ -637,33 +868,12 @@ mod tests {
     fn stream_cancel_flag_stops_the_read_loop() {
         let mut stream = ChatStream::from_sse(SAMPLE_SSE);
         stream.cancel = Some(Arc::new(AtomicBool::new(true)));
-        // Pre-set flag: the very first `next_chunk` call gives up without
-        // reading a single line, so the caller can drop the connection.
         assert_eq!(stream.next_chunk(), Ok(None));
     }
 
     #[test]
-    fn json_mode_sends_strict_schema() {
-        let settings = Settings {
-            json_mode: crate::config::JsonMode {
-                enabled: true,
-                schema: json!({"type": "object"}),
-            },
-            ..Settings::default()
-        };
-        let schema = json!({"type": "object", "properties": {"title": {"type": "string"}}});
-        let body = build_body(
-            "model",
-            &settings,
-            "",
-            &[ChatMessage::user("hi")],
-            Some(&schema),
-        );
-        assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
-        assert_eq!(
-            body["response_format"]["json_schema"]["schema"]["properties"]["title"]["type"],
-            "string"
-        );
+    fn coding_plan_base_is_not_the_default() {
+        assert_eq!(DEFAULT_BASE_URL, "https://api.z.ai/api/paas/v4");
+        assert!(!DEFAULT_BASE_URL.contains("/coding/"));
     }
 }

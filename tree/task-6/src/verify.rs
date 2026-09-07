@@ -13,7 +13,8 @@
 //! `finish_reason=stop` with a shorter, cut-off answer than the unconstrained
 //! run.
 
-use crate::api::{self, ChatMessage, Endpoint};
+use crate::agent::Agent;
+use crate::api::ChatMessage;
 use crate::config::{Res, Settings};
 
 pub const DEFAULT_PROMPT: &str =
@@ -68,7 +69,7 @@ impl VerifyReport {
     }
 }
 
-pub fn run(ep: &Endpoint, settings: &Settings, prompt: &str) -> Res<VerifyReport> {
+pub fn run(settings: &Settings, prompt: &str) -> Res<VerifyReport> {
     if settings.budget_tokens.is_none() && settings.stop.is_empty() {
         return Err(
             "no stop condition is configured — set a token budget or a stop sequence first \
@@ -85,24 +86,26 @@ pub fn run(ep: &Endpoint, settings: &Settings, prompt: &str) -> Res<VerifyReport
     let off_settings = on_settings.without_stop_condition();
     let history = vec![ChatMessage::user(prompt)];
 
-    let off_outcome = api::chat(ep, &off_settings, "", &history, None)?;
-    let on_outcome = api::chat(ep, &on_settings, "", &history, None)?;
+    let off_agent = Agent::new(off_settings)?;
+    let on_agent = Agent::new(on_settings)?;
+    let off_reply = off_agent.complete(&history)?;
+    let on_reply = on_agent.complete(&history)?;
 
-    let to_run = |label: &'static str, o: &api::Outcome| VerifyRun {
+    let to_run = |label: &'static str, r: &crate::agent::Reply| VerifyRun {
         label,
-        finish_reason: o.finish_reason.clone().unwrap_or_else(|| "?".into()),
-        chars: o.text().chars().count(),
-        completion_tokens: o.usage.completion_tokens,
-        reasoning_tokens: o.usage.reasoning_tokens,
-        text: o.text().to_string(),
+        finish_reason: r.finish_reason.clone().unwrap_or_else(|| "?".into()),
+        chars: r.text.chars().count(),
+        completion_tokens: r.usage.completion_tokens,
+        reasoning_tokens: r.usage.reasoning_tokens,
+        text: r.text.clone(),
     };
 
     Ok(VerifyReport {
         prompt: prompt.to_string(),
         budget_tokens: settings.budget_tokens,
         stop_configured: !settings.stop.is_empty(),
-        off: to_run("stop condition OFF", &off_outcome),
-        on: to_run("stop condition ON ", &on_outcome),
+        off: to_run("stop condition OFF", &off_reply),
+        on: to_run("stop condition ON ", &on_reply),
     })
 }
 
@@ -174,8 +177,7 @@ mod tests {
 
     #[test]
     fn run_refuses_when_nothing_is_configured() {
-        let ep = Endpoint::dummy();
-        let Err(err) = run(&ep, &Settings::default(), "hi") else {
+        let Err(err) = run(&Settings::default(), "hi") else {
             panic!("expected an error when no stop condition is configured");
         };
         assert!(err.contains("no stop condition is configured"));
