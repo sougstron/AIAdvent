@@ -5,9 +5,10 @@ use clap::Parser;
 use serde_json::Value;
 use std::io::{IsTerminal, Read};
 
-use crate::agent::Agent;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
+use crate::isolation;
 use crate::render;
+use crate::runtime::{BoxSpec, Runtime};
 use crate::session;
 use crate::verify;
 
@@ -85,6 +86,15 @@ pub struct Cli {
     /// Run the live z.ai lever proof (glm-5.3-flash only) and exit.
     #[arg(long, visible_alias = "verify-stop")]
     pub verify: bool,
+
+    /// Prove agent-box isolation: 100 boxes in one process, then a live
+    /// secret-token recall across separate sessions. Exits after printing.
+    #[arg(long, visible_alias = "verify-boxes")]
+    pub verify_isolation: bool,
+
+    /// With --verify-isolation, run only the checks that need no network.
+    #[arg(long)]
+    pub offline: bool,
 
     /// List saved chat sessions and exit.
     #[arg(long)]
@@ -182,6 +192,15 @@ pub fn run() -> Res<()> {
         return Ok(());
     }
 
+    if cli.verify_isolation {
+        let report = isolation::run(cli.offline)?;
+        print!("{}", report.render());
+        if !report.all_confirmed() {
+            return Err("isolation not fully confirmed".into());
+        }
+        return Ok(());
+    }
+
     let dir = session::sessions_dir();
     let loaded = if let Some(id) = cli.resume.as_deref() {
         Some(session::load_session(&dir, id)?)
@@ -199,28 +218,36 @@ pub fn run() -> Res<()> {
     one_shot(&cli, settings, &question, loaded)
 }
 
+/// The one-shot path runs through the multi-agent runtime rather than around
+/// it: one `Runtime`, one `AgentBox`, one turn. The box is what enforces the
+/// input/output policies and owns the session, so this path exercises the
+/// same code a hundred concurrent boxes would.
 fn one_shot(
     cli: &Cli,
     settings: Settings,
     question: &str,
     loaded: Option<session::Session>,
 ) -> Res<()> {
-    let mut agent = Agent::new(settings.clone())?;
-    let mut sess = if let Some(s) = loaded {
-        agent.resume(&s);
-        s
-    } else {
-        session::Session::new(agent.settings().clone())
+    let mut rt = Runtime::new()?;
+    let spec = BoxSpec::new("", settings.clone());
+    let id = match loaded {
+        Some(s) => rt.resume(&s.id, spec)?,
+        None => rt.spawn(spec),
     };
-    let reply = agent.ask(question)?;
+    let turn = rt.get_mut(&id).ok_or("box vanished")?.ask(question)?;
+
+    if let Some(why) = turn.refusal() {
+        return Err(why);
+    }
+    let reply = turn.reply.as_ref().ok_or("no reply on an accepted turn")?;
 
     if cli.raw {
         println!("{}", serde_json::to_string_pretty(&reply.raw).unwrap_or_default());
     } else {
         let (display, parse_note) = if settings.json_mode.enabled {
-            render::render_json_reply(&reply.text)
+            render::render_json_reply(&turn.text)
         } else {
-            (reply.text.clone(), None)
+            (turn.text.clone(), None)
         };
         if display.is_empty() {
             println!("(no content)");
@@ -237,6 +264,7 @@ fn one_shot(
 
     if !cli.quiet {
         let u = &reply.usage;
+        let b = rt.get(&id).ok_or("box vanished")?;
         eprintln!(
             "« model={}  finish={}  tokens: prompt={} completion={} (reasoning={}) total={}  {}ms  |  {}",
             if reply.model.is_empty() { "?" } else { &reply.model },
@@ -246,9 +274,9 @@ fn one_shot(
             u.reasoning_tokens,
             u.total_tokens,
             reply.latency_ms,
-            agent.settings().summary(),
+            b.settings().summary(),
         );
-        for f in agent.context_files() {
+        for f in b.context_files() {
             eprintln!(
                 "« context {}: {} ({} chars{})",
                 f.scope.as_str(),
@@ -267,15 +295,7 @@ fn one_shot(
     if let Some(r) = reply.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
         eprintln!("« reasoning: {} chars", r.trim().chars().count());
     }
-    sess.capture_from(
-        agent.settings(),
-        agent
-            .context_files()
-            .iter()
-            .map(|f| f.path.to_string_lossy().into_owned()),
-        agent.history(),
-    );
-    if let Err(e) = sess.save(&session::sessions_dir()) {
+    if let Err(e) = rt.close(&id) {
         eprintln!("warning: could not save session: {e}");
     }
     Ok(())

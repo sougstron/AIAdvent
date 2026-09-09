@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{ChatMessage, Role};
@@ -65,11 +66,17 @@ pub struct Session {
     pub context_files: Vec<String>,
 }
 
+/// Per-process counter that makes ids unique when many sessions are created
+/// inside the same second — the multi-agent case (see `runtime.rs`). Without
+/// it, `{secs}-{pid}` collides and boxes silently overwrite each other's file.
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl Session {
     pub fn new(settings: Settings) -> Session {
         let now = now_secs();
+        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
         Session {
-            id: format!("{now}-{:04x}", std::process::id() & 0xffff),
+            id: format!("{now}-{:04x}-{seq:x}", std::process::id() & 0xffff),
             title: "New chat".into(),
             created_at: now,
             updated_at: now,
@@ -353,6 +360,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::config::{Effort, DEFAULT_MODEL};
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -587,6 +595,27 @@ mod tests {
             sessions_dir_from(Some("/custom/sessions".into()), Some(home.display().to_string())),
             PathBuf::from("/custom/sessions")
         );
+    }
+
+    #[test]
+    fn many_sessions_in_one_process_get_distinct_ids() {
+        let ids: BTreeSet<String> = (0..100)
+            .map(|_| Session::new(Settings::default()).id)
+            .collect();
+        assert_eq!(ids.len(), 100, "session ids collided inside one process");
+        assert!(ids.iter().all(|id| is_safe_id(id)));
+    }
+
+    #[test]
+    fn distinct_ids_mean_distinct_files_on_disk() {
+        let dir = tmp_dir("hundred-files");
+        for i in 0..100 {
+            let mut s = Session::new(Settings::default());
+            s.push_user(format!("box {i}"));
+            s.save(&dir).unwrap();
+        }
+        assert_eq!(list_sessions(&dir).len(), 100);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
