@@ -40,6 +40,94 @@ CLI и TUI **не** ходят в HTTP сами. Они держат `Agent` и 
 Это и есть graded-требование: агент — объект разговора, а не обёртка над
 одним POST.
 
+## Коробка: `AgentBox` и `Runtime`
+
+`Agent` инкапсулирует *один* разговор. Чего он не давал — масштаба: и CLI, и
+TUI держали ровно один `Agent`, так что «100 агентов в одном инстансе аппки»
+жить было негде. `runtime.rs` — это место.
+
+```
+Runtime                     один на процесс, резолвит API-ключ ОДИН раз
+ ├─ AgentBox "alpha"        Agent + Session + InputPolicy + OutputPolicy + Judge?
+ ├─ AgentBox "beta"         …
+ └─ …                       боксы не делят ничего, кроме endpoint
+```
+
+Правило изоляции: **память — это только сессия**. Бокс гоняет
+`Agent::complete`, который не трогает собственную историю агента, поэтому на
+ходу N модель видит ровно то, что лежит в сессии этого бокса, и ничего из
+соседних. `close()` сохраняет сессию и выкидывает бокс из процесса,
+`resume(id)` поднимает её обратно с диска; другой id эту память не видит
+никогда.
+
+Один ход через бокс: **input policy → модель → output policy → judge →
+память**.
+
+* `InputPolicy` — лимит длины промпта, запрет пустого, чёрный список фраз,
+  префикс к каждому ходу. Отработка до сокета, поэтому отказ бесплатный.
+* `OutputPolicy` — жёсткий лимит символов (режет, а не отклоняет), запрет
+  пустого ответа, чёрный список фраз, требование валидного JSON. По умолчанию
+  наследуется из `Settings` (`max_chars`, `json_mode`).
+* `Judge` — трейт. `RuleJudge` офлайновый и детерминированный (пустой ответ,
+  ответ-эхо промпта). `ModelJudge` — вторая сетка со своим рубриком, ставит
+  0..10; её собственный разговор без истории, поэтому судья не может
+  протащить контекст одного бокса в другой.
+
+Ход, который завернула любая из трёх ступеней, **не попадает в историю**:
+память бокса содержит только то, что прошло политики. Отказ — это `Ok(Turn)` с
+`accepted() == false`, а не ошибка; `Err` означает, что упал транспорт.
+
+Задел под сабагентов — `Runtime::ask_many`: по одному ходу на каждый названный
+бокс, каждый в своём потоке. `ureq` блокирующий и потокобезопасный, так что N
+боксов дают N параллельных запросов; `AgentBox: Send` проверяется тестом.
+
+Кто чем пользуется сейчас: one-shot путь CLI идёт **через** рантайм (один
+`Runtime`, один бокс, один ход) — то есть та же дорога, по которой пошли бы сто
+боксов. TUI пока разговаривает с `Agent` напрямую; он уже устроен так же
+(`session` — память, `agent.set_history(session.history())` перед ходом), но
+формально на `Runtime` не переведён. Это следующий шаг, не этот.
+
+## Что показал `--verify-isolation`
+
+Тот же стандарт, что и `--verify`: засчитывается причинная подпись, а не «два
+текста отличаются». Подпись здесь — секретный токен.
+
+```sh
+./target/release/ask --verify-isolation            # структурная часть + live
+./target/release/ask --verify-isolation --offline  # только то, что без сети
+```
+
+Прогон 2026-09-09 на `glm-5.3-flash`:
+
+```
+== structural: 100 boxes in one process (offline) ==
+distinct ids=100/100  distinct session files=100/100
+cross-talk between boxes: 0
+resumed box recalled its own turns: true
+freshly spawned box saw nothing: true
+=> Confirmed
+
+== live: 4 boxes, one runtime, secret-token recall ==
+box-0    own=MARZIPAN prompt_tokens=96 turns=2 recalled=`MARZIPAN` foreign=[] => Confirmed
+box-1    own=OBSIDIAN prompt_tokens=96 turns=2 recalled=`OBSIDIAN` foreign=[] => Confirmed
+box-2    own=PELICAN  prompt_tokens=97 turns=2 recalled=`PELICAN`  foreign=[] => Confirmed
+control  own=-        prompt_tokens=70 turns=1 recalled=`NONE`     foreign=[] => Confirmed
+
+== live: close, drop, resume from disk ==
+token=MARZIPAN turns restored=2 recalled=`MARZIPAN` => Confirmed
+```
+
+Что здесь причинного, а не косметического: боксу *i* сказали токен *i* и
+больше ничего. Каждый вспомнил свой и **ни один не выдал чужой**; контрольный
+бокс, которому не говорили ничего, ответил `NONE`. `prompt_tokens` 96/96/97
+против 70 у контрольного — это разный контекст на проводе, а не просто разный
+текст ответа. Затем первый бокс закрыли, выкинули из процесса и подняли с
+диска — токен вернулся вместе с сессией.
+
+Отчёт честно различает три исхода: `Confirmed`, `Leaked` (бокс произнёс чужой
+токен — сессии делят память) и `Amnesiac` (не вспомнил свой — изоляция не
+опровергнута, но и не доказана). `Amnesiac` не выдаётся за успех.
+
 ## z.ai
 
 База — **plain** API, не coding-plan:
@@ -128,6 +216,11 @@ stop, temperature, top_p, top_k, system_prompt. Контекст туда не �
 `/new` и Ctrl-N начинают новый чат; `/sessions` — список и переключение;
 `/rename <title>` переименовывает. CLI: `--sessions`, `--resume ID`,
 `--continue`. Удаление в панели: `d` / Delete, подтверждение `y`/`n`.
+
+id сессии — `{unix_secs}-{pid:04x}-{seq:x}`. Хвост `seq` — процессный счётчик,
+и он не косметика: без него сто боксов, созданных в одну секунду в одном
+процессе, получали один и тот же id и **молча затирали файл друг друга**.
+Проверяется тестом `many_sessions_in_one_process_get_distinct_ids`.
 
 ## AGENTS.md
 
@@ -273,14 +366,16 @@ Temperature Confirmed только потому, что холодная сто�
 ## Состав
 
 ```
-src/main.rs     диспетчер
-src/cli.rs      clap, one-shot, --verify, --sessions/--resume/--continue
-src/agent.rs    сущность разговора: settings, history, context, ask/complete/stream
-src/api.rs      ключ, тело, POST/SSE, parse; без политики разговора
-src/config.rs   Settings, Effort, каталог моделей, клампы
-src/context.rs  discovery + сборка AGENTS.md / CLAUDE.md в system
-src/session.rs  ~/.ask6/sessions/*.json
-src/render.rs   flatten JSON-ответа («Key: value»), общий для CLI и TUI
-src/tui.rs      чат, панели, slash-команды, пикер модели
-src/verify.rs   живой self-test рычагов (glm-5.3-flash only)
+src/main.rs      диспетчер
+src/cli.rs       clap, one-shot (через Runtime), --verify, --verify-isolation, --sessions/--resume/--continue
+src/agent.rs     сущность разговора: settings, history, context, ask/complete/stream
+src/runtime.rs   коробка: AgentBox (agent+session+policies+judge) и Runtime на N боксов
+src/isolation.rs доказательство изоляции сессий: 100 боксов офлайн + live-отзыв токена
+src/api.rs       ключ, тело, POST/SSE, parse; без политики разговора
+src/config.rs    Settings, Effort, каталог моделей, клампы
+src/context.rs   discovery + сборка AGENTS.md / CLAUDE.md в system
+src/session.rs   ~/.ask6/sessions/*.json
+src/render.rs    flatten JSON-ответа («Key: value»), общий для CLI и TUI
+src/tui.rs       чат, панели, slash-команды, пикер модели
+src/verify.rs    живой self-test рычагов (glm-5.3-flash only)
 ```

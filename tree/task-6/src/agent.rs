@@ -63,14 +63,25 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(settings: Settings) -> Res<Agent> {
-        let mut settings = settings;
-        settings.clamp();
+        Ok(Agent::with_endpoint(Endpoint::resolve()?, settings))
+    }
+
+    /// Build an agent on an already-resolved endpoint. This is the constructor
+    /// the multi-agent runtime uses: resolving the key once and cloning the
+    /// endpoint keeps spawning N boxes off the filesystem N times.
+    pub fn with_endpoint(endpoint: Endpoint, settings: Settings) -> Agent {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
+        Agent::at(endpoint, cwd, home, settings)
+    }
+
+    fn at(endpoint: Endpoint, cwd: PathBuf, home: PathBuf, settings: Settings) -> Agent {
+        let mut settings = settings;
+        settings.clamp();
         let mut agent = Agent {
-            endpoint: Endpoint::resolve()?,
+            endpoint,
             settings,
             history: Vec::new(),
             cwd,
@@ -78,7 +89,7 @@ impl Agent {
             context: ContextBundle::empty(PathBuf::from(".")),
         };
         agent.refresh_context();
-        Ok(agent)
+        agent
     }
 
     #[cfg(test)]
@@ -101,18 +112,7 @@ impl Agent {
 
     #[cfg(test)]
     pub fn dummy_at(cwd: PathBuf, home: PathBuf, settings: Settings) -> Agent {
-        let mut settings = settings;
-        settings.clamp();
-        let mut agent = Agent {
-            endpoint: Endpoint::dummy(),
-            settings,
-            history: Vec::new(),
-            cwd,
-            home,
-            context: ContextBundle::empty(PathBuf::from(".")),
-        };
-        agent.refresh_context();
-        agent
+        Agent::at(Endpoint::dummy(), cwd, home, settings)
     }
 
     pub fn settings(&self) -> &Settings {
@@ -184,6 +184,13 @@ impl Agent {
 
     /// One-shot turn: append the user message, call the provider, append the
     /// assistant reply. On transport failure the user message is rolled back.
+    ///
+    /// This is the agent's own stateful API. The front-ends drive
+    /// `complete`/`stream` against an explicit history instead, because both
+    /// keep the conversation in a `Session` (see `runtime::AgentBox`) — but
+    /// the method stays: it is the shape "agent owns request and response"
+    /// that `Agent` exists to provide, and it is covered by tests below.
+    #[allow(dead_code)]
     pub fn ask(&mut self, prompt: &str) -> Res<Reply> {
         self.history.push(ChatMessage::user(prompt));
         match self.complete(&self.history.clone()) {

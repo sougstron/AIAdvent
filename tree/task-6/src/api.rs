@@ -27,13 +27,19 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Unusable for actual requests — tests that return before a call.
-    #[cfg(test)]
-    pub fn dummy() -> Endpoint {
+    /// Carries no key and points nowhere, so any request through it fails.
+    /// Used by code paths that must provably not reach the network — tests,
+    /// and the offline half of the isolation proof.
+    pub fn unusable() -> Endpoint {
         Endpoint {
             base_url: "http://unused.invalid".into(),
             api_key: String::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn dummy() -> Endpoint {
+        Endpoint::unusable()
     }
 
     pub fn resolve() -> Res<Endpoint> {
