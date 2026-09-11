@@ -36,7 +36,7 @@ Since task-6, personal provider keys (glm / deepseek / openrouter) are never
 baked into the app: `ask --login <provider>` live-checks a key against the
 provider and stores it in `~/.ask6/auth.json` (0600). `ask --keys` shows
 every provider's source, `ask --verify-login` rechecks them live. Resolution
-order: env var → `~/.ask6/auth.json`. Details: `tree/task-6/README.md`,
+order: env var → `~/.ask6/auth.json`. Details: `tree/task-7/README.md`,
 раздел «Логин».
 
 ## TUI smoke testing
@@ -57,15 +57,16 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-6/`.** It is a working agent: a ratatui
+**The active snapshot is `tree/task-7/`.** It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
 rest of the catalog is selectable but refused at send time because those
 ids cost money. Its `README.md` covers the Agent shape, key resolution,
 runtime settings, and the live lever self-test (temperature confirmed;
-top_p flat; top_k unsupported). `tree/task-5/` is the previous state
-(*Model Ladder*). Everything below in this file describes the older TUI
+top_p flat; top_k unsupported). It started as a verbatim copy of
+`tree/task-6/`, which is now frozen; `tree/task-5/` before that was the
+*Model Ladder* state. Everything below in this file describes the older TUI
 that still lives in the repo root `src/`.
 
 ## Layout
