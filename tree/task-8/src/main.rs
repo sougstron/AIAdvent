@@ -9,6 +9,7 @@ mod isolation;
 mod render;
 mod runtime;
 mod session;
+mod tokens;
 mod tui;
 mod verify;
 

@@ -19,59 +19,85 @@ pub struct CatalogModel {
     pub id: &'static str,
     pub provider: Provider,
     pub live: bool,
+    /// Context window in tokens — the denominator of the footer's context
+    /// meter. `None` means "nobody published one we checked", and the meter
+    /// renders `?` instead of inventing a limit.
+    pub context_window: Option<u64>,
 }
-const fn glm(id: &'static str, live: bool) -> CatalogModel {
-    CatalogModel { id, provider: Provider::Glm, live }
+const fn glm(id: &'static str, live: bool, ctx: u64) -> CatalogModel {
+    CatalogModel { id, provider: Provider::Glm, live, context_window: Some(ctx) }
+}
+const fn or(id: &'static str, live: bool, ctx: u64) -> CatalogModel {
+    CatalogModel { id, provider: Provider::OpenRouter, live, context_window: Some(ctx) }
 }
 
 pub const MODEL_CATALOG: &[CatalogModel] = &[
+    // Context windows (the footer's context meter divides by these):
+    // z.ai's own numbers where they are published for the direct API
+    // (`~/.pi/agent/models-store.json`, provider `zai-coding-cn`, read
+    // 2026-09-11); OpenRouter's `context_length` for the four glm ids z.ai
+    // does not list there (GET https://openrouter.ai/api/v1/models, same
+    // day). The two sources disagree for the same model (OpenRouter quotes
+    // 1310720 for glm-5.3-flash against z.ai's 1000000), so each id keeps the
+    // number from the API it is actually called through.
+    //
     // glm — GET https://api.z.ai/api/paas/v4/models on 2026-09-07
     // (10 ids, `object: list`). Only the flash tier is cheap enough to call.
-    glm("glm-4.5", false),
-    glm("glm-4.5-air", false),
-    glm("glm-4.6", false),
-    glm("glm-4.7", false),
-    glm("glm-5", false),
-    glm("glm-5-turbo", false),
-    glm("glm-5.1", false),
-    glm("glm-5.2", false),
-    glm("glm-5.3", false),
-    glm("glm-5.3-flash", true),
+    glm("glm-4.5", false, 131_072),
+    glm("glm-4.5-air", false, 131_072),
+    glm("glm-4.6", false, 204_800),
+    glm("glm-4.7", false, 204_800),
+    glm("glm-5", false, 204_800),
+    glm("glm-5-turbo", false, 200_000),
+    glm("glm-5.1", false, 200_000),
+    glm("glm-5.2", false, 1_000_000),
+    glm("glm-5.3", false, 1_000_000),
+    glm("glm-5.3-flash", true, 1_000_000),
     // deepseek — GET https://api.deepseek.com/models on 2026-09-11.
     // Both current models support thinking.type and reasoning_effort. Flash
     // is the inexpensive live tier; Pro remains selectable but is refused.
-    CatalogModel { id: "deepseek-flash", provider: Provider::DeepSeek, live: true },
-    CatalogModel { id: "deepseek-v4-pro", provider: Provider::DeepSeek, live: false },
+    // That endpoint returns ids only, no context window: the numbers below
+    // are OpenRouter's for the same two models (`deepseek/deepseek-v4-flash`,
+    // `deepseek/deepseek-v4-pro`), which is a second-hand figure — if the
+    // direct API ever disagrees, the meter is the thing to fix.
+    CatalogModel { id: "deepseek-flash", provider: Provider::DeepSeek, live: true, context_window: Some(1_024_000) },
+    CatalogModel { id: "deepseek-v4-pro", provider: Provider::DeepSeek, live: false, context_window: Some(1_024_000) },
     // openrouter — GET https://openrouter.ai/api/v1/models (public, no key)
     // on 2026-09-11: 439 ids, 19 ending in `:free`. The `:free` roster
     // churns weekly — `ask --models --live` diffs catalog against upstream.
     // Paid flagships are listed so the picker can show them as refused.
-    CatalogModel { id: "inclusionai/ling-3.0-flash-vl:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "nex-agi/nex-n2.5-mini:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "nex-agi/nex-n2.5-pro:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "inclusionai/ling-3.0-flash-sante:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "inclusionai/ling-3.0-flash-fin:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "dots-studio/dots-3-note-preview:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "liquid/lfm-2.5-2.6b:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "nvidia/nemotron-3.5-lightning:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "thinkingmachines/inkling-small:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "poolside/laguna-s-2.1:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "thinkingmachines/inkling:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "poolside/laguna-xs-2.1:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "cohere/north-mini-code:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "nvidia/nemotron-3.5-content-safety:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "nvidia/nemotron-3-ultra-550b-a55b:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "google/gemma-4-26b-a4b-it:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "google/gemma-4-31b-it:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "nvidia/nemotron-3-super-120b-a12b:free", provider: Provider::OpenRouter, live: true },
-    CatalogModel { id: "anthropic/claude-opus-5", provider: Provider::OpenRouter, live: false },
-    CatalogModel { id: "anthropic/claude-sonnet-5", provider: Provider::OpenRouter, live: false },
-    CatalogModel { id: "openai/gpt-5", provider: Provider::OpenRouter, live: false },
-    CatalogModel { id: "z-ai/glm-5.3", provider: Provider::OpenRouter, live: false },
-    CatalogModel { id: "deepseek/deepseek-v3.2", provider: Provider::OpenRouter, live: false },
-    CatalogModel { id: "meta-llama/llama-3.3-70b-instruct", provider: Provider::OpenRouter, live: false },
+    // Context windows are that response's `context_length`.
+    or("inclusionai/ling-3.0-flash-vl:free", true, 262_144),
+    or("nex-agi/nex-n2.5-mini:free", true, 262_144),
+    or("nex-agi/nex-n2.5-pro:free", true, 262_144),
+    or("inclusionai/ling-3.0-flash-sante:free", true, 262_144),
+    or("inclusionai/ling-3.0-flash-fin:free", true, 262_144),
+    or("dots-studio/dots-3-note-preview:free", true, 512_000),
+    or("liquid/lfm-2.5-2.6b:free", true, 65_536),
+    or("nvidia/nemotron-3.5-lightning:free", true, 1_000_000),
+    or("thinkingmachines/inkling-small:free", true, 1_048_576),
+    or("poolside/laguna-s-2.1:free", true, 262_144),
+    or("thinkingmachines/inkling:free", true, 1_048_576),
+    or("poolside/laguna-xs-2.1:free", true, 262_144),
+    or("cohere/north-mini-code:free", true, 256_000),
+    or("nvidia/nemotron-3.5-content-safety:free", true, 128_000),
+    or("nvidia/nemotron-3-ultra-550b-a55b:free", true, 1_000_000),
+    or("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", true, 256_000),
+    or("google/gemma-4-26b-a4b-it:free", true, 262_144),
+    or("google/gemma-4-31b-it:free", true, 262_144),
+    or("nvidia/nemotron-3-super-120b-a12b:free", true, 262_144),
+    or("anthropic/claude-opus-5", false, 1_000_000),
+    or("anthropic/claude-sonnet-5", false, 1_000_000),
+    or("openai/gpt-5", false, 400_000),
+    or("z-ai/glm-5.3", false, 1_310_720),
+    or("deepseek/deepseek-v3.2", false, 163_840),
+    or("meta-llama/llama-3.3-70b-instruct", false, 131_072),
 ];
+
+/// The model's context window in tokens, if the catalog knows one.
+pub fn context_window(model: &str) -> Option<u64> {
+    find_model(model).and_then(|m| m.context_window)
+}
 
 /// The catalog entry for `model`, if it exists. Distinct id strings are what
 /// makes provider routing sound: `glm-5.3` (z.ai direct) and `z-ai/glm-5.3`
