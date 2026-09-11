@@ -63,10 +63,8 @@ const COMMANDS: &[&str] = &[
     "context", "effort", "help", "json", "login", "max-tokens", "model", "new", "personas", "quit",
     "rename", "sessions", "settings", "stop", "system", "temp", "top-k", "top-p", "verify",
 ];
-/// Status line + key hints + the token meters.
-const FOOTER_HEIGHT: u16 = 3;
-/// Separator between the token meters, and the width of the one-column right
-/// margin the row keeps so the last meter is not flush against the edge.
+/// Status + key hints stay separate from the always-on token bar.
+const FOOTER_HEIGHT: u16 = 2;
 const STATS_SEP: &str = " \u{b7} ";
 const STATS_MARGIN: usize = 1;
 
@@ -1917,16 +1915,20 @@ impl App {
     fn draw(&self, f: &mut Frame) {
         let width = f.area().width;
         let input_height = self.input_box_height(width);
-        let [header, body, input, footer] = Layout::vertical([
+        let stats = self.token_stats();
+        let token_rows = stats_rows(&stats, width);
+        let [header, body, input, tokens, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(4),
             Constraint::Length(input_height),
+            Constraint::Length(token_rows.len() as u16),
             Constraint::Length(FOOTER_HEIGHT),
         ])
         .areas(f.area());
         self.draw_header(f, header);
         self.draw_transcript(f, body);
         self.draw_input(f, input, width);
+        self.draw_token_bar(f, tokens, token_rows);
         self.draw_footer(f, footer);
 
         if self.focus == Focus::Settings {
@@ -2138,10 +2140,12 @@ impl App {
     }
 
     /// The last-page scroll offset for given frame dimensions (kept separate
-    /// from `max_scroll` so `draw` can clamp without a terminal). Mirrors
-    /// the vertical layout in `draw`: header(1) + input + footer(2).
+    /// from `max_scroll` so `draw` can clamp without a terminal). Mirrors the
+    /// vertical layout in `draw`.
     fn max_scroll_for(&self, width: u16, height: u16) -> u16 {
-        let body_height = height.saturating_sub(1 + self.input_box_height(width) + 2);
+        let stats_height = stats_rows(&self.token_stats(), width).len() as u16;
+        let body_height =
+            height.saturating_sub(1 + self.input_box_height(width) + stats_height + FOOTER_HEIGHT);
         let inner_width = width.saturating_sub(2); // horizontal padding
         let total_lines =
             Paragraph::new(self.transcript_lines()).wrap(Wrap { trim: false }).line_count(inner_width) as u16;
@@ -2462,6 +2466,11 @@ impl App {
         ]
     }
 
+    fn draw_token_bar(&self, f: &mut Frame, area: Rect, rows: Vec<String>) {
+        let lines = rows.into_iter().map(|row| Line::styled(row, muted())).collect::<Vec<_>>();
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let keys = if self.spinner.is_some() {
             "Esc stop generation \u{b7} Ctrl-Q quit"
@@ -2474,7 +2483,6 @@ impl App {
             Paragraph::new(vec![
                 Line::styled(format!(" {}", self.status), accent()),
                 Line::styled(format!(" {keys}"), muted()),
-                Line::styled(stats_row(&self.token_stats(), area.width), muted()),
             ]),
             area,
         );
@@ -2509,23 +2517,40 @@ const HELP: &str = "\
 Esc while generating      stop the current generation (partial reply is kept)
 Ctrl-Q                    quit, even mid-generation";
 
-/// Right-aligns the token meters on the last footer row, dropping whole
-/// meters from the left when the terminal is too narrow for all four. The
-/// context meter is the last to go: it is the one with a ceiling in it.
-fn stats_row(stats: &[String], width: u16) -> String {
+/// Packs every token meter into a dedicated, right-aligned bar. Narrow
+/// terminals gain rows instead of silently losing request/session/context.
+fn stats_rows(stats: &[String], width: u16) -> Vec<String> {
     let room = (width as usize).saturating_sub(STATS_MARGIN);
-    let mut first = 0;
-    loop {
-        let text = stats[first..].join(STATS_SEP);
-        if text.chars().count() <= room {
-            let pad = room - text.chars().count();
-            return format!("{}{text} ", " ".repeat(pad));
-        }
-        first += 1;
-        if first >= stats.len() {
-            return String::new();
+    if room == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::<String>::new();
+    let mut current = String::new();
+    for stat in stats {
+        let added = if current.is_empty() {
+            stat.chars().count()
+        } else {
+            current.chars().count() + STATS_SEP.chars().count() + stat.chars().count()
+        };
+        if added > room && !current.is_empty() {
+            rows.push(right_aligned(current, room));
+            current = stat.clone();
+        } else {
+            if !current.is_empty() {
+                current.push_str(STATS_SEP);
+            }
+            current.push_str(stat);
         }
     }
+    if !current.is_empty() {
+        rows.push(right_aligned(current, room));
+    }
+    rows
+}
+
+fn right_aligned(text: String, room: usize) -> String {
+    let len = text.chars().count();
+    format!("{}{text} ", " ".repeat(room.saturating_sub(len)))
 }
 
 /// One transcript entry as styled lines: `marker` in the left margin of the
@@ -2855,23 +2880,39 @@ mod tests {
     }
 
     #[test]
-    fn stats_row_right_aligns_and_drops_meters_on_a_narrow_terminal() {
+    fn stats_rows_right_align_and_wrap_without_dropping_meters() {
         let stats: Vec<String> =
             ["req 1.2k~", "sess 8.4k", "last 512", "ctx 15k/1.0M (2%)"].iter().map(|s| s.to_string()).collect();
-        let wide = stats_row(&stats, 80);
-        assert_eq!(wide.chars().count(), 80);
-        assert!(wide.starts_with("   "));
-        assert!(wide.trim_end().ends_with("ctx 15k/1.0M (2%)"));
-        assert!(wide.contains("req 1.2k~"));
-        assert!(wide.ends_with(' '), "keeps a right margin");
+        let wide = stats_rows(&stats, 80);
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].chars().count(), 80);
+        assert!(wide[0].starts_with("   "));
+        assert!(wide[0].trim_end().ends_with("ctx 15k/1.0M (2%)"));
+        assert!(wide[0].contains("req 1.2k~"));
 
-        // 20 columns fit only the context meter — the one with the ceiling.
-        let narrow = stats_row(&stats, 20);
-        assert_eq!(narrow.chars().count(), 20);
-        assert_eq!(narrow.trim(), "ctx 15k/1.0M (2%)");
+        let narrow = stats_rows(&stats, 20);
+        assert!(narrow.len() > 1);
+        let rendered = narrow.join("\n");
+        for stat in &stats {
+            assert!(rendered.contains(stat), "missing {stat:?} from {rendered:?}");
+        }
+    }
 
-        // Narrower than even that: the row goes away rather than clipping.
-        assert_eq!(stats_row(&stats, 10), "");
+    #[test]
+    fn loaded_and_new_sessions_populate_the_always_on_stats() {
+        let settings = config::Settings::default();
+        let fresh = App::new(Agent::dummy(), settings.clone(), None);
+        assert_eq!(fresh.token_stats()[0], "req 0~");
+        assert!(fresh.token_stats()[1].starts_with("sess "));
+
+        let mut session = Session::new(settings.clone());
+        session.push_user("loaded question".into());
+        session.push_assistant("loaded answer".into());
+        let loaded = App::new(Agent::dummy(), settings, Some(session));
+        let stats = loaded.token_stats();
+        assert_ne!(stats[0], "req 0~");
+        assert_ne!(stats[1], fresh.token_stats()[1]);
+        assert!(stats[3].starts_with("ctx ") && !stats[3].starts_with("ctx 0"));
     }
 
     #[test]
