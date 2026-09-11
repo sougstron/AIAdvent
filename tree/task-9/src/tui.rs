@@ -24,6 +24,7 @@ use std::time::Duration;
 use crate::agent::Agent;
 use crate::api::{self, ChatMessage, Endpoint, Outcome};
 use crate::auth::{self, CheckResult, Provider};
+use crate::compress;
 use crate::config::{self, Effort, Res, Settings};
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
@@ -49,6 +50,7 @@ const SETTINGS_ROWS: &[&str] = &[
     "model",
     "effort",
     "json mode",
+    "compress",
     "max_chars",
     "budget_tokens",
     "stop",
@@ -60,7 +62,8 @@ const SETTINGS_ROWS: &[&str] = &[
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
 const COMMANDS: &[&str] = &[
-    "context", "effort", "help", "json", "login", "max-tokens", "model", "new", "personas", "quit",
+    "compress", "context", "effort", "help", "json", "login", "max-tokens", "model", "new",
+    "personas", "quit",
     "rename", "sessions", "settings", "stop", "system", "temp", "top-k", "top-p", "verify",
 ];
 /// Status + key hints stay separate from the always-on token bar.
@@ -753,6 +756,7 @@ impl App {
             .iter()
             .map(|f| f.path.to_string_lossy().into_owned())
             .collect();
+        s.compressor = self.agent.compressor().clone();
         if let Err(e) = s.save(&self.sessions_dir) {
             eprintln!("warning: could not save session: {e}");
         }
@@ -802,6 +806,7 @@ impl App {
             "model" => self.cmd_model(rest),
             "system" => self.cmd_system(rest),
             "context" => self.cmd_context(rest),
+            "compress" => self.cmd_compress(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
             "top-p" | "top_p" => self.cmd_top_p(rest),
             "top-k" | "top_k" => self.cmd_top_k(rest),
@@ -1467,6 +1472,84 @@ impl App {
         }
     }
 
+    /// `/compress [show|off|summary|keep N|every N]` — управление контекстом.
+    /// Та же переключалка, что и строка `compress` в настройках.
+    fn cmd_compress(&mut self, rest: &str) {
+        let rest = rest.trim();
+        let (head, tail) = match rest.split_once(char::is_whitespace) {
+            Some((h, t)) => (h, t.trim()),
+            None => (rest, ""),
+        };
+        match head {
+            "" | "show" | "status" => {
+                self.entries.push(Entry::Info(self.compression_listing()));
+            }
+            "keep" | "every" => {
+                match tail.parse::<usize>() {
+                    Ok(n) if n >= 1 => {
+                        if head == "keep" {
+                            self.settings.keep_recent = n;
+                        } else {
+                            self.settings.summarize_every = n;
+                        }
+                        self.settings.clamp();
+                        self.sync_agent_settings();
+                        self.status = self.compression_status();
+                    }
+                    _ => self.status = format!("usage: /compress {head} <число ≥ 1>"),
+                }
+            }
+            other => match config::ContextStrategy::parse(other) {
+                Ok(strategy) => {
+                    self.settings.context_strategy = strategy;
+                    self.agent.set_strategy(strategy);
+                    self.status = self.compression_status();
+                    self.entries.push(Entry::Info(self.compression_listing()));
+                }
+                Err(_) => {
+                    self.status = "usage: /compress [show|off|summary|keep N|every N]".into()
+                }
+            },
+        }
+    }
+
+    fn compression_status(&self) -> String {
+        self.agent
+            .compressor()
+            .status(self.settings.context_strategy, self.session.history().len())
+    }
+
+    fn compression_listing(&self) -> String {
+        let c = self.agent.compressor();
+        let history = self.session.history();
+        let mut lines = vec![
+            self.compression_status(),
+            format!(
+                "keep_recent={}  summarize_every={}",
+                self.settings.keep_recent, self.settings.summarize_every
+            ),
+            format!(
+                "на провод уходит {} из {} сообщений",
+                self.agent.wire_history(&history).len(),
+                history.len()
+            ),
+        ];
+        if c.is_empty() {
+            lines.push("summary ещё нет".into());
+        } else {
+            lines.push(String::new());
+            lines.push(c.summary().to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// Настройки живут в `App`, а сжатие считает `Agent` — то, что влияет на
+    /// свёртку, надо донести до агента до отправки хода.
+    fn sync_agent_settings(&mut self) {
+        *self.agent.settings_mut() = self.settings.clone();
+        self.agent.settings_mut().clamp();
+    }
+
     fn json_edit(&mut self, instruction: &str, terminal: &mut DefaultTerminal) {
         let system = format!(
             "You maintain a JSON Schema (draft-like: type/properties/required/additionalProperties). \
@@ -1660,6 +1743,13 @@ impl App {
             }
             "effort" => self.settings.effort = self.settings.effort.cycle(delta),
             "json mode" => self.settings.json_mode.enabled = !self.settings.json_mode.enabled,
+            // Переключалка стратегий управления контекстом. Сейчас два
+            // варианта (off / summary); новая стратегия появится здесь сама,
+            // как только её добавят в `ContextStrategy::ALL`.
+            "compress" => {
+                self.settings.context_strategy = self.settings.context_strategy.cycle(delta);
+                self.agent.set_strategy(self.settings.context_strategy);
+            }
             "max_chars" => {
                 self.settings.max_chars = cycle_choice(MAX_CHARS_CHOICES, self.settings.max_chars, delta)
             }
@@ -1686,12 +1776,54 @@ impl App {
         }
     }
 
+    /// Свёртка истории перед ходом. Это настоящий запрос к модели, поэтому
+    /// он идёт под спиннером и его можно отменить (Esc) — тогда ход просто
+    /// уйдёт с полной историей.
+    fn maintain_compression(&mut self, history: &[ChatMessage], terminal: &mut DefaultTerminal) {
+        self.sync_agent_settings();
+        if !self.settings.context_strategy.enabled() {
+            return;
+        }
+        let policy = compress::Policy::from_settings(&self.settings);
+        if self.agent.compressor().due(history.len(), policy).is_none() {
+            return;
+        }
+        let mut folding = self.prepared_agent();
+        let hist = history.to_vec();
+        let result = self.with_spinner(terminal, "сжимаю историю", move || {
+            folding.fold_history(&hist).map(|report| (folding, report))
+        });
+        match result {
+            Some(Ok((folded, Some(report)))) => {
+                // Свёртку делал клон агента (`prepared_agent`), поэтому новое
+                // summary надо забрать обратно в живой агент.
+                self.agent.set_compressor(folded.compressor().clone());
+                self.save_session();
+                self.status = format!(
+                    "история сжата: {} сообщений ({} симв.) → summary {} симв. (покрыто {}), свёртка стоила {} токенов",
+                    report.chunk_len,
+                    report.chunk_chars,
+                    report.summary_chars,
+                    report.covered,
+                    report.usage.total_tokens
+                );
+            }
+            Some(Ok((_, None))) => {}
+            Some(Err(e)) => self.status = format!("сжатие не удалось ({e}) — шлю полную историю"),
+            None => self.status = "сжатие отменено — шлю полную историю".into(),
+        }
+    }
+
     fn send_message(&mut self, question: String, terminal: &mut DefaultTerminal) {
         self.session.push_user(question.clone());
         self.entries.push(Entry::User(question));
         self.follow = true;
         self.agent.set_history(self.session.history());
         let history = self.agent.history().to_vec();
+        // Управление контекстом: свернуть отставшую часть истории до
+        // отправки хода. При `compress=off` это no-op без запроса; иначе на
+        // провод пойдёт `wire_history` — summary в system плюс хвост.
+        self.maintain_compression(&history, terminal);
         // Size of exactly what goes out, captured before the reply lands:
         // dividing it by the provider's `prompt_tokens` is what calibrates
         // the footer's estimates (see `tokens.rs`).
@@ -2025,6 +2157,22 @@ impl App {
         if s.json_mode.enabled {
             parts.push("json".into());
         }
+        // Сжатие показывается, только когда включено: «свёрнуто N/M» — самая
+        // короткая честная форма ответа на «что вообще уходит на провод».
+        if self.agent.strategy().enabled() {
+            let c = self.agent.compressor();
+            parts.push(if c.is_empty() {
+                format!("compress {}", self.agent.strategy())
+            } else {
+                format!(
+                    "compress {} {}/{} ({} свёрток)",
+                    self.agent.strategy(),
+                    c.covered(),
+                    self.session.history().len(),
+                    c.folds()
+                )
+            });
+        }
         if let Some(t) = s.temperature {
             parts.push(format!("temp {t}"));
         }
@@ -2209,6 +2357,16 @@ impl App {
                 _ => self.settings.effort.to_string(),
             },
             "json mode" => if self.settings.json_mode.enabled { "on" } else { "off" }.into(),
+            "compress" => match self.settings.context_strategy {
+                config::ContextStrategy::Off => "off  (вся история уходит на провод)".into(),
+                other => format!(
+                    "{other}  (последние {} как есть, summary каждые {}; свёрнуто {}/{})",
+                    self.settings.keep_recent,
+                    self.settings.summarize_every,
+                    self.agent.compressor().covered(),
+                    self.session.history().len()
+                ),
+            },
             "max_chars" => self.settings.max_chars.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
             "budget_tokens" => {
                 self.settings.budget_tokens.map(|n| n.to_string()).unwrap_or_else(|| "off".into())
@@ -2406,8 +2564,10 @@ impl App {
     }
 
     /// Size of the whole conversation as it would go out right now: the
-    /// assembled system prompt (system prompt + AGENTS.md context) plus every
-    /// stored message. This is the thing `prompt_tokens` is charged for.
+    /// assembled system prompt (system prompt + AGENTS.md context + the
+    /// running summary, if compression is on) plus every message that is
+    /// still sent verbatim. This is the thing `prompt_tokens` is charged for
+    /// — with `compress=summary` it stops growing with the whole transcript.
     fn conversation_shape(&self) -> Shape {
         let system = self.agent.system_for_request();
         let system_shape = if system.trim().is_empty() {
@@ -2415,8 +2575,11 @@ impl App {
         } else {
             Shape::new(system.chars().count(), 1)
         };
-        self.session
-            .history()
+        let history = self.session.history();
+        // Меряем то, что реально уйдёт на провод: при включённом сжатии это
+        // хвост после summary, а само summary уже сидит в `system` выше.
+        self.agent
+            .wire_history(&history)
             .iter()
             .fold(system_shape, |acc, m| acc.plus(Shape::new(m.content.chars().count(), 1)))
     }
@@ -2512,6 +2675,8 @@ const HELP: &str = "\
 /personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
 /personas a,b,c: <question>   same, with your own cast instead of the default three
 /context [show|on|off|reload]  AGENTS.md files in the system prompt
+/compress [show|off|summary]  history compression: keep the last N, summarize the rest
+/compress keep N | every N    how many messages stay verbatim / how often we fold
 /settings                 open the settings panel (Tab does the same)
 /quit                     exit
 Esc while generating      stop the current generation (partial reply is kept)
@@ -2946,6 +3111,66 @@ mod tests {
         app.adjust_setting(-1); // one step back from "off" is the "full" end
         assert_eq!(app.settings.top_k, Some(-1));
         assert_eq!(app.setting_value(top_k_row), "full");
+    }
+
+    #[test]
+    fn compress_row_toggles_between_the_two_strategies() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        let row = SETTINGS_ROWS.iter().position(|r| *r == "compress").unwrap();
+        assert!(app.setting_value(row).starts_with("off"));
+        app.settings_selected = row;
+        app.adjust_setting(1);
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Summary);
+        assert_eq!(app.agent.strategy(), config::ContextStrategy::Summary);
+        assert!(app.setting_value(row).starts_with("summary"));
+        // Два варианта — ещё шаг возвращает обратно в off.
+        app.adjust_setting(1);
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Off);
+    }
+
+    #[test]
+    fn slash_compress_switches_strategy_and_reports_state() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_compress("summary");
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Summary);
+        assert!(app.agent.strategy().enabled());
+        assert!(app.status.contains("compress=summary"));
+        app.cmd_compress("keep 3");
+        assert_eq!(app.settings.keep_recent, 3);
+        assert_eq!(app.agent.settings().keep_recent, 3);
+        app.cmd_compress("every 4");
+        assert_eq!(app.settings.summarize_every, 4);
+        app.cmd_compress("keep 0");
+        assert!(app.status.starts_with("usage:"), "{}", app.status);
+        assert_eq!(app.settings.keep_recent, 3, "битый аргумент ничего не меняет");
+        app.cmd_compress("off");
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Off);
+        app.cmd_compress("nonsense");
+        assert!(app.status.starts_with("usage:"));
+    }
+
+    /// Счётчик токенов должен мерить то, что уходит на провод: иначе футер
+    /// продолжит показывать полную историю, которую никто не отправлял.
+    #[test]
+    fn token_meter_follows_the_compressed_history() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        for i in 0..12 {
+            app.session.push_user(format!("сообщение пользователя {i}"));
+            app.session.push_assistant(format!("ответ ассистента {i}"));
+        }
+        let full = app.conversation_shape();
+        let mut c = compress::Compressor::new();
+        c.apply("короткая сводка".into(), 20, 4000);
+        app.agent.set_compressor(c);
+        // Стратегия ещё off — меряем по-прежнему всю историю.
+        assert_eq!(app.conversation_shape(), full);
+        app.cmd_compress("summary");
+        let compressed = app.conversation_shape();
+        assert!(
+            compressed.chars < full.chars,
+            "{compressed:?} должно быть меньше {full:?}"
+        );
+        assert_eq!(compressed.messages, full.messages - 20);
     }
 
     #[test]

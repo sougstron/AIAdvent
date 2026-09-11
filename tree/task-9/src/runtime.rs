@@ -455,6 +455,9 @@ pub struct AgentBox {
     judge: Option<Box<dyn Judge>>,
     turns: usize,
     refused: usize,
+    /// Сколько раз история сворачивалась в summary и во что это обошлось.
+    folds: usize,
+    fold_tokens: u64,
 }
 
 impl AgentBox {
@@ -474,6 +477,8 @@ impl AgentBox {
             judge: spec.judge,
             turns: 0,
             refused: 0,
+            folds: 0,
+            fold_tokens: 0,
         }
     }
 
@@ -483,6 +488,9 @@ impl AgentBox {
         // The session is the memory; the agent's own history stays empty so
         // there is exactly one place a turn can come from.
         agent.reset();
+        // ...but the running summary *is* session memory: `reset` drops it
+        // along with the history, so it goes back in after the wipe.
+        agent.set_compressor(session.compressor.clone());
         AgentBox {
             id: session.id.clone(),
             label: spec.label,
@@ -491,6 +499,8 @@ impl AgentBox {
             judge: spec.judge,
             turns: session.messages.iter().filter(|m| m.role == "user").count(),
             refused: 0,
+            folds: 0,
+            fold_tokens: 0,
             agent,
             session,
         }
@@ -545,6 +555,11 @@ impl AgentBox {
         self.refused
     }
 
+    /// Сколько свёрток истории сделал этот бокс и сколько токенов они стоили.
+    pub fn folds(&self) -> (usize, u64) {
+        (self.folds, self.fold_tokens)
+    }
+
     pub fn judge_name(&self) -> Option<&str> {
         self.judge.as_deref().map(Judge::name)
     }
@@ -592,6 +607,13 @@ impl AgentBox {
 
         let mut history = self.session.history();
         history.push(ChatMessage::user(sent.clone()));
+        // Управление контекстом: если накопился целый чанк, он сворачивается
+        // в summary до отправки хода, и на провод уходит уже сжатая история
+        // (`Agent::wire_history`). При стратегии `off` это no-op без запроса.
+        if let Some(fold) = self.agent.fold_history(&history)? {
+            self.folds += 1;
+            self.fold_tokens += fold.usage.total_tokens;
+        }
         let reply = self.agent.complete(&history)?;
 
         let (out_verdict, text) = self.output.apply(&reply.text);
@@ -639,6 +661,7 @@ impl AgentBox {
                 .iter()
                 .map(|f| f.path.to_string_lossy().into_owned()),
             &history,
+            self.agent.compressor(),
         );
         self.session.save(dir)
     }

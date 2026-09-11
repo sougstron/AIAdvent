@@ -33,6 +33,8 @@ use crate::verify;
         ask --verify-login                    live-recheck every configured key\n  \
         ask --verify                          prove z.ai levers with causal signatures\n  \
         ask --verify-billing                  show whether spend is metered or plan quota\n  \
+        ask --compress summary                history compression: keep the last N, summarize the rest\n  \
+        ask --verify-compress                 prove compression saves tokens without losing facts\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
         ask --continue                        resume the most recent session"
@@ -94,6 +96,25 @@ pub struct Cli {
     // `allow_hyphen_values` so `--top-k -1` reads as a value, not a flag.
     #[arg(long, allow_hyphen_values = true)]
     pub top_k: Option<i32>,
+
+    /// Context-management strategy: `off` (send the whole history) or
+    /// `summary` (keep the last --keep-recent messages verbatim, replace the
+    /// rest with a running summary).
+    #[arg(long, env = "ASK_COMPRESS", value_name = "STRATEGY")]
+    pub compress: Option<String>,
+
+    /// With --compress summary: how many recent messages stay verbatim.
+    #[arg(long, value_name = "N")]
+    pub keep_recent: Option<usize>,
+
+    /// With --compress summary: how many messages one summary fold covers.
+    #[arg(long, value_name = "N")]
+    pub summarize_every: Option<usize>,
+
+    /// Live proof that history compression saves tokens and keeps the facts
+    /// from the folded part. Exits after printing.
+    #[arg(long)]
+    pub verify_compress: bool,
 
     /// Check live whether spend goes to the metered API or the GLM Coding
     /// Plan subscription, print the verdict and exit.
@@ -233,6 +254,21 @@ impl Cli {
         if let Some(p) = self.top_p {
             s.top_p = Some(config::parse_top_p(p)?);
         }
+        if let Some(c) = &self.compress {
+            s.context_strategy = config::ContextStrategy::parse(c)?;
+        }
+        if let Some(n) = self.keep_recent {
+            if n == 0 {
+                return Err("--keep-recent must be at least 1".into());
+            }
+            s.keep_recent = n;
+        }
+        if let Some(n) = self.summarize_every {
+            if n == 0 {
+                return Err("--summarize-every must be at least 1".into());
+            }
+            s.summarize_every = n;
+        }
         if let Some(k) = self.top_k {
             if k == 0 || k < -1 {
                 return Err(format!("top_k must be -1 (off) or a positive count (got {k})"));
@@ -282,6 +318,18 @@ pub fn run() -> Res<()> {
     if cli.verify {
         let report = verify::run()?;
         println!("{}", report.render());
+        return Ok(());
+    }
+
+    if cli.verify_compress {
+        let report = verify::run_compression()?;
+        print!("{}", report.render());
+        if !report.confirmed() {
+            return Err(format!(
+                "compression not confirmed: {}",
+                report.status_line()
+            ));
+        }
         return Ok(());
     }
 

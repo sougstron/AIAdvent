@@ -3,6 +3,7 @@ mod api;
 mod auth;
 mod billing;
 mod cli;
+mod compress;
 mod config;
 mod context;
 mod isolation;

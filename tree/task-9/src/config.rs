@@ -133,6 +133,80 @@ pub fn catalog_error(model: &str) -> String {
     )
 }
 
+/// Стратегия управления контекстом — что уходит провайдеру вместо всей
+/// истории.
+///
+/// Переключатель намеренно сделан списком, а не булевым флагом: следующие
+/// стратегии сохранения контекста (окно по токенам, векторная память,
+/// иерархические summary) добавляются сюда новым вариантом, и вся обвязка —
+/// настройки TUI, `/compress`, `--compress`, сериализация сессии — начинает
+/// их видеть без изменений.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ContextStrategy {
+    /// История уходит целиком, как было до задачи 9.
+    #[default]
+    Off,
+    /// Последние N сообщений дословно, всё старше — одним summary.
+    Summary,
+}
+
+impl ContextStrategy {
+    /// Порядок в переключателе настроек.
+    pub const ALL: [ContextStrategy; 2] = [ContextStrategy::Off, ContextStrategy::Summary];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContextStrategy::Off => "off",
+            ContextStrategy::Summary => "summary",
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        self != ContextStrategy::Off
+    }
+
+    pub fn parse(s: &str) -> Res<ContextStrategy> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "full" => Ok(ContextStrategy::Off),
+            "summary" | "on" | "compress" => Ok(ContextStrategy::Summary),
+            other => Err(format!(
+                "unknown context strategy `{other}`; expected one of: {}",
+                ContextStrategy::ALL
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Шаг по списку стрелками в настройках.
+    pub fn cycle(self, delta: i32) -> ContextStrategy {
+        let all = ContextStrategy::ALL;
+        let idx = all.iter().position(|s| *s == self).unwrap_or(0) as i32;
+        all[(idx + delta).rem_euclid(all.len() as i32) as usize]
+    }
+}
+
+impl fmt::Display for ContextStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Сколько последних сообщений стратегия `summary` держит дословно.
+pub const DEFAULT_KEEP_RECENT: usize = 6;
+/// Размер чанка свёртки: summary обновляется каждые столько сообщений.
+pub const DEFAULT_SUMMARIZE_EVERY: usize = 10;
+
+fn default_keep_recent() -> usize {
+    DEFAULT_KEEP_RECENT
+}
+
+fn default_summarize_every() -> usize {
+    DEFAULT_SUMMARIZE_EVERY
+}
+
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Ты — полезный ассистент. Отвечай ясно и по делу.";
 
 /// Documented z.ai range for `temperature` is `[0.0, 1.0]`. Live, 1.5 and 2.0
@@ -288,6 +362,17 @@ pub struct Settings {
     /// into the system message. Toggled at runtime via `set_context_enabled`.
     #[serde(default = "default_context_enabled")]
     pub context_enabled: bool,
+    /// Стратегия сжатия истории. `Off` — старое поведение (вся история на
+    /// провод), `Summary` — последние [`Settings::keep_recent`] сообщений
+    /// дословно плюс бегущее summary (см. `compress.rs`).
+    #[serde(default)]
+    pub context_strategy: ContextStrategy,
+    /// Сколько последних сообщений стратегия `summary` не трогает.
+    #[serde(default = "default_keep_recent")]
+    pub keep_recent: usize,
+    /// Как часто (в сообщениях) обновляется summary.
+    #[serde(default = "default_summarize_every")]
+    pub summarize_every: usize,
     pub effort: Effort,
     pub json_mode: JsonMode,
     /// Hard character cap on the *visible* answer. Enforced twice: as a
@@ -347,6 +432,9 @@ impl Default for Settings {
             model: default_model(),
             system_prompt: default_system_prompt(),
             context_enabled: true,
+            context_strategy: ContextStrategy::default(),
+            keep_recent: DEFAULT_KEEP_RECENT,
+            summarize_every: DEFAULT_SUMMARIZE_EVERY,
             effort: Effort::Low,
             json_mode: JsonMode::default(),
             max_chars: None,
@@ -398,6 +486,10 @@ impl Settings {
         if self.stop.len() > 4 {
             self.stop.truncate(4);
         }
+        // Ноль превратил бы «держим последние N» в «держим ничего», а чанк
+        // нулевого размера — в бесконечную свёртку на месте.
+        self.keep_recent = self.keep_recent.clamp(1, 200);
+        self.summarize_every = self.summarize_every.clamp(1, 200);
     }
 
     pub fn summary(&self) -> String {
@@ -417,6 +509,13 @@ impl Settings {
             "context={}",
             if self.context_enabled { "on" } else { "off" }
         ));
+        parts.push(match self.context_strategy {
+            ContextStrategy::Off => "compress=off".into(),
+            other => format!(
+                "compress={other}(keep={},every={})",
+                self.keep_recent, self.summarize_every
+            ),
+        });
         parts.push(match self.max_chars {
             Some(n) => format!("max_chars={n}"),
             None => "max_chars=off".into(),
@@ -492,6 +591,49 @@ pub fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_strategy_parses_cycles_and_defaults_to_off() {
+        assert_eq!(ContextStrategy::default(), ContextStrategy::Off);
+        assert!(!ContextStrategy::Off.enabled());
+        assert!(ContextStrategy::Summary.enabled());
+        for s in ContextStrategy::ALL {
+            assert_eq!(ContextStrategy::parse(s.label()).unwrap(), s);
+            // Полный круг по переключателю возвращает на место.
+            assert_eq!(s.cycle(1).cycle(-1), s);
+            assert_eq!(s.cycle(ContextStrategy::ALL.len() as i32), s);
+        }
+        assert_eq!(ContextStrategy::parse("ON").unwrap(), ContextStrategy::Summary);
+        assert!(ContextStrategy::parse("vector-memory").is_err());
+    }
+
+    #[test]
+    fn clamp_keeps_the_compression_policy_usable() {
+        let mut s = Settings {
+            keep_recent: 0,
+            summarize_every: 0,
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.keep_recent, 1);
+        assert_eq!(s.summarize_every, 1);
+        let mut s = Settings {
+            keep_recent: 10_000,
+            summarize_every: 10_000,
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.keep_recent, 200);
+        assert_eq!(s.summarize_every, 200);
+    }
+
+    #[test]
+    fn summary_line_shows_the_compression_strategy() {
+        let mut s = Settings::default();
+        assert!(s.summary().contains("compress=off"));
+        s.context_strategy = ContextStrategy::Summary;
+        assert!(s.summary().contains("compress=summary(keep=6,every=10)"));
+    }
 
     #[test]
     fn effort_cycles_real_wire_values() {
