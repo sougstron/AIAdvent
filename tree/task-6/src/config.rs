@@ -37,11 +37,11 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
     glm("glm-5.2", false),
     glm("glm-5.3", false),
     glm("glm-5.3-flash", true),
-    // deepseek — from docs, not live-listed; no key available 2026-09-11.
-    // `GET https://api.deepseek.com/models` needs a key (it answers
-    // "Authentication Fails" without one). Reasoning is chosen by model id.
-    CatalogModel { id: "deepseek-chat", provider: Provider::DeepSeek, live: true },
-    CatalogModel { id: "deepseek-reasoner", provider: Provider::DeepSeek, live: false },
+    // deepseek — GET https://api.deepseek.com/models on 2026-09-11.
+    // Both current models support thinking.type and reasoning_effort. Flash
+    // is the inexpensive live tier; Pro remains selectable but is refused.
+    CatalogModel { id: "deepseek-flash", provider: Provider::DeepSeek, live: true },
+    CatalogModel { id: "deepseek-v4-pro", provider: Provider::DeepSeek, live: false },
     // openrouter — GET https://openrouter.ai/api/v1/models (public, no key)
     // on 2026-09-11: 439 ids, 19 ending in `:free`. The `:free` roster
     // churns weekly — `ask --models --live` diffs catalog against upstream.
@@ -125,21 +125,20 @@ pub const MAX_TOKENS_MAX: u32 = 131_072;
 
 /// Reasoning effort sent as `reasoning_effort`.
 ///
-/// Live against `glm-5.3-flash` (HTTP 400, error code 1210):
-/// `thinking.type: disabled`, `reasoning_effort: none`, and
-/// `reasoning_effort: medium` are all rejected with
-/// "This model always engages in thinking and cannot be disabled;
-/// please use low, high, or max".
+/// Both glm and DeepSeek accept low/high/max. Live against
+/// `glm-5.3-flash`, `none` and `medium` are rejected (HTTP 400 / 1210);
+/// DeepSeek accepts compatibility aliases, but the common picker exposes the
+/// three values supported by both providers.
 ///
 /// `None` / `Medium` stay in the enum so older saved sessions still
-/// deserialize; [`Effort::wire`] maps them onto a legal value.
+/// deserialize; [`Effort::wire`] maps them onto a legal common value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Effort {
-    /// Saved-session / `/effort none` alias — cannot actually disable thinking.
+    /// Saved-session / `/effort none` alias.
     None,
     #[default]
     Low,
-    /// Saved-session / `/effort medium` alias — the API rejects `medium`.
+    /// Saved-session / `/effort medium` alias.
     Medium,
     High,
     Max,
@@ -175,7 +174,7 @@ impl Effort {
             "high" => Ok(Effort::High),
             "max" => Ok(Effort::Max),
             other => Err(format!(
-                "unknown effort `{other}` (low|high|max; none/medium are aliases — glm-5.3-flash rejects them)"
+                "unknown effort `{other}` (low|high|max; none/medium are compatibility aliases)"
             )),
         }
     }
@@ -573,7 +572,7 @@ mod tests {
     #[test]
     fn provider_of_routes_each_provider_block() {
         assert_eq!(provider_of("glm-5.3-flash"), Some(Provider::Glm));
-        assert_eq!(provider_of("deepseek-chat"), Some(Provider::DeepSeek));
+        assert_eq!(provider_of("deepseek-flash"), Some(Provider::DeepSeek));
         assert_eq!(provider_of("nvidia/nemotron-3.5-lightning:free"), Some(Provider::OpenRouter));
         // Distinct strings: z.ai direct vs OpenRouter alias.
         assert_eq!(provider_of("glm-5.3"), Some(Provider::Glm));
@@ -589,7 +588,7 @@ mod tests {
         assert!(!glm_only.iter().any(|id| id.contains(':') || id.starts_with("deepseek")));
         let with_or = available_ids(&[Provider::Glm, Provider::OpenRouter]);
         assert!(with_or.contains(&"google/gemma-4-31b-it:free"));
-        assert!(!with_or.contains(&"deepseek-chat"));
+        assert!(!with_or.contains(&"deepseek-flash"));
         let all = available_models(&Provider::ALL);
         assert_eq!(all.len(), MODEL_CATALOG.len());
     }

@@ -184,9 +184,9 @@ endpoint этой площадки (`Endpoint::for_model`).
 
 - **glm** (`GET https://api.z.ai/api/paas/v4/models`, 2026-09-07): 10 id.
   Live только `glm-5.3-flash`. Остальные выбираются, на отправке отказ.
-- **deepseek** — из документации, не live-listed (на машине не было ключа
-  2026-09-11; `GET https://api.deepseek.com/models` без ключа отвечает
-  `Authentication Fails`): `deepseek-chat` (live), `deepseek-reasoner` (paid).
+- **deepseek** (`GET https://api.deepseek.com/models`, 2026-09-11): два id —
+  `deepseek-flash` (live) и `deepseek-v4-pro` (paid, выбирается, но на
+  отправке отказ).
 - **openrouter** (`GET https://openrouter.ai/api/v1/models`, публично,
   2026-09-11): 439 id, из них 19 `:free`. В каталоге — эти 19 (`live`) плюс
   шесть платных флагманов (`anthropic/claude-opus-5`, `anthropic/claude-sonnet-5`,
@@ -195,7 +195,8 @@ endpoint этой площадки (`Endpoint::for_model`).
   `ask --models --live` показывает дрифт, каталог сам не правится.
 
 Деньги: `api::guard_live_model` — единственное правило live-вызова; поле
-`CatalogModel::live` с ним сверяет тест. `/effort` на проводе только у glm.
+`CatalogModel::live` с ним сверяет тест. `/effort` и reasoning-плашка
+работают для обеих прямых площадок: glm и каждой модели DeepSeek.
 
 **Что значит вердикт.** «Подключено» пишется только когда провайдер ответил
 данными, выведенными из этого ключа (`Confirmed`): openrouter — `GET /key`
@@ -298,10 +299,10 @@ cargo build --release --manifest-path tree/task-6/Cargo.toml
 
 | рычаг | где | на проводе | диапазон / заметка |
 |---|---|---|---|
-| `model` | `/model`, settings, `--model` | `model` | каталог площадки, если есть ключ; live: glm-5.3-flash / deepseek-chat / `:free` |
+| `model` | `/model`, settings, `--model` | `model` | каталог площадки, если есть ключ; live: glm-5.3-flash / deepseek-flash / `:free` |
 | `system_prompt` | `/system`, settings | `role: system` | дефолт: «Ты — полезный ассистент…» |
 | `context_enabled` | `/context on\|off` | файлы в system | по умолчанию on |
-| `effort` | `/effort`, settings, `--effort` | `reasoning_effort` | на проводе только `low`/`high`/`max` |
+| `effort` | `/effort`, settings, `--effort` | `thinking` + `reasoning_effort` | glm и обе модели DeepSeek; `low`/`high`/`max` |
 | `json_mode` | `/json …` | `response_format: json_object` + подсказка в system | schema — hint, не гарантия |
 | `max_chars` | settings, `--max-chars` | hint + клиентский truncate | гарантия на видимый ответ |
 | `budget_tokens` | `/max-tokens`, settings, `--budget-tokens` / `--max-tokens` | `max_tokens` | 1…131072; reasoning + visible |

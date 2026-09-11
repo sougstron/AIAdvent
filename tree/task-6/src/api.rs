@@ -66,7 +66,7 @@ impl Endpoint {
         })
     }
 
-    /// Resolves the endpoint that owns `model` — how `--model deepseek-chat`
+    /// Resolves the endpoint that owns `model` — how `--model deepseek-flash`
     /// actually reaches DeepSeek. Unknown ids get the same error `--model`
     /// produces; a known id whose provider has no key errors like any
     /// unresolved provider.
@@ -85,19 +85,19 @@ pub fn is_live_model(provider: Provider, model: &str) -> bool {
 }
 
 
-/// Per-provider money guard: the one model tier that may be called live.
-/// glm: only the flash tier; deepseek: only the chat tier; openrouter: only
-/// `:free` ids. Everything else stays selectable but is refused at send time.
+/// Per-provider money guard: glm and DeepSeek permit their flash tiers;
+/// OpenRouter permits `:free` ids. Everything else stays selectable but is
+/// refused at send time.
 pub fn guard_live_model(provider: Provider, model: &str) -> Res<()> {
     let allowed = match provider {
         Provider::Glm => model == LIVE_COMPLETION_MODEL,
-        Provider::DeepSeek => model == "deepseek-chat",
+        Provider::DeepSeek => model == "deepseek-flash",
         Provider::OpenRouter => model.ends_with(":free"),
     };
     if !allowed {
         let what = match provider {
             Provider::Glm => format!("only `{LIVE_COMPLETION_MODEL}`"),
-            Provider::DeepSeek => "only `deepseek-chat`".to_string(),
+            Provider::DeepSeek => "only `deepseek-flash`".to_string(),
             Provider::OpenRouter => "only ids ending in `:free`".to_string(),
         };
         return Err(format!(
@@ -205,11 +205,9 @@ impl Outcome {
 
 /// Builds the request body. Kept separate from `chat` so tests can inspect
 /// it without a network call. The agent decides *what* goes in; this just
-/// serializes the settings onto the provider's parameter names. `provider`
-/// gates the glm-specific fields: `thinking` and `reasoning_effort` are
-/// z.ai-only (glm-5.3-flash, HTTP 400 / 1210) — DeepSeek picks reasoning by
-/// model id, and OpenRouter's own `reasoning` block is deliberately not
-/// invented here.
+/// serializes the settings onto the provider's parameter names. glm and
+/// DeepSeek both accept `thinking` and `reasoning_effort`; OpenRouter's own
+/// `reasoning` block is deliberately not invented here.
 pub fn build_body(
     provider: Provider,
     model: &str,
@@ -260,13 +258,16 @@ pub fn build_body(
         "model": model,
         "messages": messages,
     });
-    if provider == Provider::Glm {
+    if matches!(provider, Provider::Glm | Provider::DeepSeek) {
         if let Some(obj) = body.as_object_mut() {
-            // glm-5.3-flash: thinking.type only supports enabled (HTTP 400 /
-            // 1210 if disabled). clear_thinking: false is the flash-doc
-            // recommendation. glm-only fields — DeepSeek/OpenRouter would
-            // reject or silently misread them.
-            obj.insert("thinking".into(), json!({ "type": "enabled", "clear_thinking": false }));
+            let thinking = if provider == Provider::Glm {
+                // glm-5.3-flash documents clear_thinking and cannot disable
+                // thinking. DeepSeek accepts only the portable `type` field.
+                json!({ "type": "enabled", "clear_thinking": false })
+            } else {
+                json!({ "type": "enabled" })
+            };
+            obj.insert("thinking".into(), thinking);
             obj.insert("reasoning_effort".into(), json!(settings.effort.wire()));
         }
     }
@@ -589,19 +590,20 @@ mod tests {
     }
 
     #[test]
-    fn glm_thinking_fields_are_absent_for_other_providers() {
+    fn thinking_fields_are_sent_to_both_direct_providers() {
         let settings = Settings::default();
         let ds = build_body(
             Provider::DeepSeek,
-            "deepseek-chat",
+            "deepseek-flash",
             &settings,
             "",
             &[ChatMessage::user("hi")],
             None,
         );
-        assert!(ds.get("thinking").is_none(), "deepseek must not receive a glm thinking block");
-        assert!(ds.get("reasoning_effort").is_none());
-        assert_eq!(ds["model"], "deepseek-chat");
+        assert_eq!(ds["thinking"]["type"], "enabled");
+        assert!(ds["thinking"].get("clear_thinking").is_none());
+        assert_eq!(ds["reasoning_effort"], "low");
+        assert_eq!(ds["model"], "deepseek-flash");
 
         let or = build_body(
             Provider::OpenRouter,
@@ -613,9 +615,10 @@ mod tests {
         );
         assert!(or.get("thinking").is_none());
         assert!(or.get("reasoning_effort").is_none());
-        // The glm body keeps both — the 1210 contract.
+
         let glm = body_for(&settings);
         assert_eq!(glm["thinking"]["type"], "enabled");
+        assert_eq!(glm["thinking"]["clear_thinking"], false);
         assert!(glm.get("reasoning_effort").is_some());
     }
 
@@ -822,9 +825,9 @@ mod tests {
 
     #[test]
     fn guard_is_provider_specific() {
-        assert!(guard_live_model(Provider::DeepSeek, "deepseek-chat").is_ok());
-        let err = guard_live_model(Provider::DeepSeek, "deepseek-reasoner").unwrap_err();
-        assert!(err.contains("deepseek-chat"));
+        assert!(guard_live_model(Provider::DeepSeek, "deepseek-flash").is_ok());
+        let err = guard_live_model(Provider::DeepSeek, "deepseek-v4-pro").unwrap_err();
+        assert!(err.contains("deepseek-flash"));
         assert!(err.contains("expensive"));
         assert!(guard_live_model(Provider::OpenRouter, "meta-llama/llama-3.3-70b-instruct:free").is_ok());
         assert!(guard_live_model(Provider::OpenRouter, "openai/gpt-4o").is_err());
