@@ -148,6 +148,31 @@ Completions: `POST …/chat/completions`. Endpoint `/api/coding/paas/v4` кли�
 Ключ лежит в слоте coding-плана, но ходит на обычный paas/v4. Если ничего не
 нашлось, ошибка перечисляет эти три места и напоминает про plain URL.
 
+### Чем платим: `--verify-billing`
+
+Ключ у z.ai один на оба продукта — платит тот, **куда послан запрос**. Квота
+GLM Coding Plan тратится только на `/api/coding/paas/v4` и Anthropic-совместимом
+`/api/anthropic`; plain `/api/paas/v4` метрится по токенам из баланса/пакета
+аккаунта. Проверка живьём:
+
+```sh
+ask --verify-billing      # алиас: ask --billing
+```
+
+Печатает base URL, наличие «плановых» кусков пути, живой пробный вызов с
+usage и цену по прайсу, и выходит с ненулевым кодом, если вердикт не
+`PayPerToken`. Опора вердикта: аккаунт без метрируемых средств отвечает на
+plain-путь ошибкой `1113` («insufficient balance or no resource package») даже
+при живом Coding Plan — значит `200` здесь означает, что вызов метрился.
+Баланс аккаунта прочитать нельзя, публичного endpoint у z.ai нет; цены —
+`glm-5.3-flash` $0.15 / $0.03 cached / $0.50 за 1M
+(<https://docs.z.ai/guides/overview/pricing>, снято 2026-09-11).
+
+Почему «$5 как было, так и осталось»: цент — это 20k выходных или 67k входных
+токенов, а бесплатные resource-пакеты списываются раньше кэша. Смотреть надо
+usage-лог и страницу пакетов, а не округлённый баланс. Строка usage в one-shot
+теперь печатает и `~$…` за вызов.
+
 ## Модели
 
 Каталог с `GET https://api.z.ai/api/paas/v4/models` на 2026-09-07 (10 id):
@@ -367,7 +392,7 @@ Temperature Confirmed только потому, что холодная сто�
 
 ```
 src/main.rs      диспетчер
-src/cli.rs       clap, one-shot (через Runtime), --verify, --verify-isolation, --sessions/--resume/--continue
+src/cli.rs       clap, one-shot (через Runtime), --verify, --verify-isolation, --verify-billing, --sessions/--resume/--continue
 src/agent.rs     сущность разговора: settings, history, context, ask/complete/stream
 src/runtime.rs   коробка: AgentBox (agent+session+policies+judge) и Runtime на N боксов
 src/isolation.rs доказательство изоляции сессий: 100 боксов офлайн + live-отзыв токена
@@ -378,4 +403,5 @@ src/session.rs   ~/.ask6/sessions/*.json
 src/render.rs    flatten JSON-ответа («Key: value»), общий для CLI и TUI
 src/tui.rs       чат, панели, slash-команды, пикер модели
 src/verify.rs    живой self-test рычагов (glm-5.3-flash only)
+src/billing.rs   --verify-billing: метрируемый API против квоты Coding Plan, цена вызова
 ```
