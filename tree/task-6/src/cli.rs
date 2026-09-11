@@ -6,6 +6,7 @@ use clap::Parser;
 use serde_json::Value;
 use std::io::{IsTerminal, Read};
 
+use crate::api::{self, Endpoint};
 use crate::auth::{self, CheckResult, Provider};
 use crate::billing;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
@@ -28,6 +29,7 @@ use crate::verify;
         ask --login                           connect an API key (glm/deepseek/openrouter)\n  \
         printf %s \"$KEY\" | ask --login glm --key-stdin   connect a key from a script\n  \
         ask --keys                            show configured keys and their sources\n  \
+        ask --models                          catalog grouped by provider (live / paid / no key)\n  \
         ask --verify-login                    live-recheck every configured key\n  \
         ask --verify                          prove z.ai levers with causal signatures\n  \
         ask --verify-billing                  show whether spend is metered or plan quota\n  \
@@ -40,7 +42,9 @@ pub struct Cli {
     #[arg(trailing_var_arg = true)]
     pub question: Vec<String>,
 
-    /// Model id from the z.ai catalog. Only glm-5.3-flash may be called live.
+    /// Model id from the catalog. Its provider must be connected (env var or
+    /// `ask --login`); the request goes to that provider's endpoint. Paid ids
+    /// are refused at send time by the money guard.
     #[arg(long)]
     pub model: Option<String>,
 
@@ -129,7 +133,17 @@ pub struct Cli {
     #[arg(long)]
     pub quiet: bool,
 
-    /// Show every provider's key state: source (env/store/legacy), masked
+    /// Print the model catalog grouped by provider, marking each id live,
+    /// refused (paid), or hidden behind a missing key. Exits after printing.
+    #[arg(long)]
+    pub models: bool,
+
+    /// With --models: live-list each connected provider's /models endpoint
+    /// and diff it against the static catalog (drift report, no auto-edit).
+    #[arg(long)]
+    pub live: bool,
+
+    /// Show every provider's key state: source (env/store), masked
     /// key, and the last live check. Exits after printing.
     #[arg(long)]
     pub keys: bool,
@@ -146,8 +160,8 @@ pub struct Cli {
     #[arg(long)]
     pub key_stdin: bool,
 
-    /// Remove a provider's key from the local store. Env vars and legacy
-    /// files are outside the store's reach and stay.
+    /// Remove a provider's key from the local store. An env var, if any,
+    /// stays — unset it yourself.
     #[arg(long, value_name = "PROVIDER")]
     pub logout: Option<String>,
 
@@ -161,13 +175,25 @@ impl Cli {
     pub fn to_settings(&self) -> Res<Settings> {
         let mut s = Settings::default();
         if let Some(m) = &self.model {
-            if !config::MODEL_CATALOG.contains(&m.as_str()) {
-                return Err(format!(
-                    "unknown model `{m}`; catalog: {}",
-                    config::MODEL_CATALOG.join(", ")
-                ));
+            // Three-way: unknown id / known but keyless provider / usable.
+            // The second branch is the only place a parse-time check reads
+            // real key state; `config::find_model` + the provider list keep
+            // the logic pure apart from that one call.
+            match config::find_model(m) {
+                None => return Err(config::catalog_error(m)),
+                Some(cm) => {
+                    let connected = auth::connected_providers();
+                    if !connected.contains(&cm.provider) {
+                        return Err(format!(
+                            "model `{m}` needs a {} key: run `ask --login {}` (or set ${})",
+                            cm.provider.label(),
+                            cm.provider.id(),
+                            cm.provider.env_var()
+                        ));
+                    }
+                    s.model = m.clone();
+                }
             }
-            s.model = m.clone();
         }
         if let Some(e) = &self.effort {
             s.effort = Effort::parse(e)?;
@@ -235,6 +261,12 @@ pub fn run() -> Res<()> {
     if cli.sessions {
         return print_sessions();
     }
+    if cli.models {
+        return print_models(cli.live);
+    }
+    if cli.live {
+        return Err("--live is only meaningful together with --models".into());
+    }
 
     let settings = cli.to_settings()?;
 
@@ -289,7 +321,7 @@ fn one_shot(
     question: &str,
     loaded: Option<session::Session>,
 ) -> Res<()> {
-    let mut rt = Runtime::new()?;
+    let mut rt = Runtime::for_model(&settings.model, session::sessions_dir())?;
     let spec = BoxSpec::new("", settings.clone());
     let id = match loaded {
         Some(s) => rt.resume(&s.id, spec)?,
@@ -378,10 +410,13 @@ fn print_sessions() -> Res<()> {
 
 // --- login flows ------------------------------------------------------------
 
-/// `--keys`: one row per provider — source, masked key, last live check.
+/// `--keys`: one row per provider — source (env/store), masked key, last live check.
 fn print_keys() -> Res<()> {
     let rows = auth::status_all();
-    println!("{:<12} {:<34} {:<24} last live check", "provider", "source", "key");
+    println!(
+        "{:<12} {:<34} {:<24} last live check",
+        "provider", "source (env/store)", "key"
+    );
     for row in &rows {
         let (source, key) = match (&row.source, &row.masked) {
             (Some(s), Some(k)) => (s.describe().to_string(), k.clone()),
@@ -394,13 +429,104 @@ fn print_keys() -> Res<()> {
         println!("{:<12} {:<34} {:<24} {}", row.provider.id(), source, key, check);
     }
     if rows.iter().all(|r| !r.connected()) {
-        println!("\nno keys configured — run `ask --login <provider>` (stored in {}, never in the app)", auth::auth_path().display());
+        println!(
+            "\nno keys configured — run `ask --login <provider>` (stored in {}, never in the app)",
+            auth::auth_path().display()
+        );
     }
     Ok(())
 }
 
-/// `--logout`: drop the key from the local store. Anything outside the store
-/// (env var, legacy file) is reported as out of reach, not silently ignored.
+/// `--models`: catalog grouped by provider. Offline unless `--live`.
+fn print_models(live: bool) -> Res<()> {
+    let connected = auth::connected_providers();
+    for &p in &Provider::ALL {
+        let has = connected.contains(&p);
+        println!(
+            "{} ({})  {}",
+            p.label(),
+            p.id(),
+            if has { "connected" } else { "no key" }
+        );
+        for m in config::MODEL_CATALOG.iter().filter(|m| m.provider == p) {
+            let tag = if !has {
+                "no key"
+            } else if api::is_live_model(m.provider, m.id) {
+                "live"
+            } else {
+                "refused (paid)"
+            };
+            println!("  {:<52} {tag}", m.id);
+        }
+        println!();
+    }
+    let missing: Vec<&str> = Provider::ALL
+        .iter()
+        .filter(|p| !connected.contains(p))
+        .map(|p| p.id())
+        .collect();
+    if !missing.is_empty() {
+        println!(
+            "unlock a provider: {}",
+            missing
+                .iter()
+                .map(|id| format!("ask --login {id}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
+    }
+    if !live {
+        return Ok(());
+    }
+    println!("--live: GET /models per connected provider vs static catalog");
+    for &p in &connected {
+        let ep = match Endpoint::for_provider(p) {
+            Ok(ep) => ep,
+            Err(e) => {
+                println!("  {}: cannot resolve key ({e})", p.id());
+                continue;
+            }
+        };
+        match api::list_model_ids(&ep) {
+            Ok(up) => {
+                let catalog: Vec<&str> = config::MODEL_CATALOG
+                    .iter()
+                    .filter(|m| m.provider == p)
+                    .map(|m| m.id)
+                    .collect();
+                let gone: Vec<&str> = catalog
+                    .iter()
+                    .copied()
+                    .filter(|id| !up.iter().any(|u| u == id))
+                    .collect();
+                let new: Vec<&str> = up
+                    .iter()
+                    .map(|s| s.as_str())
+                    .filter(|id| !catalog.contains(id))
+                    .collect();
+                println!(
+                    "  {}: upstream {} id(s), catalog {}",
+                    p.id(),
+                    up.len(),
+                    catalog.len()
+                );
+                for id in &gone {
+                    println!("    in catalog but gone upstream: {id}");
+                }
+                for id in &new {
+                    println!("    new upstream, not in catalog: {id}");
+                }
+                if gone.is_empty() && new.is_empty() {
+                    println!("    no drift");
+                }
+            }
+            Err(e) => println!("  {}: live list failed: {e}", p.id()),
+        }
+    }
+    Ok(())
+}
+
+/// `--logout`: drop the key from the local store. An env var is out of reach.
 fn logout(id: &str) -> Res<()> {
     let provider = Provider::parse(id)?;
     match auth::disconnect(provider) {
@@ -410,7 +536,7 @@ fn logout(id: &str) -> Res<()> {
             auth::auth_path().display()
         ),
         Ok(false) => println!(
-            "{}: nothing stored in {} (an env var or legacy file, if any, stays — unset ${} / edit the file yourself)",
+            "{}: nothing stored in {} (an env var, if any, stays — unset ${} yourself)",
             provider.label(),
             auth::auth_path().display(),
             provider.env_var()

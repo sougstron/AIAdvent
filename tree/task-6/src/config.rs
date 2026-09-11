@@ -1,29 +1,111 @@
 //! Chat settings shared by the CLI, the TUI and the agent.
 
+use crate::auth::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
 
 pub type Res<T> = Result<T, String>;
 
-/// Default and only model that may be used for live completions.
+/// Default and only model that may be used for live completions on glm.
 pub const DEFAULT_MODEL: &str = "glm-5.3-flash";
 
-/// Catalog from `GET https://api.z.ai/api/paas/v4/models` on 2026-09-07
-/// (10 ids, `object: list`). Only `glm-5.3-flash` is cheap enough to call;
-/// the rest are exposed as selectable settings but refused at send time.
-pub const MODEL_CATALOG: &[&str] = &[
-    "glm-4.5",
-    "glm-4.5-air",
-    "glm-4.6",
-    "glm-4.7",
-    "glm-5",
-    "glm-5-turbo",
-    "glm-5.1",
-    "glm-5.2",
-    "glm-5.3",
-    "glm-5.3-flash",
+/// One selectable model. `live: true` marks the tier its provider's money
+/// guard permits for real calls (`api::guard_live_model` is the rule; the
+/// `live` field is kept in sync with it by
+/// `api::catalog_matches_the_money_guard` — a test that fails the build the
+/// moment a pasted id widens the guard or drifts from it).
+pub struct CatalogModel {
+    pub id: &'static str,
+    pub provider: Provider,
+    pub live: bool,
+}
+const fn glm(id: &'static str, live: bool) -> CatalogModel {
+    CatalogModel { id, provider: Provider::Glm, live }
+}
+
+pub const MODEL_CATALOG: &[CatalogModel] = &[
+    // glm — GET https://api.z.ai/api/paas/v4/models on 2026-09-07
+    // (10 ids, `object: list`). Only the flash tier is cheap enough to call.
+    glm("glm-4.5", false),
+    glm("glm-4.5-air", false),
+    glm("glm-4.6", false),
+    glm("glm-4.7", false),
+    glm("glm-5", false),
+    glm("glm-5-turbo", false),
+    glm("glm-5.1", false),
+    glm("glm-5.2", false),
+    glm("glm-5.3", false),
+    glm("glm-5.3-flash", true),
+    // deepseek — from docs, not live-listed; no key available 2026-09-11.
+    // `GET https://api.deepseek.com/models` needs a key (it answers
+    // "Authentication Fails" without one). Reasoning is chosen by model id.
+    CatalogModel { id: "deepseek-chat", provider: Provider::DeepSeek, live: true },
+    CatalogModel { id: "deepseek-reasoner", provider: Provider::DeepSeek, live: false },
+    // openrouter — GET https://openrouter.ai/api/v1/models (public, no key)
+    // on 2026-09-11: 439 ids, 19 ending in `:free`. The `:free` roster
+    // churns weekly — `ask --models --live` diffs catalog against upstream.
+    // Paid flagships are listed so the picker can show them as refused.
+    CatalogModel { id: "inclusionai/ling-3.0-flash-vl:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "nex-agi/nex-n2.5-mini:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "nex-agi/nex-n2.5-pro:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "inclusionai/ling-3.0-flash-sante:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "inclusionai/ling-3.0-flash-fin:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "dots-studio/dots-3-note-preview:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "liquid/lfm-2.5-2.6b:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "nvidia/nemotron-3.5-lightning:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "thinkingmachines/inkling-small:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "poolside/laguna-s-2.1:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "thinkingmachines/inkling:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "poolside/laguna-xs-2.1:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "cohere/north-mini-code:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "nvidia/nemotron-3.5-content-safety:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "nvidia/nemotron-3-ultra-550b-a55b:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "google/gemma-4-26b-a4b-it:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "google/gemma-4-31b-it:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "nvidia/nemotron-3-super-120b-a12b:free", provider: Provider::OpenRouter, live: true },
+    CatalogModel { id: "anthropic/claude-opus-5", provider: Provider::OpenRouter, live: false },
+    CatalogModel { id: "anthropic/claude-sonnet-5", provider: Provider::OpenRouter, live: false },
+    CatalogModel { id: "openai/gpt-5", provider: Provider::OpenRouter, live: false },
+    CatalogModel { id: "z-ai/glm-5.3", provider: Provider::OpenRouter, live: false },
+    CatalogModel { id: "deepseek/deepseek-v3.2", provider: Provider::OpenRouter, live: false },
+    CatalogModel { id: "meta-llama/llama-3.3-70b-instruct", provider: Provider::OpenRouter, live: false },
 ];
+
+/// The catalog entry for `model`, if it exists. Distinct id strings are what
+/// makes provider routing sound: `glm-5.3` (z.ai direct) and `z-ai/glm-5.3`
+/// (OpenRouter) are different entries.
+pub fn find_model(model: &str) -> Option<&'static CatalogModel> {
+    MODEL_CATALOG.iter().find(|m| m.id == model)
+}
+
+/// The provider that owns `model` — how a model id routes to an endpoint.
+pub fn provider_of(model: &str) -> Option<Provider> {
+    find_model(model).map(|m| m.provider)
+}
+
+/// Catalog entries whose provider appears in `connected`, in catalog order.
+/// Pure: no env, no filesystem — the caller decides what "connected" means.
+pub fn available_models(connected: &[Provider]) -> Vec<&'static CatalogModel> {
+    MODEL_CATALOG
+        .iter()
+        .filter(|m| connected.contains(&m.provider))
+        .collect()
+}
+
+/// Same as [`available_models`], ids only.
+pub fn available_ids(connected: &[Provider]) -> Vec<&'static str> {
+    available_models(connected).into_iter().map(|m| m.id).collect()
+}
+
+/// The shared "no such model" error naming the full catalog.
+pub fn catalog_error(model: &str) -> String {
+    format!(
+        "unknown model `{model}`; catalog: {}",
+        MODEL_CATALOG.iter().map(|m| m.id).collect::<Vec<_>>().join(", ")
+    )
+}
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Ты — полезный ассистент. Отвечай ясно и по делу.";
 
@@ -469,9 +551,46 @@ mod tests {
         assert_eq!(cleared.max_chars, Some(200));
     }
 
+
     #[test]
     fn catalog_includes_the_live_default() {
-        assert!(MODEL_CATALOG.contains(&DEFAULT_MODEL));
-        assert_eq!(MODEL_CATALOG.len(), 10);
+        let entry = find_model(DEFAULT_MODEL).expect("default model in catalog");
+        assert_eq!(entry.provider, Provider::Glm);
+        assert!(entry.live);
+    }
+
+    #[test]
+    fn catalog_ids_are_unique() {
+        // Same id under two providers would make provider_of ambiguous and
+        // silently route a request to the wrong endpoint.
+        for (i, a) in MODEL_CATALOG.iter().enumerate() {
+            for b in &MODEL_CATALOG[i + 1..] {
+                assert_ne!(a.id, b.id, "duplicate catalog id `{}`", a.id);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_of_routes_each_provider_block() {
+        assert_eq!(provider_of("glm-5.3-flash"), Some(Provider::Glm));
+        assert_eq!(provider_of("deepseek-chat"), Some(Provider::DeepSeek));
+        assert_eq!(provider_of("nvidia/nemotron-3.5-lightning:free"), Some(Provider::OpenRouter));
+        // Distinct strings: z.ai direct vs OpenRouter alias.
+        assert_eq!(provider_of("glm-5.3"), Some(Provider::Glm));
+        assert_eq!(provider_of("z-ai/glm-5.3"), Some(Provider::OpenRouter));
+        assert_eq!(provider_of("nope"), None);
+    }
+
+    #[test]
+    fn available_models_filters_by_connected_providers_only() {
+        assert!(available_ids(&[]).is_empty());
+        let glm_only = available_ids(&[Provider::Glm]);
+        assert!(glm_only.contains(&"glm-5.3-flash"));
+        assert!(!glm_only.iter().any(|id| id.contains(':') || id.starts_with("deepseek")));
+        let with_or = available_ids(&[Provider::Glm, Provider::OpenRouter]);
+        assert!(with_or.contains(&"google/gemma-4-31b-it:free"));
+        assert!(!with_or.contains(&"deepseek-chat"));
+        let all = available_models(&Provider::ALL);
+        assert_eq!(all.len(), MODEL_CATALOG.len());
     }
 }

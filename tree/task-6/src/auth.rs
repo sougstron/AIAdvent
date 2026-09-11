@@ -1,10 +1,11 @@
 //! Personal, per-machine API keys: the credential store, the resolver, and
 //! the live key checks behind "login". Keys never ship with the app — they
-//! live in `~/.ask6/auth.json` (0600, written atomically), are picked up
-//! from a provider env var first, and fall back to legacy locations other
-//! tools already use. A key counts as *connected* only after the provider
-//! answered with data derived from that key (`CheckResult::Confirmed`);
-//! anything less is either rejected (not saved) or saved `unverified`.
+//! are picked up from a provider env var or live in `~/.ask6/auth.json`
+//! (0600, written atomically). Nothing else is read: files left behind by
+//! other local tools are deliberately ignored. A key counts as *connected*
+//! only after the provider answered with data derived from that key
+//! (`CheckResult::Confirmed`); anything less is either rejected (not saved)
+//! or saved `unverified`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -80,24 +81,6 @@ impl Provider {
         }
     }
 
-    /// Where to look for a key if env and the store have none: path relative
-    /// to `$HOME` + the JSON path inside it. First match wins. These are the
-    /// files other local tools already use; nothing is copied or migrated.
-    pub fn legacy_sources(self) -> &'static [(&'static str, &'static [&'static str])] {
-        match self {
-            // The z.ai key lives in the coding-plan slot of the pi/omp auth
-            // files but is valid on the plain API — the long-standing rule.
-            Provider::Glm => &[
-                (".pi/agent/auth.json", &["zai-coding-cn", "key"]),
-                (".omp/agent/auth.json", &["zai-coding-cn", "key"]),
-            ],
-            Provider::DeepSeek => &[(".pi/agent/auth.json", &["deepseek", "key"])],
-            Provider::OpenRouter => &[
-                (".pi/agent/auth.json", &["openrouter", "key"]),
-                (".local/share/opencode/auth.json", &["openrouter", "key"]),
-            ],
-        }
-    }
 }
 
 /// One stored provider credential. `base_url` overrides the chat base for
@@ -144,7 +127,6 @@ impl fmt::Debug for Entry {
 pub enum Source {
     Env,
     Store(PathBuf),
-    Legacy(PathBuf),
 }
 
 impl Source {
@@ -152,7 +134,6 @@ impl Source {
         match self {
             Source::Env => "env".to_string(),
             Source::Store(p) => format!("store {}", p.display()),
-            Source::Legacy(p) => format!("legacy {}", p.display()),
         }
     }
 }
@@ -261,22 +242,25 @@ fn warn_if_loose(path: &Path) {
 /// Resolution order, never printing the key:
 /// 1. `$<PROVIDER>_API_KEY`
 /// 2. `~/.ask6/auth.json` → `providers.<id>.key` (the "login" store)
-/// 3. legacy files of [`Provider::legacy_sources`]
+///
+/// Nothing else is read. Files left behind by other local tools
+/// (`~/.pi/…`, `~/.omp/…`, opencode) are deliberately ignored — keys reach
+/// this app only through login or an env var.
 pub fn resolve(provider: Provider) -> Res<Resolved> {
     let env = std::env::var(provider.env_var()).ok();
-    resolve_from(
-        provider,
-        env.as_deref(),
-        Some(&auth_path()),
-        std::env::var("HOME").ok().as_deref().map(Path::new),
-    )
+    match resolve_from(provider, env.as_deref(), Some(&auth_path())) {
+        Ok(r) => Ok(r),
+        Err(e) => match other_tool_hint(provider, std::env::var("HOME").ok().as_deref()) {
+            Some(hint) => Err(format!("{e}\n{hint}")),
+            None => Err(e),
+        },
+    }
 }
 
 pub fn resolve_from(
     provider: Provider,
     env_key: Option<&str>,
     store_path: Option<&Path>,
-    home: Option<&Path>,
 ) -> Res<Resolved> {
     if let Some(key) = env_key.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(Resolved {
@@ -302,50 +286,57 @@ pub fn resolve_from(
             }
         }
     }
-    if let Some(home) = home {
-        for (rel, json_path) in provider.legacy_sources() {
-            let path = home.join(rel);
-            if let Some(key) = key_from_json(&path, json_path)? {
-                return Ok(Resolved {
-                    key,
-                    base_url: provider.default_base_url().into(),
-                    source: Source::Legacy(path),
-                });
-            }
-        }
-    }
     Err(missing_key_message(provider))
 }
 
 fn missing_key_message(provider: Provider) -> String {
-    let legacy = provider
-        .legacy_sources()
-        .iter()
-        .map(|(rel, segs)| format!("~/{rel} [{}]", segs.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join("][")))
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
-        "no {} API key found. Connect one: `ask --login {}` — the key is checked live and \
-stored in ~/.ask6/auth.json (per machine, never in the app). Interim sources: ${}, or {legacy}.",
+        "no {} API key found. Connect one: `ask --login {}` — the key is checked \
+live and stored in ~/.ask6/auth.json (0600, per machine). Override for CI: ${}.",
         provider.label(),
         provider.id(),
         provider.env_var()
     )
 }
 
-/// Walks `segments` into a JSON file and returns its non-empty string value.
-fn key_from_json(path: &Path, segments: &[&str]) -> Res<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut v: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-    for seg in segments {
-        v = v.get(seg).cloned().unwrap_or(Value::Null);
-    }
-    Ok(v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+/// Files where other local tools used to keep keys this app once read. They
+/// are no longer read; the check is existence-only, so no key material is
+/// ever touched — the returned line just points at the migration path.
+pub const RETIRED_LEGACY_FILES: &[&str] = &[
+    ".pi/agent/auth.json",
+    ".omp/agent/auth.json",
+    ".local/share/opencode/auth.json",
+];
+
+/// One-line migration note for the error message when a provider has no key
+/// but a retired other-tool file still exists. `None` when there is nothing
+/// to mention. Never opens or parses the file.
+fn other_tool_hint(provider: Provider, home: Option<&str>) -> Option<String> {
+    let home = home?;
+    let home = Path::new(home);
+    RETIRED_LEGACY_FILES
+        .iter()
+        .any(|rel| home.join(rel).exists())
+        .then(|| {
+            format!(
+                "note: a key from another tool's file is no longer read — \
+run `ask --login {}` once to store it here",
+                provider.id()
+            )
+        })
+}
+
+/// Providers whose key resolves right now (env var or the login store),
+/// in [`Provider::ALL`] order. Availability means "a key exists" — not
+/// "the provider last confirmed it": an env-only key has no check history
+/// and an unreachable provider must not make the picker lie. `--verify-login`
+/// is the truth-teller on top of this.
+pub fn connected_providers() -> Vec<Provider> {
+    Provider::ALL
+        .iter()
+        .copied()
+        .filter(|&p| resolve(p).is_ok())
+        .collect()
 }
 
 /// `sk-or…9f2c (len 73)` — scheme prefix + last 4 chars only. Short keys are
@@ -511,7 +502,6 @@ fn confirmed_or_unverifiable(provider: Provider, body: &str) -> CheckResult {
         },
     }
 }
-
 /// Short provider-quote for messages: a JSON `error.message` when present,
 /// else the head of the body. Provider responses never contain the key.
 fn snippet(body: &str) -> String {
@@ -581,8 +571,8 @@ pub fn connect(provider: Provider, key: &str) -> Res<(CheckResult, bool)> {
     Ok((verdict, true))
 }
 
-/// Removes the provider's key from the local store. Env vars and legacy
-/// files are outside its reach — callers say so.
+/// Removes the provider's key from the local store. An env var is outside
+/// its reach — callers say so.
 pub fn disconnect(provider: Provider) -> Res<bool> {
     let path = auth_path();
     let mut creds = load_from(&path)?;
@@ -594,7 +584,7 @@ pub fn disconnect(provider: Provider) -> Res<bool> {
 }
 
 /// Persists a fresh check verdict on an existing store entry. Returns false
-/// when the key resolves from env/legacy — nothing is copied into the store
+/// when the key resolves from env — nothing is copied into the store
 /// behind the user's back.
 pub fn record_check(provider: Provider, verdict: &CheckResult) -> Res<bool> {
     let path = auth_path();
@@ -622,7 +612,7 @@ pub fn recheck(provider: Provider) -> Res<CheckResult> {
 
 /// One row of `--keys` / the TUI `/login` panel. `source`/`masked` are set
 /// when a key resolves from anywhere; `last_check` only when it resolves
-/// from the store (legacy files carry no check history).
+/// from the store (history exists iff the key is in the store).
 #[derive(Clone)]
 pub struct ProviderStatus {
     pub provider: Provider,
@@ -688,17 +678,15 @@ mod tests {
         save_to(path, &creds).unwrap();
     }
 
-    // --- resolution order: env → store → legacy, per provider ---
+    // --- resolution order: env → store, and only that ---
 
     #[test]
-    fn env_wins_over_store_and_legacy_for_every_provider() {
+    fn env_wins_over_store_for_every_provider() {
         let dir = tmp("env-wins");
-        let home = dir.join("home");
         let store = dir.join("store.json");
-        write_file(&home.join(".pi/agent/auth.json"), r#"{"zai-coding-cn":{"key":"from-pi"}}"#);
         for p in Provider::ALL {
             store_with(&store, p.id(), "from-store");
-            let r = resolve_from(p, Some("from-env"), Some(&store), Some(&home)).unwrap();
+            let r = resolve_from(p, Some("from-env"), Some(&store)).unwrap();
             assert_eq!(r.key, "from-env");
             assert_eq!(r.source, Source::Env);
         }
@@ -706,72 +694,69 @@ mod tests {
     }
 
     #[test]
-    fn store_wins_over_legacy_for_every_provider() {
-        let dir = tmp("store-wins");
-        let home = dir.join("home");
+    fn store_is_used_when_env_is_unset() {
+        let dir = tmp("store-only");
         let store = dir.join("store.json");
-        write_file(&home.join(".pi/agent/auth.json"), r#"{"zai-coding-cn":{"key":"from-pi"}}"#);
-        write_file(&home.join(".pi/agent/auth.json"), r#"{"zai-coding-cn":{"key":"from-pi"}}"#);
         for p in Provider::ALL {
             store_with(&store, p.id(), "from-store");
-            let r = resolve_from(p, None, Some(&store), Some(&home)).unwrap();
+            let r = resolve_from(p, None, Some(&store)).unwrap();
             assert_eq!(r.key, "from-store");
             assert_eq!(r.source, Source::Store(store.clone()));
         }
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The user's literal ask: keys left in other tools' files must never be
+    /// picked up again. All three retired files hold valid-looking keys and
+    /// the resolver still refuses to touch them.
     #[test]
-    fn legacy_fallback_per_provider_and_source_order() {
-        let dir = tmp("legacy");
+    fn no_key_is_read_from_other_tools_files() {
+        let dir = tmp("retired-files");
         let home = dir.join("home");
-        let store = dir.join("missing-store.json");
-
-        write_file(&home.join(".pi/agent/auth.json"), r#"{"zai-coding-cn":{"key":"glm-from-pi"}}"#);
-        let r = resolve_from(Provider::Glm, None, Some(&store), Some(&home)).unwrap();
-        assert_eq!(r.key, "glm-from-pi");
-        assert_eq!(r.source, Source::Legacy(home.join(".pi/agent/auth.json")));
-
-        // omp is the second glm source.
-        let home2 = dir.join("home2");
-        write_file(&home2.join(".omp/agent/auth.json"), r#"{"zai-coding-cn":{"key":"glm-from-omp"}}"#);
-        let r = resolve_from(Provider::Glm, None, Some(&store), Some(&home2)).unwrap();
-        assert_eq!(r.key, "glm-from-omp");
-        assert_eq!(r.source, Source::Legacy(home2.join(".omp/agent/auth.json")));
-
-        let home3 = dir.join("home3");
-        write_file(&home3.join(".pi/agent/auth.json"), r#"{"deepseek":{"key":"ds-from-pi"}}"#);
-        let r = resolve_from(Provider::DeepSeek, None, Some(&store), Some(&home3)).unwrap();
-        assert_eq!(r.key, "ds-from-pi");
-
-        // openrouter falls through pi to opencode's file.
-        let home4 = dir.join("home4");
+        write_file(&home.join(".pi/agent/auth.json"), r#"{"zai-coding-cn":{"key":"glm-from-pi"},"deepseek":{"key":"ds-from-pi"},"openrouter":{"key":"or-from-pi"}}"#);
+        write_file(&home.join(".omp/agent/auth.json"), r#"{"zai-coding-cn":{"key":"glm-from-omp"}}"#);
         write_file(
-            &home4.join(".local/share/opencode/auth.json"),
+            &home.join(".local/share/opencode/auth.json"),
             r#"{"openrouter":{"key":"or-from-opencode"}}"#,
         );
-        let r = resolve_from(Provider::OpenRouter, None, Some(&store), Some(&home4)).unwrap();
-        assert_eq!(r.key, "or-from-opencode");
-        assert_eq!(
-            r.source,
-            Source::Legacy(home4.join(".local/share/opencode/auth.json"))
-        );
+        for p in Provider::ALL {
+            let err = resolve_from(p, None, None).unwrap_err();
+            assert!(err.contains(&format!("no {} API key", p.label())), "{err}");
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The hint exists so a pi-only user is told *why* they went keyless and
+    /// what to do — without the app ever reading the file's contents.
     #[test]
     fn missing_key_error_names_login_and_store() {
         let dir = tmp("missing");
-        let err = resolve_from(Provider::Glm, None, Some(&dir.join("no.json")), Some(&dir)).unwrap_err();
+        let err = resolve_from(Provider::Glm, None, Some(&dir.join("no.json"))).unwrap_err();
         assert!(err.contains("--login glm"));
         assert!(err.contains("~/.ask6/auth.json"));
         assert!(err.contains("ZAI_API_KEY"));
-        assert!(err.contains("zai-coding-cn"));
-        assert!(err.contains(".pi/agent/auth.json"));
-        let err = resolve_from(Provider::OpenRouter, None, None, None).unwrap_err();
+        assert!(!err.contains(".pi/"));
+        let err = resolve_from(Provider::OpenRouter, None, None).unwrap_err();
         assert!(err.contains("--login openrouter"));
         assert!(err.contains("OPENROUTER_API_KEY"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn other_tool_hint_fires_on_file_existence_only() {
+        let dir = tmp("hint");
+        let home = dir.join("home");
+        assert!(other_tool_hint(Provider::Glm, None).is_none());
+        assert!(other_tool_hint(Provider::Glm, Some(dir.to_str().unwrap())).is_none());
+        // A file nobody reads any more, but it exists → the hint names login.
+        write_file(&home.join(".pi/agent/auth.json"), "whatever");
+        let hint = other_tool_hint(Provider::DeepSeek, Some(home.to_str().unwrap())).unwrap();
+        assert!(hint.contains("--login deepseek"), "{hint}");
+        // No parsing: a corrupt file still only produces the hint text.
+        write_file(&home.join(".omp/agent/auth.json"), "{not json");
+        let hint = other_tool_hint(Provider::Glm, Some(home.to_str().unwrap())).unwrap();
+        assert!(hint.contains("--login glm"), "{hint}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -779,19 +764,8 @@ mod tests {
         let dir = tmp("empty-env");
         let store = dir.join("store.json");
         store_with(&store, "glm", "from-store");
-        let r = resolve_from(Provider::Glm, Some("   "), Some(&store), None).unwrap();
+        let r = resolve_from(Provider::Glm, Some("   "), Some(&store)).unwrap();
         assert_eq!(r.key, "from-store");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn corrupt_legacy_file_is_a_loud_error() {
-        let dir = tmp("corrupt-legacy");
-        let home = dir.join("home");
-        write_file(&home.join(".pi/agent/auth.json"), "{not json");
-        let err = resolve_from(Provider::Glm, None, None, Some(&home)).unwrap_err();
-        assert!(err.contains("cannot parse"));
-        assert!(err.contains(home.join(".pi/agent/auth.json").display().to_string().as_str()));
         fs::remove_dir_all(&dir).unwrap();
     }
 

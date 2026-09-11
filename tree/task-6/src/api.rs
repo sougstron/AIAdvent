@@ -4,7 +4,7 @@
 
 use serde_json::{json, Value};
 use crate::auth::{self, Provider};
-use crate::config::{Res, Settings, DEFAULT_MODEL};
+use crate::config::{self, Res, Settings, DEFAULT_MODEL};
 use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -56,7 +56,7 @@ impl Endpoint {
     }
 
     /// Resolves the endpoint from the user's own machine: `$ENV` →
-    /// `~/.ask6/auth.json` → legacy files. See `auth::resolve`.
+    /// `~/.ask6/auth.json`. See `auth::resolve`.
     pub fn for_provider(provider: Provider) -> Res<Endpoint> {
         let resolved = auth::resolve(provider)?;
         Ok(Endpoint {
@@ -65,6 +65,23 @@ impl Endpoint {
             api_key: resolved.key,
         })
     }
+
+    /// Resolves the endpoint that owns `model` — how `--model deepseek-chat`
+    /// actually reaches DeepSeek. Unknown ids get the same error `--model`
+    /// produces; a known id whose provider has no key errors like any
+    /// unresolved provider.
+    pub fn for_model(model: &str) -> Res<Endpoint> {
+        let provider = config::provider_of(model).ok_or_else(|| config::catalog_error(model))?;
+        Endpoint::for_provider(provider)
+    }
+}
+
+
+
+/// The money guard as a predicate — same rule as [`guard_live_model`],
+/// usable where a `bool` is handier than a `Result`.
+pub fn is_live_model(provider: Provider, model: &str) -> bool {
+    guard_live_model(provider, model).is_ok()
 }
 
 
@@ -91,6 +108,28 @@ completions (other catalog models are expensive)",
     }
     Ok(())
 }
+
+/// Live `GET {base}/models` for a connected endpoint. Used by `ask --models --live`
+/// to report catalog drift — never to auto-edit the catalog.
+pub fn list_model_ids(ep: &Endpoint) -> Res<Vec<String>> {
+    let url = format!("{}/models", ep.base_url.trim_end_matches('/'));
+    let resp = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {}", ep.api_key))
+        .set("Accept-Language", "en-US,en")
+        .call();
+    let raw = read_json_response(resp, &url)?;
+    let Some(data) = raw.get("data").and_then(|d| d.as_array()) else {
+        return Err(format!(
+            "unexpected /models shape from {}: missing data[]",
+            ep.provider.id()
+        ));
+    };
+    Ok(data
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .collect())
+}
+
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -166,8 +205,13 @@ impl Outcome {
 
 /// Builds the request body. Kept separate from `chat` so tests can inspect
 /// it without a network call. The agent decides *what* goes in; this just
-/// serializes the settings onto z.ai's parameter names.
+/// serializes the settings onto the provider's parameter names. `provider`
+/// gates the glm-specific fields: `thinking` and `reasoning_effort` are
+/// z.ai-only (glm-5.3-flash, HTTP 400 / 1210) — DeepSeek picks reasoning by
+/// model id, and OpenRouter's own `reasoning` block is deliberately not
+/// invented here.
 pub fn build_body(
+    provider: Provider,
     model: &str,
     settings: &Settings,
     system: &str,
@@ -215,11 +259,17 @@ pub fn build_body(
     let mut body = json!({
         "model": model,
         "messages": messages,
-        // glm-5.3-flash: thinking.type only supports enabled (HTTP 400 / 1210
-        // if disabled). clear_thinking: false is the flash-doc recommendation.
-        "thinking": { "type": "enabled", "clear_thinking": false },
-        "reasoning_effort": settings.effort.wire(),
     });
+    if provider == Provider::Glm {
+        if let Some(obj) = body.as_object_mut() {
+            // glm-5.3-flash: thinking.type only supports enabled (HTTP 400 /
+            // 1210 if disabled). clear_thinking: false is the flash-doc
+            // recommendation. glm-only fields — DeepSeek/OpenRouter would
+            // reject or silently misread them.
+            obj.insert("thinking".into(), json!({ "type": "enabled", "clear_thinking": false }));
+            obj.insert("reasoning_effort".into(), json!(settings.effort.wire()));
+        }
+    }
     if let Some(obj) = body.as_object_mut() {
         if settings.json_mode.enabled {
             obj.insert(
@@ -263,7 +313,7 @@ pub fn chat(
     schema: Option<&Value>,
 ) -> Res<Outcome> {
     guard_live_model(ep.provider, &settings.model)?;
-    let body = build_body(&settings.model, settings, system, history, schema);
+    let body = build_body(ep.provider, &settings.model, settings, system, history, schema);
     post_completion(ep, body)
 }
 
@@ -457,7 +507,7 @@ pub fn chat_stream(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Res<ChatStream> {
     guard_live_model(ep.provider, &settings.model)?;
-    let mut body = build_body(&settings.model, settings, system, history, schema);
+    let mut body = build_body(ep.provider, &settings.model, settings, system, history, schema);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("stream".into(), json!(true));
         obj.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -529,12 +579,44 @@ mod tests {
 
     fn body_for(settings: &Settings) -> Value {
         build_body(
+            Provider::Glm,
             &settings.model,
             settings,
             &settings.system_prompt,
             &[ChatMessage::user("hi")],
             None,
         )
+    }
+
+    #[test]
+    fn glm_thinking_fields_are_absent_for_other_providers() {
+        let settings = Settings::default();
+        let ds = build_body(
+            Provider::DeepSeek,
+            "deepseek-chat",
+            &settings,
+            "",
+            &[ChatMessage::user("hi")],
+            None,
+        );
+        assert!(ds.get("thinking").is_none(), "deepseek must not receive a glm thinking block");
+        assert!(ds.get("reasoning_effort").is_none());
+        assert_eq!(ds["model"], "deepseek-chat");
+
+        let or = build_body(
+            Provider::OpenRouter,
+            "google/gemma-4-31b-it:free",
+            &settings,
+            "",
+            &[ChatMessage::user("hi")],
+            None,
+        );
+        assert!(or.get("thinking").is_none());
+        assert!(or.get("reasoning_effort").is_none());
+        // The glm body keeps both — the 1210 contract.
+        let glm = body_for(&settings);
+        assert_eq!(glm["thinking"]["type"], "enabled");
+        assert!(glm.get("reasoning_effort").is_some());
     }
 
     #[test]
@@ -620,7 +702,7 @@ mod tests {
             ChatMessage::assistant("reply"),
             ChatMessage::user("second"),
         ];
-        let body = build_body("glm-5.3-flash", &settings, "", &history, None);
+        let body = build_body(Provider::Glm, "glm-5.3-flash", &settings, "", &history, None);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "user");
@@ -650,6 +732,7 @@ mod tests {
         };
         let schema = json!({"type": "object", "properties": {"title": {"type": "string"}}});
         let body = build_body(
+            Provider::Glm,
             "glm-5.3-flash",
             &settings,
             "",
@@ -665,7 +748,7 @@ mod tests {
     #[test]
     fn model_field_is_the_settings_model() {
         let settings = Settings::default();
-        let body = build_body("glm-5.3-flash", &settings, "", &[ChatMessage::user("hi")], None);
+        let body = build_body(Provider::Glm, "glm-5.3-flash", &settings, "", &[ChatMessage::user("hi")], None);
         assert_eq!(body["model"], "glm-5.3-flash");
     }
 
@@ -745,6 +828,24 @@ mod tests {
         assert!(err.contains("expensive"));
         assert!(guard_live_model(Provider::OpenRouter, "meta-llama/llama-3.3-70b-instruct:free").is_ok());
         assert!(guard_live_model(Provider::OpenRouter, "openai/gpt-4o").is_err());
+    }
+
+    /// The catalog's `live` flags and the money guard are one rule, not two.
+    /// This is the guard against a pasted paid id quietly becoming callable.
+    #[test]
+    fn catalog_live_flags_match_the_money_guard_exactly() {
+        for m in config::MODEL_CATALOG {
+            assert_eq!(
+                m.live,
+                is_live_model(m.provider, m.id),
+                "catalog `{}` (live={}) disagrees with the money guard",
+                m.id,
+                m.live
+            );
+        }
+        // …and a paid id that merely *looks* catalog-adjacent stays refused.
+        assert!(!is_live_model(Provider::OpenRouter, "z-ai/glm-5.3"));
+        assert!(!is_live_model(Provider::OpenRouter, "openai/gpt-5"));
     }
 
 

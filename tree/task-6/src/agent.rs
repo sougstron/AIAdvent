@@ -63,7 +63,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(settings: Settings) -> Res<Agent> {
-        Ok(Agent::with_endpoint(Endpoint::resolve()?, settings))
+        Ok(Agent::with_endpoint(Endpoint::for_model(&settings.model)?, settings))
     }
 
     /// Build an agent on an already-resolved endpoint. This is the constructor
