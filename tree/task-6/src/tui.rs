@@ -22,7 +22,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::agent::Agent;
-use crate::api::{self, ChatMessage, Outcome};
+use crate::api::{self, ChatMessage, Endpoint, Outcome};
+use crate::auth::{self, CheckResult, Provider};
 use crate::config::{self, Effort, Res, Settings};
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
@@ -58,8 +59,8 @@ const SETTINGS_ROWS: &[&str] = &[
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
 const COMMANDS: &[&str] = &[
-    "context", "effort", "help", "json", "max-tokens", "model", "new", "personas", "quit", "rename",
-    "sessions", "settings", "stop", "system", "temp", "top-k", "top-p", "verify",
+    "context", "effort", "help", "json", "login", "max-tokens", "model", "new", "personas", "quit",
+    "rename", "sessions", "settings", "stop", "system", "temp", "top-k", "top-p", "verify",
 ];
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
@@ -88,7 +89,16 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("interactive chat requires a terminal".into());
     }
-    let mut agent = Agent::new(settings.clone())?;
+    // Keyless boot: a missing key must not keep the app from starting —
+    // the whole point of /login is to connect one from inside. The agent
+    // comes up on a provably unusable endpoint until a key is connected.
+    let (mut agent, boot) = match Agent::new(settings.clone()) {
+        Ok(a) => (a, None),
+        Err(e) => (
+            Agent::with_endpoint(Endpoint::unusable(), settings.clone()),
+            Some(format!("no API key yet — connect one below ({e})")),
+        ),
+    };
     let settings = if let Some(ref session) = loaded {
         agent.resume(session);
         session.settings.clone()
@@ -110,7 +120,11 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
-    let result = App::new(agent, settings, loaded).event_loop(&mut terminal);
+    let mut app = App::new(agent, settings, loaded);
+    if let Some(msg) = boot {
+        app.start_keyless(&msg);
+    }
+    let result = app.event_loop(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         PopKeyboardEnhancementFlags,
@@ -133,6 +147,7 @@ enum Focus {
     Settings,
     Sessions,
     Model,
+    Login,
 }
 
 struct App {
@@ -154,6 +169,13 @@ struct App {
     /// the bottom; any manual scroll up clears it until the user scrolls
     /// back down to the last line.
     follow: bool,
+    login_selected: usize,
+    login_rows: Vec<auth::ProviderStatus>,
+    /// Index into `login_rows` awaiting a y/n confirmation before logout.
+    login_pending_delete: Option<usize>,
+    /// When set, the input box is entering an API key for this provider —
+    /// same trick as `editing_system_prompt`, but the text renders masked.
+    editing_api_key: Option<Provider>,
     settings_selected: usize,
     /// Cursor inside the model-picker overlay (independent of `settings_selected`).
     model_selected: usize,
@@ -187,6 +209,10 @@ impl App {
             ),
         };
         App {
+            login_selected: 0,
+            login_rows: Vec::new(),
+            login_pending_delete: None,
+            editing_api_key: None,
             agent,
             session,
             settings,
@@ -249,6 +275,7 @@ impl App {
             Focus::Settings => self.handle_settings_key(key.code),
             Focus::Sessions => self.handle_sessions_key(key.code, terminal),
             Focus::Model => self.handle_model_key(key.code),
+            Focus::Login => self.handle_login_key(key.code, terminal),
         }
     }
 
@@ -312,10 +339,21 @@ impl App {
                 self.input_scroll = 0;
                 self.status = "system prompt edit cancelled".into();
             }
+            KeyCode::Esc if self.editing_api_key.is_some() => {
+                self.editing_api_key = None;
+                self.input.clear();
+                self.cursor = 0;
+                self.input_scroll = 0;
+                self.focus = Focus::Login;
+                self.status = "key entry cancelled".into();
+            }
             KeyCode::Esc => self.quit = true,
             KeyCode::Tab => {
                 self.focus = Focus::Settings;
                 self.settings_selected = 0;
+            }
+            KeyCode::Enter if self.editing_api_key.is_some() => {
+                self.finish_key_entry(terminal);
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.insert_char('\n');
@@ -333,6 +371,13 @@ impl App {
                 );
             }
             KeyCode::Enter if !self.input.trim().is_empty() => {
+                let line = self.input.trim().to_string();
+                // Keyless guard: slash commands still work (that's how you
+                // reach /login), but a chat message has nowhere to go.
+                if !line.starts_with('/') && !self.agent.has_api_key() {
+                    self.status = "no API key — /login to connect one (Enter opens the panel)".into();
+                    return;
+                }
                 let line = std::mem::take(&mut self.input);
                 self.cursor = 0;
                 self.input_scroll = 0;
@@ -656,6 +701,7 @@ impl App {
         match name.to_ascii_lowercase().as_str() {
             "new" => self.new_chat(),
             "rename" => self.cmd_rename(rest),
+            "login" => self.cmd_login(),
             "sessions" => {
                 self.save_session();
                 self.sessions_list = session::list_sessions(&self.sessions_dir);
@@ -896,6 +942,197 @@ impl App {
         self.editing_system_prompt = true;
         self.focus = Focus::Input;
         self.status = "editing system prompt — Enter save · Shift+Enter newline · Esc cancel".into();
+    }
+
+
+    // --- /login: connect personal provider keys -----------------------------
+
+    /// Keyless boot: the agent came up on an unusable endpoint, so open the
+    /// login panel right away instead of letting the first send fail.
+    fn start_keyless(&mut self, message: &str) {
+        self.focus = Focus::Login;
+        self.status = message.to_string();
+        self.refresh_login_rows();
+    }
+
+    fn cmd_login(&mut self) {
+        self.login_selected = 0;
+        self.login_pending_delete = None;
+        self.refresh_login_rows();
+        self.focus = Focus::Login;
+    }
+
+    fn refresh_login_rows(&mut self) {
+        self.login_rows = auth::status_all();
+        if self.login_selected >= self.login_rows.len() {
+            self.login_selected = 0;
+        }
+    }
+
+
+    fn handle_login_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.logout_selected_login(),
+            _ => self.login_pending_delete = None,
+        }
+    }
+
+    fn logout_selected_login(&mut self) {
+        let Some(idx) = self.login_pending_delete.take() else { return };
+        let Some(row) = self.login_rows.get(idx) else { return };
+        let provider = row.provider;
+        match auth::disconnect(provider) {
+            Ok(true) => {
+                self.status =
+                    format!("{}: key removed from {}", provider.label(), auth::auth_path().display());
+            }
+            Ok(false) => {
+                self.status = format!(
+                    "{}: nothing in the local store — an env var or legacy file, if any, stays",
+                    provider.label()
+                );
+            }
+            Err(e) => self.status = format!("logout failed: {e}"),
+        }
+        self.refresh_login_rows();
+    }
+
+    /// Enter on a provider row: the input box switches to masked key entry
+    /// (same mechanism as the system-prompt editor).
+    fn begin_key_entry(&mut self) {
+        let Some(row) = self.login_rows.get(self.login_selected) else { return };
+        let provider = row.provider;
+        self.editing_api_key = Some(provider);
+        self.input.clear();
+        self.cursor = 0;
+        self.input_scroll = 0;
+        self.focus = Focus::Input;
+        self.status = format!(
+            "entering {} API key — Enter submits, Esc cancels (checked live, stored 0600)",
+            provider.label()
+        );
+    }
+
+    fn handle_login_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) {
+        if self.login_pending_delete.is_some() {
+            self.handle_login_confirm_key(code);
+            return;
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Input,
+            KeyCode::Up | KeyCode::Char('k') => self.move_login_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_login_selection(1),
+            KeyCode::Enter => self.begin_key_entry(),
+            KeyCode::Char('r') => self.recheck_selected_login(terminal),
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if self
+                    .login_rows
+                    .get(self.login_selected)
+                    .is_some_and(auth::ProviderStatus::connected)
+                {
+                    self.login_pending_delete = Some(self.login_selected);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_login_selection(&mut self, delta: i32) {
+        let n = Provider::ALL.len() as i32;
+        self.login_selected =
+            ((self.login_selected as i32 + delta).rem_euclid(n)) as usize;
+    }
+
+    fn finish_key_entry(&mut self, terminal: &mut DefaultTerminal) {
+        let Some(provider) = self.editing_api_key.take() else { return };
+        let key = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        self.input_scroll = 0;
+        self.focus = Focus::Login;
+        if key.trim().is_empty() {
+            self.status = "empty key — nothing connected".into();
+            return;
+        }
+        let label = provider.label();
+        let result = self.with_spinner(
+            terminal,
+            &format!("checking {label} key live"),
+            move || auth::connect(provider, &key),
+        );
+        match result {
+            Some(Ok((verdict, saved))) => {
+                match &verdict {
+                    CheckResult::Confirmed { evidence } => {
+                        self.after_login_success(provider);
+                        self.status = format!(
+                            "{label}: CONFIRMED — key saved to {}",
+                            auth::auth_path().display()
+                        );
+                        self.entries.push(Entry::Info(format!("/login {label}: {evidence}")));
+                        self.scroll_to_bottom(terminal);
+                    }
+                    CheckResult::Unreachable { msg } => {
+                        self.after_login_success(provider);
+                        self.status = format!(
+                            "{label}: provider unreachable ({msg}) — key saved UNVERIFIED, press r to recheck"
+                        );
+                    }
+                    CheckResult::Rejected { http, msg } => {
+                        self.status =
+                            format!("{label}: REJECTED (HTTP {http}) — key NOT saved ({msg})");
+                    }
+                }
+                if !saved {
+                    self.entries.push(Entry::Info(format!(
+                        "/login {label}: connect ended without a save ({})",
+                        login_verdict_line(&verdict)
+                    )));
+                }
+            }
+            Some(Err(e)) => self.status = format!("login failed: {e}"),
+            None => self.status = "login cancelled (Esc)".into(),
+        }
+        self.refresh_login_rows();
+    }
+    /// A freshly connected glm key upgrades a keyless boot immediately.
+    fn after_login_success(&mut self, provider: Provider) {
+        if provider == Provider::Glm && !self.agent.has_api_key() {
+            if let Ok(ep) = Endpoint::for_provider(Provider::Glm) {
+                self.agent.set_endpoint(ep);
+            }
+        }
+    }
+
+    /// `r` on the panel: live-recheck the selected provider's key.
+    fn recheck_selected_login(&mut self, terminal: &mut DefaultTerminal) {
+        let Some(row) = self.login_rows.get(self.login_selected) else { return };
+        let provider = row.provider;
+        let label = provider.label();
+        let key = match auth::resolve(provider) {
+            Ok(r) => r.key,
+            Err(e) => {
+                self.status = format!("nothing to check for {label}: {e}");
+                return;
+            }
+        };
+        let result = self.with_spinner(
+            terminal,
+            &format!("rechecking {label} key"),
+            move || auth::check(provider, &key),
+        );
+        match result {
+            Some(verdict) => {
+                match auth::record_check(provider, &verdict) {
+                    Ok(_) => {}
+                    Err(e) => self.entries.push(Entry::Info(format!(
+                        "could not record {label} check: {e}"
+                    ))),
+                }
+                self.status = format!("{label}: {}", login_verdict_line(&verdict));
+                self.refresh_login_rows();
+            }
+            None => self.status = "recheck cancelled (Esc)".into(),
+        }
     }
 
     fn cmd_effort(&mut self, rest: &str) {
@@ -1519,6 +1756,8 @@ impl App {
             self.draw_sessions_overlay(f, body);
         } else if self.focus == Focus::Model {
             self.draw_model_overlay(f, body);
+        } else if self.focus == Focus::Login {
+            self.draw_login_overlay(f, body);
         } else if self.focus == Focus::Input && self.command_popup_active() {
             self.draw_command_popup(f, body);
         }
@@ -1534,7 +1773,14 @@ impl App {
         } else {
             Style::default()
         };
-        let lines = input_lines(&self.input, width);
+        // API-key entry renders the same char count as '*' so the wrap and
+        // cursor math above stay exact while nothing readable is on screen.
+        let shown = if self.editing_api_key.is_some() {
+            mask_input(&self.input)
+        } else {
+            self.input.clone()
+        };
+        let lines = input_lines(&shown, width);
         let view = (area.height.saturating_sub(2)) as usize;
         let scroll = self
             .input_scroll
@@ -1545,10 +1791,12 @@ impl App {
             .take(view)
             .map(|(_, text)| Line::raw(text.clone()))
             .collect();
-        let title = if self.editing_system_prompt {
-            " system prompt — Enter save · Shift+Enter newline · Esc cancel "
+        let title: String = if let Some(provider) = self.editing_api_key {
+            format!(" {} API key — Enter submit · Esc cancel ", provider.label())
+        } else if self.editing_system_prompt {
+            " system prompt — Enter save · Shift+Enter newline · Esc cancel ".to_string()
         } else {
-            " message — /help for commands "
+            " message — /help for commands ".to_string()
         };
         f.render_widget(
             Paragraph::new(visible)
@@ -1767,6 +2015,45 @@ impl App {
         );
     }
 
+    /// `/login` panel: one row per provider — connection source, masked key,
+    /// and the verdict of the last live check.
+    fn draw_login_overlay(&self, f: &mut Frame, area: Rect) {
+        let popup = centered(
+            area,
+            88,
+            (Provider::ALL.len() as u16 + 2)
+                .min(area.height.saturating_sub(2))
+                .max(4),
+        );
+        let items: Vec<ListItem> = self
+            .login_rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let cursor = if i == self.login_selected { "▸ " } else { "  " };
+                ListItem::new(Line::from(vec![
+                    Span::raw(cursor),
+                    Span::raw(login_row_text(row)),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.login_selected));
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_stateful_widget(
+            List::new(items).block(Block::bordered().title(
+                " login — Enter add key · r recheck · d remove · Esc close ",
+            )),
+            popup,
+            &mut state,
+        );
+        if let Some(idx) = self.login_pending_delete {
+            if let Some(row) = self.login_rows.get(idx) {
+                self.draw_delete_confirm(f, area, row.provider.label());
+            }
+        }
+    }
+
     fn draw_sessions_overlay(&self, f: &mut Frame, area: Rect) {
         let popup = centered(area, 78, 12.min(area.height.saturating_sub(2)).max(4));
         let items: Vec<ListItem> = if self.sessions_list.is_empty() {
@@ -1873,6 +2160,7 @@ const HELP: &str = "\
 /stop add <seq>           add a stop sequence (max 4)
 /stop clear               clear stop sequences
 /verify                   prove the agent reaches z.ai and that levers are honoured
+/login                    connect glm/deepseek/openrouter keys (live-checked, stored 0600)
 /personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
 /personas a,b,c: <question>   same, with your own cast instead of the default three
 /context [show|on|off|reload]  AGENTS.md files in the system prompt
@@ -1903,6 +2191,40 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
+    }
+}
+
+/// Every char becomes '*'; the char count (and therefore the wrap/cursor
+/// math over the masked string) is unchanged.
+fn mask_input(text: &str) -> String {
+    text.chars().map(|_| '*').collect()
+}
+
+/// One `/login` panel row: provider, source, masked key, last live check.
+fn login_row_text(row: &auth::ProviderStatus) -> String {
+    let id = format!("{:<10}", row.provider.id());
+    match (&row.source, &row.masked) {
+        (Some(source), Some(key)) => {
+            let check = match &row.last_check {
+                Some(c) => format!(
+                    "  {} {}",
+                    c.verdict,
+                    session::format_updated(c.at)
+                ),
+                None => String::new(),
+            };
+            format!("{id}{:<30} {key}{check}", source.describe())
+        }
+        _ => format!("{id}not connected — Enter to add a key"),
+    }
+}
+
+/// Compact verdict for the status line after a recheck.
+fn login_verdict_line(verdict: &CheckResult) -> String {
+    match verdict {
+        CheckResult::Confirmed { evidence } => format!("CONFIRMED — {evidence}"),
+        CheckResult::Rejected { http, msg } => format!("REJECTED (HTTP {http}) — {msg}"),
+        CheckResult::Unreachable { msg } => format!("UNREACHABLE — {msg}"),
     }
 }
 
@@ -2290,7 +2612,75 @@ mod tests {
         assert_eq!(move_cursor_line(&lines, 3, 1), Some(8)); // col 3 on row 1
         // …and clamped to a shorter target line.
         let lines = wrap_input("aaaa\nbb", 10);
+
         assert_eq!(move_cursor_line(&lines, 3, 1), Some(7)); // col 2 (clamped)
+    }
+
+    #[test]
+    fn login_panel_opens_and_rows_render() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_login();
+        assert!(matches!(app.focus, Focus::Login));
+        assert_eq!(app.login_rows.len(), Provider::ALL.len());
+        // Selection wraps over exactly the three providers.
+        app.move_login_selection(1);
+        assert_eq!(app.login_selected, 1);
+        app.move_login_selection(-1);
+        app.move_login_selection(-1);
+        assert_eq!(app.login_selected, Provider::ALL.len() - 1);
+        // Row text for an unconnected provider offers the Enter hint.
+        let unconnected = auth::ProviderStatus {
+            provider: Provider::DeepSeek,
+            source: None,
+            masked: None,
+            last_check: None,
+        };
+        assert!(login_row_text(&unconnected).contains("not connected"));
+        let connected = auth::ProviderStatus {
+            provider: Provider::OpenRouter,
+            source: Some(auth::Source::Env),
+            masked: Some(auth::mask("sk-or-v1-abcdefgh")),
+            last_check: None,
+        };
+        let text = login_row_text(&connected);
+        assert!(text.contains("env"));
+        assert!(text.contains("sk-or…efgh"));
+    }
+
+    #[test]
+    fn login_key_entry_focuses_input_and_masks_echo() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_login();
+        app.begin_key_entry();
+        assert!(app.editing_api_key.is_some());
+        assert!(matches!(app.focus, Focus::Input));
+        for c in "super-secret-key".chars() {
+            app.insert_char(c);
+        }
+        assert_eq!(mask_input(&app.input), "*".repeat("super-secret-key".len()));
+        // The masked text must wrap into the same number of visual lines.
+        let plain = input_lines(&app.input, 80);
+        let masked = input_lines(&mask_input(&app.input), 80);
+        assert_eq!(plain.len(), masked.len());
+    }
+
+    #[test]
+    fn login_logout_needs_explicit_confirmation() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_login();
+        app.login_pending_delete = Some(0);
+        // Any key other than y/Enter aborts the logout — nothing is removed.
+        app.handle_login_confirm_key(KeyCode::Char('n'));
+        assert!(app.login_pending_delete.is_none());
+    }
+
+    #[test]
+    fn keyless_boot_lands_on_the_login_panel() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.start_keyless("no API key yet — connect one below");
+        assert!(matches!(app.focus, Focus::Login));
+        assert!(!app.login_rows.is_empty());
+        assert!(app.status.contains("no API key"));
     }
 
     #[test]

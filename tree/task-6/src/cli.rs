@@ -1,10 +1,12 @@
 //! Argument parsing and the non-interactive entry points: one-shot questions,
-//! `--sessions`, and `--verify` (the live z.ai lever proof from a script).
+//! `--sessions`, `--verify`, and the login flows (`--login`, `--keys`,
+//! `--logout`, `--verify-login`) that manage the machine's own API keys.
 
 use clap::Parser;
 use serde_json::Value;
 use std::io::{IsTerminal, Read};
 
+use crate::auth::{self, CheckResult, Provider};
 use crate::billing;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
 use crate::isolation;
@@ -23,6 +25,10 @@ use crate::verify;
     after_help = "Examples:\n  \
         ask                                   open the chat TUI\n  \
         ask \"what is the capital of France?\"   one-shot question\n  \
+        ask --login                           connect an API key (glm/deepseek/openrouter)\n  \
+        printf %s \"$KEY\" | ask --login glm --key-stdin   connect a key from a script\n  \
+        ask --keys                            show configured keys and their sources\n  \
+        ask --verify-login                    live-recheck every configured key\n  \
         ask --verify                          prove z.ai levers with causal signatures\n  \
         ask --verify-billing                  show whether spend is metered or plan quota\n  \
         ask --sessions                        list saved chat sessions\n  \
@@ -122,6 +128,33 @@ pub struct Cli {
     /// Never print the usage/finish_reason line.
     #[arg(long)]
     pub quiet: bool,
+
+    /// Show every provider's key state: source (env/store/legacy), masked
+    /// key, and the last live check. Exits after printing.
+    #[arg(long)]
+    pub keys: bool,
+
+    /// Connect a provider's API key: hidden prompt (or --key-stdin), live
+    /// check against the provider, then 0600 storage in ~/.ask6/auth.json.
+    /// Value is a provider id (glm | deepseek | openrouter); bare --login
+    /// opens an interactive picker. A rejected key is not saved (exit 1).
+    #[arg(long, num_args = 0..=1, value_name = "PROVIDER")]
+    pub login: Option<String>,
+
+    /// With --login: read the key from stdin instead of the hidden prompt
+    /// (for scripts and CI).
+    #[arg(long)]
+    pub key_stdin: bool,
+
+    /// Remove a provider's key from the local store. Env vars and legacy
+    /// files are outside the store's reach and stay.
+    #[arg(long, value_name = "PROVIDER")]
+    pub logout: Option<String>,
+
+    /// Live-recheck every configured key against its provider and print the
+    /// verdicts with evidence.
+    #[arg(long)]
+    pub verify_login: bool,
 }
 
 impl Cli {
@@ -187,6 +220,18 @@ impl Cli {
 pub fn run() -> Res<()> {
     let cli = Cli::parse();
 
+    if cli.keys {
+        return print_keys();
+    }
+    if let Some(id) = cli.logout.as_deref() {
+        return logout(id);
+    }
+    if cli.login.is_some() || cli.key_stdin {
+        return login(cli.login.as_deref(), cli.key_stdin);
+    }
+    if cli.verify_login {
+        return verify_login();
+    }
     if cli.sessions {
         return print_sessions();
     }
@@ -329,6 +374,203 @@ fn print_sessions() -> Res<()> {
         println!("{}", s.line());
     }
     Ok(())
+}
+
+// --- login flows ------------------------------------------------------------
+
+/// `--keys`: one row per provider — source, masked key, last live check.
+fn print_keys() -> Res<()> {
+    let rows = auth::status_all();
+    println!("{:<12} {:<34} {:<24} last live check", "provider", "source", "key");
+    for row in &rows {
+        let (source, key) = match (&row.source, &row.masked) {
+            (Some(s), Some(k)) => (s.describe().to_string(), k.clone()),
+            _ => ("—".to_string(), "—".to_string()),
+        };
+        let check = match &row.last_check {
+            Some(c) => format!("{} {} ({})", c.verdict, session::format_updated(c.at), c.evidence),
+            None => "—".to_string(),
+        };
+        println!("{:<12} {:<34} {:<24} {}", row.provider.id(), source, key, check);
+    }
+    if rows.iter().all(|r| !r.connected()) {
+        println!("\nno keys configured — run `ask --login <provider>` (stored in {}, never in the app)", auth::auth_path().display());
+    }
+    Ok(())
+}
+
+/// `--logout`: drop the key from the local store. Anything outside the store
+/// (env var, legacy file) is reported as out of reach, not silently ignored.
+fn logout(id: &str) -> Res<()> {
+    let provider = Provider::parse(id)?;
+    match auth::disconnect(provider) {
+        Ok(true) => println!(
+            "{}: key removed from {}",
+            provider.label(),
+            auth::auth_path().display()
+        ),
+        Ok(false) => println!(
+            "{}: nothing stored in {} (an env var or legacy file, if any, stays — unset ${} / edit the file yourself)",
+            provider.label(),
+            auth::auth_path().display(),
+            provider.env_var()
+        ),
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// `--verify-login`: live-recheck everything configured.
+fn verify_login() -> Res<()> {
+    let mut configured = Vec::new();
+    for &p in &Provider::ALL {
+        match auth::resolve(p) {
+            Ok(r) => configured.push((p, r.source.describe())),
+            Err(_) => println!("{:<12} — not configured (ask --login {})", p.id(), p.id()),
+        }
+    }
+    if configured.is_empty() {
+        return Err(format!(
+            "no keys configured — run `ask --login <provider>`; keys live in {}",
+            auth::auth_path().display()
+        ));
+    }
+    let mut rejected = 0;
+    for (p, source) in configured {
+        match auth::recheck(p) {
+            Ok(CheckResult::Confirmed { evidence }) => {
+                println!("{:<12} CONFIRMED    [{source}] {evidence}", p.id())
+            }
+            Ok(CheckResult::Rejected { http, msg }) => {
+                rejected += 1;
+                println!("{:<12} REJECTED     [{source}] HTTP {http}: {msg}", p.id())
+            }
+            Ok(CheckResult::Unreachable { msg }) => {
+                println!("{:<12} UNREACHABLE  [{source}] {msg}", p.id())
+            }
+            Err(e) => println!("{:<12} ERROR        {e}", p.id()),
+        }
+    }
+    if rejected > 0 {
+        return Err(format!("{rejected} configured key(s) were rejected by their provider"));
+    }
+    Ok(())
+}
+
+/// `--login`: hidden prompt (or stdin), live check, 0600 store.
+fn login(provider_arg: Option<&str>, key_stdin: bool) -> Res<()> {
+    let provider = match provider_arg.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Provider::parse(s)?,
+        None if key_stdin => {
+            return Err("--key-stdin needs a provider: ask --login glm --key-stdin".into())
+        }
+        None => pick_provider()?,
+    };
+    let key = if key_stdin {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("cannot read stdin: {e}"))?;
+        buf.trim().to_string()
+    } else {
+        prompt_key(provider)?
+    };
+    if key.is_empty() {
+        return Err("empty key — nothing connected".into());
+    }
+    println!("checking {} key live…", provider.label());
+    match auth::connect(provider, &key)? {
+        (CheckResult::Confirmed { evidence }, true) => {
+            println!("CONFIRMED — {} key works: {evidence}", provider.label());
+            println!(
+                "saved to {} (mode 0600, never committed)",
+                auth::auth_path().display()
+            );
+        }
+        (CheckResult::Unreachable { msg }, true) => {
+            println!(
+                "{}: provider unreachable ({msg}) — key saved UNVERIFIED; run `ask --verify-login` later",
+                provider.label()
+            );
+        }
+        (CheckResult::Rejected { http, msg }, false) => {
+            return Err(format!(
+                "REJECTED (HTTP {http}): {msg} — key NOT saved"
+            ));
+        }
+        _ => unreachable!("connect returns only the verdicts above"),
+    }
+    Ok(())
+}
+
+/// Bare `--login` with a terminal: numbered provider picker.
+fn pick_provider() -> Res<Provider> {
+    if !std::io::stdin().is_terminal() {
+        return Err("specify a provider: ask --login glm|deepseek|openrouter".into());
+    }
+    println!("Which provider do you want to connect?");
+    for (i, p) in Provider::ALL.iter().enumerate() {
+        println!("  {}. {} ({})", i + 1, p.label(), p.id());
+    }
+    print!("1-3: ");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("cannot read choice: {e}"))?;
+    let idx: usize = line
+        .trim()
+        .parse()
+        .map_err(|_| format!("not a number: {}", line.trim()))?;
+    Provider::ALL
+        .get(idx.wrapping_sub(1))
+        .copied()
+        .ok_or_else(|| format!("no provider #{idx} (1-3)"))
+}
+
+/// Reads an API key without echo: raw mode, one char at a time, `*` shown
+/// per char. Esc cancels; Ctrl-C restores the terminal and cancels. No new
+/// dependencies — plain crossterm, which the TUI already pulls in.
+fn prompt_key(provider: Provider) -> Res<String> {
+    use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    if !std::io::stdin().is_terminal() {
+        return Err("no terminal for a hidden prompt — use --key-stdin".into());
+    }
+    println!(
+        "{} API key (input hidden; Enter submits, Esc cancels):",
+        provider.label()
+    );
+    enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
+    let mut key = String::new();
+    let outcome = loop {
+        match read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Enter => break Ok(key),
+                KeyCode::Esc => break Err("login cancelled".into()),
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Err("login cancelled (Ctrl-C)".into());
+                }
+                KeyCode::Backspace => {
+                    key.pop();
+                }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    key.push(c);
+                    print!("*");
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => break Err(format!("cannot read key input: {e}")),
+        }
+    };
+    disable_raw_mode().map_err(|e| format!("cannot restore terminal: {e}"))?;
+    println!();
+    outcome.map(|k| k.trim().to_string())
 }
 
 /// Positional args, or stdin when it is piped in. Empty (and a TTY) means
