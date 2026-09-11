@@ -27,6 +27,7 @@ use crate::auth::{self, CheckResult, Provider};
 use crate::config::{self, Effort, Res, Settings};
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
+use crate::tokens::{self, Shape, TokenMeter};
 use crate::verify;
 
 const MAX_CHARS_CHOICES: &[Option<usize>] =
@@ -62,6 +63,13 @@ const COMMANDS: &[&str] = &[
     "context", "effort", "help", "json", "login", "max-tokens", "model", "new", "personas", "quit",
     "rename", "sessions", "settings", "stop", "system", "temp", "top-k", "top-p", "verify",
 ];
+/// Status line + key hints + the token meters.
+const FOOTER_HEIGHT: u16 = 3;
+/// Separator between the token meters, and the width of the one-column right
+/// margin the row keeps so the last meter is not flush against the edge.
+const STATS_SEP: &str = " \u{b7} ";
+const STATS_MARGIN: usize = 1;
+
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
 const SPINNER_FRAMES: &[&str] =
@@ -234,6 +242,13 @@ struct App {
     cmd_popup_dismissed: bool,
     cmd_selected: usize,
     quit: bool,
+    /// Token meters drawn in the footer: measured usage of the session so
+    /// far plus the calibration that turns "what's in the box" into an
+    /// estimate of the next request.
+    tokens: TokenMeter,
+    /// Character/message size of the last request actually sent — the input
+    /// side of the chars-per-token calibration.
+    sent_shape: Shape,
     /// `Some((label, frame))` while a background request is in flight —
     /// rendered as the last line of the transcript, replacing the old
     /// full-screen "working" overlay.
@@ -291,6 +306,8 @@ impl App {
             cmd_popup_dismissed: false,
             cmd_selected: 0,
             quit: false,
+            tokens: TokenMeter::new(),
+            sent_shape: Shape::default(),
             spinner: None,
         }
     }
@@ -722,6 +739,7 @@ impl App {
         self.scroll = 0;
         self.follow = true;
         self.focus = Focus::Input;
+        self.tokens.reset_session();
         self.status = "New chat".into();
     }
 
@@ -752,6 +770,7 @@ impl App {
                 self.save_session();
                 self.settings = s.settings.clone();
                 self.agent.resume(&s);
+                self.tokens.reset_session();
                 self.entries = entries_from_session(&s);
                 self.status = format!("Loaded '{}'", s.title);
                 self.session = s;
@@ -1675,6 +1694,10 @@ impl App {
         self.follow = true;
         self.agent.set_history(self.session.history());
         let history = self.agent.history().to_vec();
+        // Size of exactly what goes out, captured before the reply lands:
+        // dividing it by the provider's `prompt_tokens` is what calibrates
+        // the footer's estimates (see `tokens.rs`).
+        self.sent_shape = self.conversation_shape();
 
         // JSON mode stays on the blocking path: streamed fragments of a JSON
         // object aren't valid JSON until the last token, so there's nothing
@@ -1869,6 +1892,7 @@ impl App {
             *text = capped;
             *n = note;
         }
+        self.tokens.record(self.sent_shape.chars, &outcome.usage);
         self.status = format!(
             "finish={} · tokens: prompt={} completion={} (reasoning={}) · {}ms",
             outcome.finish_reason.as_deref().unwrap_or("?"),
@@ -1897,7 +1921,7 @@ impl App {
             Constraint::Length(1),
             Constraint::Min(4),
             Constraint::Length(input_height),
-            Constraint::Length(2),
+            Constraint::Length(FOOTER_HEIGHT),
         ])
         .areas(f.area());
         self.draw_header(f, header);
@@ -2377,6 +2401,67 @@ impl App {
         );
     }
 
+    /// Size of the whole conversation as it would go out right now: the
+    /// assembled system prompt (system prompt + AGENTS.md context) plus every
+    /// stored message. This is the thing `prompt_tokens` is charged for.
+    fn conversation_shape(&self) -> Shape {
+        let system = self.agent.system_for_request();
+        let system_shape = if system.trim().is_empty() {
+            Shape::default()
+        } else {
+            Shape::new(system.chars().count(), 1)
+        };
+        self.session
+            .history()
+            .iter()
+            .fold(system_shape, |acc, m| acc.plus(Shape::new(m.content.chars().count(), 1)))
+    }
+
+    /// The text in the input box, when it would be sent as a chat message.
+    /// A slash command, a system-prompt edit or an API key never becomes a
+    /// request, so none of them move the meters.
+    fn pending_shape(&self) -> Shape {
+        let typed = self.input.trim();
+        if typed.is_empty()
+            || typed.starts_with('/')
+            || self.editing_system_prompt
+            || self.editing_api_key.is_some()
+        {
+            return Shape::default();
+        }
+        Shape::new(self.input.chars().count(), 1)
+    }
+
+    /// Current query means the text of the pending or most recently sent user
+    /// message. It deliberately excludes the system prompt and prior turns.
+    fn current_query_shape(&self) -> Shape {
+        let pending = self.pending_shape();
+        if !pending.is_empty() {
+            return pending;
+        }
+        self.session
+            .history()
+            .iter()
+            .rev()
+            .find(|m| m.role == api::Role::User)
+            .map(|m| Shape::new(m.content.chars().count(), 1))
+            .unwrap_or_default()
+    }
+
+    /// The four footer meters, widest label first:
+    /// request on the table, session total, last reply, context window.
+    fn token_stats(&self) -> Vec<String> {
+        let conversation = self.conversation_shape();
+        let pending = self.pending_shape();
+        let used = self.tokens.context_used(&conversation, &pending);
+        vec![
+            format!("req {}", self.tokens.current_request(&self.current_query_shape()).label()),
+            format!("sess {}", self.tokens.session(&conversation).label()),
+            format!("last {}", self.tokens.last_reply().label()),
+            format!("ctx {}", tokens::context_label(used, config::context_window(&self.settings.model))),
+        ]
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let keys = if self.spinner.is_some() {
             "Esc stop generation \u{b7} Ctrl-Q quit"
@@ -2389,6 +2474,7 @@ impl App {
             Paragraph::new(vec![
                 Line::styled(format!(" {}", self.status), accent()),
                 Line::styled(format!(" {keys}"), muted()),
+                Line::styled(stats_row(&self.token_stats(), area.width), muted()),
             ]),
             area,
         );
@@ -2422,6 +2508,25 @@ const HELP: &str = "\
 /quit                     exit
 Esc while generating      stop the current generation (partial reply is kept)
 Ctrl-Q                    quit, even mid-generation";
+
+/// Right-aligns the token meters on the last footer row, dropping whole
+/// meters from the left when the terminal is too narrow for all four. The
+/// context meter is the last to go: it is the one with a ceiling in it.
+fn stats_row(stats: &[String], width: u16) -> String {
+    let room = (width as usize).saturating_sub(STATS_MARGIN);
+    let mut first = 0;
+    loop {
+        let text = stats[first..].join(STATS_SEP);
+        if text.chars().count() <= room {
+            let pad = room - text.chars().count();
+            return format!("{}{text} ", " ".repeat(pad));
+        }
+        first += 1;
+        if first >= stats.len() {
+            return String::new();
+        }
+    }
+}
 
 /// One transcript entry as styled lines: `marker` in the left margin of the
 /// first row, two spaces of hanging indent under it, so the glyph column
@@ -2688,6 +2793,86 @@ fn move_cursor_line(lines: &[(usize, String)], cursor: usize, delta: i32) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_meters_start_as_estimates_and_name_all_four_stats() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.session.push_user("привет, как дела?".into());
+        let stats = app.token_stats();
+        assert_eq!(stats.len(), 4);
+        assert!(stats[0].starts_with("req "), "{stats:?}");
+        assert!(stats[1].starts_with("sess "), "{stats:?}");
+        assert!(stats[2].starts_with("last "), "{stats:?}");
+        // Nothing has been sent yet, so the first three are estimates and the
+        // context meter divides by glm-5.3-flash's published window.
+        assert!(stats[0].ends_with('~'), "{stats:?}");
+        assert!(stats[3].starts_with("ctx ") && stats[3].contains("/1.0M"), "{stats:?}");
+        assert_eq!(stats[2], "last 0");
+    }
+
+    #[test]
+    fn a_measured_reply_turns_the_meters_into_exact_numbers() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.session.push_user("hello".into());
+        app.sent_shape = app.conversation_shape();
+        app.tokens.record(
+            app.sent_shape.chars,
+            &api::Usage {
+                prompt_tokens: 120,
+                completion_tokens: 40,
+                reasoning_tokens: 8,
+                total_tokens: 160,
+            },
+        );
+        let stats = app.token_stats();
+        assert_eq!(stats[0], "req 6~");
+        assert_eq!(stats[1], "sess 160");
+        assert_eq!(stats[2], "last 40");
+        assert_eq!(stats[3], "ctx 160/1.0M (0%)");
+        // Typing replaces the current-query estimate and makes context an
+        // estimate again; measured history does not move until a reply.
+        app.input = "next question".into();
+        let typing = app.token_stats();
+        assert!(typing[0].ends_with('~') && typing[0] != stats[0], "{typing:?}");
+        assert!(typing[3].contains('~'), "{typing:?}");
+        assert_eq!(typing[1], stats[1], "session history does not move until a reply");
+    }
+
+    #[test]
+    fn a_slash_command_in_the_box_is_not_counted_as_a_request() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/sessions".into();
+        assert_eq!(app.pending_shape(), Shape::default());
+        app.input = "ask something".into();
+        assert_eq!(app.pending_shape(), Shape::new(13, 1));
+    }
+
+    #[test]
+    fn an_unknown_model_shows_a_question_mark_instead_of_a_made_up_window() {
+        let settings = config::Settings { model: "not-in-the-catalog".into(), ..Default::default() };
+        let app = App::new(Agent::dummy(), settings, None);
+        assert!(app.token_stats()[3].ends_with("/?"), "{:?}", app.token_stats());
+    }
+
+    #[test]
+    fn stats_row_right_aligns_and_drops_meters_on_a_narrow_terminal() {
+        let stats: Vec<String> =
+            ["req 1.2k~", "sess 8.4k", "last 512", "ctx 15k/1.0M (2%)"].iter().map(|s| s.to_string()).collect();
+        let wide = stats_row(&stats, 80);
+        assert_eq!(wide.chars().count(), 80);
+        assert!(wide.starts_with("   "));
+        assert!(wide.trim_end().ends_with("ctx 15k/1.0M (2%)"));
+        assert!(wide.contains("req 1.2k~"));
+        assert!(wide.ends_with(' '), "keeps a right margin");
+
+        // 20 columns fit only the context meter — the one with the ceiling.
+        let narrow = stats_row(&stats, 20);
+        assert_eq!(narrow.chars().count(), 20);
+        assert_eq!(narrow.trim(), "ctx 15k/1.0M (2%)");
+
+        // Narrower than even that: the row goes away rather than clipping.
+        assert_eq!(stats_row(&stats, 10), "");
+    }
 
     #[test]
     fn json_mode_default_is_a_flat_schema() {
