@@ -123,6 +123,18 @@ impl Agent {
         &mut self.settings
     }
 
+    /// Swaps the transport endpoint after the fact — the keyless TUI boot
+    /// starts on `Endpoint::unusable()` and upgrades once `/login` connects
+    /// a key. History, settings and context are untouched.
+    pub fn set_endpoint(&mut self, endpoint: Endpoint) {
+        self.endpoint = endpoint;
+    }
+
+    /// Whether the agent can reach a provider at all right now.
+    pub fn has_api_key(&self) -> bool {
+        self.endpoint.has_key()
+    }
+
     pub fn history(&self) -> &[ChatMessage] {
         &self.history
     }

@@ -139,14 +139,72 @@ https://api.z.ai/api/paas/v4
 Completions: `POST …/chat/completions`. Endpoint `/api/coding/paas/v4` клиент
 никогда не использует.
 
-Ключ (значение нигде не печатается, ни в логах, ни в ошибках):
+## Логин: ключи — личные, на машине
 
-1. `$ZAI_API_KEY`
-2. `~/.pi/agent/auth.json` → `["zai-coding-cn"]["key"]`
-3. `~/.omp/agent/auth.json` — то же поле
+Ключи не зашиты в аппку. Три площадки — `glm` (z.ai), `deepseek`,
+`openrouter` — подключаются через логин: ввёл ключ → **живая проверка у
+провайдера** → сохранён в `~/.ask6/auth.json` (0600, каталог 0700, запись
+атомарная через `.tmp`). Порядок резолва на каждом ходу:
 
-Ключ лежит в слоте coding-плана, но ходит на обычный paas/v4. Если ничего не
-нашлось, ошибка перечисляет эти три места и напоминает про plain URL.
+1. env-переменная площадки (`$ZAI_API_KEY`, `$DEEPSEEK_API_KEY`,
+   `$OPENROUTER_API_KEY`) — чтобы CI и разовые прогоны могли перекрыть всё;
+2. `~/.ask6/auth.json` → `providers.<id>.key` — то, что сохранил логин;
+3. legacy-файлы других инструментов (только чтение): pi/omp
+   `["zai-coding-cn"]["key"]` для glm, `["deepseek"]["key"]`,
+   `["openrouter"]["key"]` у pi и opencode.
+
+Ключ glm по-прежнему лежит в слоте coding-плана legacy-файлов, но ходит на
+обычный paas/v4. Значение нигде не печатается: маска — префикс + последние
+4 символа (`sk-or…324e (len 73)`), `Debug` у хранимых структур маскирован,
+тест-гвардия сканирует `src/*.rs` и падает, найдя литерал вида `sk-…`.
+
+```sh
+ask --login glm            # скрытый ввод, живая проверка, сохранение
+printf %s "$K" | ask --login deepseek --key-stdin   # из скрипта
+ask --keys                 # таблица: площадка | источник | маска | последняя проверка
+ask --verify-login         # живо перепроверить всё настроенное
+ask --logout glm           # убрать из хранилища (env/legacy убрать нельзя)
+```
+
+В TUI то же самое — `/login`: три строки со статусом, `Enter` — ввод ключа
+(звёздочками), `r` — перепроверить, `d` — удалить (с подтверждением y/n).
+Без ключа glm TUI стартует keyless: сразу открывается панель `/login`,
+отправка запрещена до подключения ключа.
+
+**Что значит вердикт.** «Подключено» пишется только когда провайдер ответил
+данными, выведенными из этого ключа (`Confirmed`): openrouter — `GET /key`
+(label/usage/limit), deepseek — `GET /user/balance` (на корне домена, не под
+`/v1`), glm — бесплатного auth-endpoint нет, поэтому дешёвый ключ-производный
+пробой: `POST /chat/completions` c `max_tokens: 1` (доли цента). `401/403` →
+`Rejected`, ключ **не сохраняется**, выход 1. Сеть/5xx → `Unreachable`:
+ключ сохраняется с пометкой `unverified`, «подключено» не заявляется.
+
+Живые прогоны (2026-09-11):
+
+```text
+$ printf %s "$KEY" | ask --login glm --key-stdin
+checking GLM (z.ai) key live…
+CONFIRMED — GLM (z.ai) key works: chat/completions 200: model=glm-5.3-flash, prompt_tokens=13
+saved to /tmp/…/auth.json (mode 0600, never committed)
+
+$ printf %s "sk-bogus-definitely-invalid-key-000" | ask --login glm --key-stdin
+checking GLM (z.ai) key live…
+error: REJECTED (HTTP 401): GLM (z.ai) rejected the key: token expired or incorrect — key NOT saved
+# exit 1, файл хранилища не создан
+
+$ printf %s "$OR_KEY" | ask --login openrouter --key-stdin
+CONFIRMED — OpenRouter key works: key 200: label=…, usage=9.675, limit=null
+$ printf %s "sk-or-bogus-000" | ask --login openrouter --key-stdin
+error: REJECTED (HTTP 401): OpenRouter rejected the key: Missing Authentication header — key NOT saved
+
+$ ask --verify-login
+deepseek     — not configured (ask --login deepseek)
+glm          CONFIRMED    [legacy ~/.pi/agent/auth.json] chat/completions 200: model=glm-5.3-flash, prompt_tokens=13
+openrouter   CONFIRMED    [store …] key 200: label=…, usage=9.675, limit=null
+```
+
+deepseek живьём не проверен — ключа на машине нет; разбор ответов покрыт
+офлайн-тестами `classify` (fixture 200/401/5xx на каждую площадку).
 
 ### Чем платим: `--verify-billing`
 
@@ -200,10 +258,13 @@ cargo build --release --manifest-path tree/task-6/Cargo.toml
 ./tree/task-6/target/release/ask --sessions              # список сессий
 ./tree/task-6/target/release/ask --continue              # последняя сессия
 ./tree/task-6/target/release/ask --resume ID             # сессия по id
+./tree/task-6/target/release/ask --login glm             # подключить ключ (живая проверка)
+./tree/task-6/target/release/ask --keys                  # таблица ключей и источников
+./tree/task-6/target/release/ask --verify-login          # живо перепроверить ключи
 ```
 
-`--verify-stop` — видимый алиас `--verify`. Нужен `$ZAI_API_KEY` (или ключ в
-auth.json, см. выше).
+`--verify-stop` — видимый алиас `--verify`. Нужен настроенный ключ glm
+(`$ZAI_API_KEY`, `ask --login glm` или legacy, см. «Логин»).
 
 ## Runtime-настройки
 
@@ -308,6 +369,7 @@ Shift+Enter требует kitty keyboard protocol; без него деград
 /json schema <json>               произвольный JSON Schema
 /json edit <instruction>          модель переписывает схему
 /json show                        показать схему
+/login                            подключить ключ glm/deepseek/openrouter (Enter ввод, r перепроверка, d удалить)
 /temp [off|0.0-1.0]               температура
 /top-p [off|0.01-1.0]             nucleus
 /top-k [off|full|N]               top-k
@@ -396,8 +458,8 @@ src/cli.rs       clap, one-shot (через Runtime), --verify, --verify-isolati
 src/agent.rs     сущность разговора: settings, history, context, ask/complete/stream
 src/runtime.rs   коробка: AgentBox (agent+session+policies+judge) и Runtime на N боксов
 src/isolation.rs доказательство изоляции сессий: 100 боксов офлайн + live-отзыв токена
-src/api.rs       ключ, тело, POST/SSE, parse; без политики разговора
-src/config.rs    Settings, Effort, каталог моделей, клампы
+src/auth.rs       логин: хранилище ~/.ask6/auth.json, резолв env→store→legacy, живые проверки ключей
+src/api.rs       транспорт: тело, POST/SSE, parse, гвардия моделей; без политики разговора
 src/context.rs   discovery + сборка AGENTS.md / CLAUDE.md в system
 src/session.rs   ~/.ask6/sessions/*.json
 src/render.rs    flatten JSON-ответа («Key: value»), общий для CLI и TUI

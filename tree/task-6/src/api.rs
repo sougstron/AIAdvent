@@ -3,15 +3,14 @@
 //! `agent.rs`. The coding-plan base (`/api/coding/paas/v4`) is never used.
 
 use serde_json::{json, Value};
-use std::env;
-use std::fs;
+use crate::auth::{self, Provider};
+use crate::config::{Res, Settings, DEFAULT_MODEL};
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::{Res, Settings, DEFAULT_MODEL};
+
 
 /// Plain (non-coding-plan) OpenAI-compatible base.
 pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
@@ -22,6 +21,7 @@ pub const LIVE_COMPLETION_MODEL: &str = DEFAULT_MODEL;
 
 #[derive(Clone)]
 pub struct Endpoint {
+    pub provider: Provider,
     pub base_url: String,
     api_key: String,
 }
@@ -29,9 +29,11 @@ pub struct Endpoint {
 impl Endpoint {
     /// Carries no key and points nowhere, so any request through it fails.
     /// Used by code paths that must provably not reach the network — tests,
-    /// and the offline half of the isolation proof.
+    /// the offline half of the isolation proof, and the keyless TUI boot
+    /// before `/login` connects a key.
     pub fn unusable() -> Endpoint {
         Endpoint {
+            provider: Provider::Glm,
             base_url: "http://unused.invalid".into(),
             api_key: String::new(),
         }
@@ -42,83 +44,49 @@ impl Endpoint {
         Endpoint::unusable()
     }
 
+    pub fn has_key(&self) -> bool {
+        !self.api_key.is_empty()
+    }
+
+    /// Default endpoint: z.ai with the glm key. Kept so existing call sites
+    /// and tests keep their "glm by default" behavior; `for_provider` is
+    /// the explicit form.
     pub fn resolve() -> Res<Endpoint> {
+        Endpoint::for_provider(Provider::Glm)
+    }
+
+    /// Resolves the endpoint from the user's own machine: `$ENV` →
+    /// `~/.ask6/auth.json` → legacy files. See `auth::resolve`.
+    pub fn for_provider(provider: Provider) -> Res<Endpoint> {
+        let resolved = auth::resolve(provider)?;
         Ok(Endpoint {
-            base_url: DEFAULT_BASE_URL.into(),
-            api_key: resolve_api_key()?,
+            provider,
+            base_url: resolved.base_url,
+            api_key: resolved.key,
         })
     }
 }
 
-pub fn resolve_api_key() -> Res<String> {
-    let home = env::var("HOME").unwrap_or_default();
-    let pi = PathBuf::from(&home).join(".pi/agent/auth.json");
-    let omp = PathBuf::from(&home).join(".omp/agent/auth.json");
-    resolve_api_key_from(env::var("ZAI_API_KEY").ok().as_deref(), Some(&pi), Some(&omp))
-}
 
-/// Resolution order, never printing the key:
-/// 1. `$ZAI_API_KEY`
-/// 2. `~/.pi/agent/auth.json` → `["zai-coding-cn"]["key"]`
-/// 3. `~/.omp/agent/auth.json` equivalent
-pub fn resolve_api_key_from(
-    env_key: Option<&str>,
-    pi_auth: Option<&Path>,
-    omp_auth: Option<&Path>,
-) -> Res<String> {
-    if let Some(key) = env_key.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(key.to_string());
-    }
-    if let Some(path) = pi_auth {
-        if let Some(key) = key_from_auth_file(path)? {
-            return Ok(key);
-        }
-    }
-    if let Some(path) = omp_auth {
-        if let Some(key) = key_from_auth_file(path)? {
-            return Ok(key);
-        }
-    }
-    Err(missing_key_error(pi_auth, omp_auth))
-}
-
-fn missing_key_error(pi_auth: Option<&Path>, omp_auth: Option<&Path>) -> String {
-    let pi = pi_auth
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.pi/agent/auth.json".into());
-    let omp = omp_auth
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.omp/agent/auth.json".into());
-    format!(
-        "no z.ai API key found. Set $ZAI_API_KEY, or put an `{{\"type\":\"api_key\",\"key\":\"...\"}}` \
-entry at [\"zai-coding-cn\"][\"key\"] in {pi} or {omp}. \
-Using {DEFAULT_BASE_URL} (the plain API, not the coding-plan endpoint)."
-    )
-}
-
-fn key_from_auth_file(path: &Path) -> Res<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let v: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-    let key = v
-        .get("zai-coding-cn")
-        .and_then(|e| e.get("key"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    Ok(key)
-}
-
-pub fn guard_live_model(model: &str) -> Res<()> {
-    if model != LIVE_COMPLETION_MODEL {
+/// Per-provider money guard: the one model tier that may be called live.
+/// glm: only the flash tier; deepseek: only the chat tier; openrouter: only
+/// `:free` ids. Everything else stays selectable but is refused at send time.
+pub fn guard_live_model(provider: Provider, model: &str) -> Res<()> {
+    let allowed = match provider {
+        Provider::Glm => model == LIVE_COMPLETION_MODEL,
+        Provider::DeepSeek => model == "deepseek-chat",
+        Provider::OpenRouter => model.ends_with(":free"),
+    };
+    if !allowed {
+        let what = match provider {
+            Provider::Glm => format!("only `{LIVE_COMPLETION_MODEL}`"),
+            Provider::DeepSeek => "only `deepseek-chat`".to_string(),
+            Provider::OpenRouter => "only ids ending in `:free`".to_string(),
+        };
         return Err(format!(
-            "refusing to call `{model}`: only `{LIVE_COMPLETION_MODEL}` may be used for live \
-completions (other catalog models are expensive)"
+            "refusing to call `{model}` on {}: {what} may be used for live \
+completions (other catalog models are expensive)",
+            provider.id()
         ));
     }
     Ok(())
@@ -294,7 +262,7 @@ pub fn chat(
     history: &[ChatMessage],
     schema: Option<&Value>,
 ) -> Res<Outcome> {
-    guard_live_model(&settings.model)?;
+    guard_live_model(ep.provider, &settings.model)?;
     let body = build_body(&settings.model, settings, system, history, schema);
     post_completion(ep, body)
 }
@@ -488,7 +456,7 @@ pub fn chat_stream(
     schema: Option<&Value>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Res<ChatStream> {
-    guard_live_model(&settings.model)?;
+    guard_live_model(ep.provider, &settings.model)?;
     let mut body = build_body(&settings.model, settings, system, history, schema);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("stream".into(), json!(true));
@@ -558,7 +526,6 @@ pub fn enforce_max_chars(text: &str, max_chars: Option<usize>) -> (String, bool)
 mod tests {
     use super::*;
     use crate::config::{Effort, Settings};
-    use std::io::Write;
 
     fn body_for(settings: &Settings) -> Value {
         build_body(
@@ -764,69 +731,22 @@ mod tests {
 
     #[test]
     fn guard_rejects_expensive_catalog_models() {
-        assert!(guard_live_model("glm-5.3-flash").is_ok());
-        let err = guard_live_model("glm-5.3").unwrap_err();
+        assert!(guard_live_model(Provider::Glm, "glm-5.3-flash").is_ok());
+        let err = guard_live_model(Provider::Glm, "glm-5.3").unwrap_err();
         assert!(err.contains("glm-5.3-flash"));
         assert!(err.contains("expensive"));
     }
 
     #[test]
-    fn key_env_wins_over_auth_files() {
-        let dir = std::env::temp_dir().join(format!("ask-key-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let pi = dir.join("pi.json");
-        let mut f = fs::File::create(&pi).unwrap();
-        write!(f, r#"{{"zai-coding-cn":{{"type":"api_key","key":"from-file"}}}}"#).unwrap();
-        let key = resolve_api_key_from(Some("from-env"), Some(&pi), None).unwrap();
-        assert_eq!(key, "from-env");
-        let _ = fs::remove_dir_all(&dir);
+    fn guard_is_provider_specific() {
+        assert!(guard_live_model(Provider::DeepSeek, "deepseek-chat").is_ok());
+        let err = guard_live_model(Provider::DeepSeek, "deepseek-reasoner").unwrap_err();
+        assert!(err.contains("deepseek-chat"));
+        assert!(err.contains("expensive"));
+        assert!(guard_live_model(Provider::OpenRouter, "meta-llama/llama-3.3-70b-instruct:free").is_ok());
+        assert!(guard_live_model(Provider::OpenRouter, "openai/gpt-4o").is_err());
     }
 
-    #[test]
-    fn key_falls_through_pi_then_omp() {
-        let dir = std::env::temp_dir().join(format!("ask-key2-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let pi = dir.join("pi.json");
-        let omp = dir.join("omp.json");
-        fs::write(&pi, "{}").unwrap();
-        fs::write(
-            &omp,
-            r#"{"zai-coding-cn":{"type":"api_key","key":"from-omp"}}"#,
-        )
-        .unwrap();
-        let key = resolve_api_key_from(None, Some(&pi), Some(&omp)).unwrap();
-        assert_eq!(key, "from-omp");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn key_missing_names_the_locations() {
-        let dir = std::env::temp_dir().join(format!("ask-key3-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let pi = dir.join("missing-pi.json");
-        let omp = dir.join("missing-omp.json");
-        let err = resolve_api_key_from(None, Some(&pi), Some(&omp)).unwrap_err();
-        assert!(err.contains("ZAI_API_KEY"));
-        assert!(err.contains("zai-coding-cn"));
-        assert!(err.contains(&pi.display().to_string()));
-        assert!(err.contains(&omp.display().to_string()));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn empty_env_key_is_ignored() {
-        let dir = std::env::temp_dir().join(format!("ask-key4-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let pi = dir.join("pi.json");
-        fs::write(
-            &pi,
-            r#"{"zai-coding-cn":{"type":"api_key","key":"from-pi"}}"#,
-        )
-        .unwrap();
-        let key = resolve_api_key_from(Some("  "), Some(&pi), None).unwrap();
-        assert_eq!(key, "from-pi");
-        let _ = fs::remove_dir_all(&dir);
-    }
 
     const SAMPLE_SSE: &str = concat!(
         "data: {\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",

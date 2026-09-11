@@ -32,6 +32,14 @@ CONFIRMED when the causal signature (`finish_reason`, token/char counts)
 actually shows the cutoff, not just "the text differs" (LLM sampling alone
 can make two runs differ). Don't weaken that check to a text-diff heuristic.
 
+Since task-6, personal provider keys (glm / deepseek / openrouter) are never
+baked into the app: `ask --login <provider>` live-checks a key against the
+provider and stores it in `~/.ask6/auth.json` (0600). `ask --keys` shows
+every provider's source, `ask --verify-login` rechecks them live. Resolution
+order: env var → store → legacy files (`~/.pi/agent/auth.json`,
+`~/.omp/agent/auth.json`, `~/.local/share/opencode/auth.json`). Details:
+`tree/task-6/README.md`, раздел «Логин».
+
 ## TUI smoke testing
 
 Automated tests don't cover terminal rendering. When touching `src/tui.rs`,
