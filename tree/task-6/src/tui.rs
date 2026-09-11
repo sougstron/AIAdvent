@@ -92,11 +92,17 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
     // Keyless boot: a missing key must not keep the app from starting —
     // the whole point of /login is to connect one from inside. The agent
     // comes up on a provably unusable endpoint until a key is connected.
-    let (mut agent, boot) = match Agent::new(settings.clone()) {
-        Ok(a) => (a, None),
+    // If *some* provider is connected but not the one that owns the current
+    // model, we still boot — the picker will offer that provider's ids.
+    let (mut agent, boot) = match Endpoint::for_model(&settings.model) {
+        Ok(ep) => (Agent::with_endpoint(ep, settings.clone()), None),
         Err(e) => (
             Agent::with_endpoint(Endpoint::unusable(), settings.clone()),
-            Some(format!("no API key yet — connect one below ({e})")),
+            if auth::connected_providers().is_empty() {
+                Some(format!("no API key yet — connect one below ({e})"))
+            } else {
+                None
+            },
         ),
     };
     let settings = if let Some(ref session) = loaded {
@@ -123,6 +129,8 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
     let mut app = App::new(agent, settings, loaded);
     if let Some(msg) = boot {
         app.start_keyless(&msg);
+    } else {
+        app.warn_if_model_unavailable();
     }
     let result = app.event_loop(&mut terminal);
     let _ = ratatui::crossterm::execute!(
@@ -176,6 +184,11 @@ struct App {
     /// When set, the input box is entering an API key for this provider —
     /// same trick as `editing_system_prompt`, but the text renders masked.
     editing_api_key: Option<Provider>,
+    /// Providers whose key currently resolves. Tests set this directly and
+    /// never call `auth::resolve`.
+    connected: Vec<Provider>,
+    /// Catalog ids for `connected`, in catalog order.
+    available: Vec<&'static str>,
     settings_selected: usize,
     /// Cursor inside the model-picker overlay (independent of `settings_selected`).
     model_selected: usize,
@@ -208,11 +221,22 @@ impl App {
                 "Type a message and press Enter · /help for commands".into(),
             ),
         };
+        // Tests construct App with dummy() then set `connected` themselves —
+        // calling resolve() here would make cargo test depend on $HOME.
+        let (connected, available) = if cfg!(test) {
+            (Vec::new(), Vec::new())
+        } else {
+            let c = auth::connected_providers();
+            let a = config::available_ids(&c);
+            (c, a)
+        };
         App {
             login_selected: 0,
             login_rows: Vec::new(),
             login_pending_delete: None,
             editing_api_key: None,
+            connected,
+            available,
             agent,
             session,
             settings,
@@ -688,6 +712,8 @@ impl App {
                 self.entries = entries_from_session(&s);
                 self.status = format!("Loaded '{}'", s.title);
                 self.session = s;
+                self.retarget_endpoint();
+                self.warn_if_model_unavailable();
                 self.scroll_to_bottom(terminal);
             }
             Err(e) => self.status = format!("load failed: {e}"),
@@ -756,22 +782,19 @@ impl App {
             self.open_model_picker();
             return;
         }
-        match config::MODEL_CATALOG.iter().find(|m| m.eq_ignore_ascii_case(rest)) {
-            Some(id) => {
-                self.settings.model = (*id).to_string();
-                self.status = if *id == config::DEFAULT_MODEL {
-                    format!("model set to {id}")
-                } else {
-                    format!(
-                        "model set to {id} — only {} is enabled for live calls; this one is refused at send time",
-                        config::DEFAULT_MODEL
-                    )
-                };
+        match config::MODEL_CATALOG
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(rest))
+        {
+            Some(cm) if self.connected.contains(&cm.provider) => {
+                self.apply_model_id(cm);
             }
-            None => self.entries.push(Entry::Info(format!(
-                "unknown model `{rest}`; catalog: {}",
-                config::MODEL_CATALOG.join(", ")
+            Some(cm) => self.entries.push(Entry::Info(format!(
+                "no {} key — /login {}",
+                cm.provider.label(),
+                cm.provider.id()
             ))),
+            None => self.entries.push(Entry::Info(config::catalog_error(rest))),
         }
     }
 
@@ -899,7 +922,8 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
-        self.model_selected = config::MODEL_CATALOG
+        self.model_selected = self
+            .available
             .iter()
             .position(|m| *m == self.settings.model)
             .unwrap_or(0);
@@ -907,32 +931,76 @@ impl App {
     }
 
     fn handle_model_key(&mut self, code: KeyCode) {
+        let n = self.available.len();
         match code {
             KeyCode::Esc => self.focus = Focus::Settings,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.model_selected = (self.model_selected + config::MODEL_CATALOG.len() - 1)
-                    % config::MODEL_CATALOG.len()
+            KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                self.model_selected = (self.model_selected + n - 1) % n;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.model_selected = (self.model_selected + 1) % config::MODEL_CATALOG.len()
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.model_selected = (self.model_selected + 1) % n;
             }
-            KeyCode::Enter => self.apply_model_choice(),
+            KeyCode::Enter if n > 0 => self.apply_model_choice(),
             _ => {}
         }
     }
 
     fn apply_model_choice(&mut self) {
-        let id = config::MODEL_CATALOG[self.model_selected];
-        self.settings.model = id.to_string();
-        self.status = if id == config::DEFAULT_MODEL {
-            format!("model set to {id}")
+        let Some(id) = self.available.get(self.model_selected).copied() else {
+            return;
+        };
+        let Some(cm) = config::find_model(id) else {
+            return;
+        };
+        self.apply_model_id(cm);
+        self.focus = Focus::Settings;
+    }
+
+    fn apply_model_id(&mut self, cm: &config::CatalogModel) {
+        self.settings.model = cm.id.to_string();
+        self.status = if cm.live {
+            format!("model set to {}", cm.id)
         } else {
             format!(
-                "model set to {id} — only {} is enabled for live calls; this one is refused at send time",
-                config::DEFAULT_MODEL
+                "model set to {} — refused at send (paid); `ask --models` lists live ids",
+                cm.id
             )
         };
-        self.focus = Focus::Settings;
+        self.retarget_endpoint();
+    }
+
+    fn retarget_endpoint(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        match Endpoint::for_model(&self.settings.model) {
+            Ok(ep) => self.agent.set_endpoint(ep),
+            Err(e) => {
+                // Keep the old endpoint rather than pointing at a provider
+                // that does not match settings.model.
+                self.status = e;
+            }
+        }
+    }
+
+    fn warn_if_model_unavailable(&mut self) {
+        let Some(p) = config::provider_of(&self.settings.model) else {
+            return;
+        };
+        if self.connected.contains(&p) {
+            return;
+        }
+        self.entries.push(Entry::Info(format!(
+            "{} is no longer available — its key is gone (/login {})",
+            self.settings.model,
+            p.id()
+        )));
+    }
+
+    #[cfg(test)]
+    fn with_connected(&mut self, connected: Vec<Provider>) {
+        self.connected = connected;
+        self.available = config::available_ids(&self.connected);
     }
 
     fn open_system_prompt_editor(&mut self) {
@@ -967,6 +1035,10 @@ impl App {
         if self.login_selected >= self.login_rows.len() {
             self.login_selected = 0;
         }
+        if !cfg!(test) {
+            self.connected = auth::connected_providers();
+            self.available = config::available_ids(&self.connected);
+        }
     }
 
 
@@ -981,14 +1053,31 @@ impl App {
         let Some(idx) = self.login_pending_delete.take() else { return };
         let Some(row) = self.login_rows.get(idx) else { return };
         let provider = row.provider;
+        let model_hit = config::provider_of(&self.settings.model) == Some(provider);
         match auth::disconnect(provider) {
             Ok(true) => {
-                self.status =
-                    format!("{}: key removed from {}", provider.label(), auth::auth_path().display());
+                if cfg!(test) {
+                    self.connected.retain(|p| *p != provider);
+                    self.available = config::available_ids(&self.connected);
+                }
+                if model_hit {
+                    self.agent.set_endpoint(Endpoint::unusable());
+                    self.status = format!(
+                        "{} is no longer available — its key was removed (/login {})",
+                        self.settings.model,
+                        provider.id()
+                    );
+                } else {
+                    self.status = format!(
+                        "{}: key removed from {}",
+                        provider.label(),
+                        auth::auth_path().display()
+                    );
+                }
             }
             Ok(false) => {
                 self.status = format!(
-                    "{}: nothing in the local store — an env var or legacy file, if any, stays",
+                    "{}: nothing in the local store — an env var, if any, stays",
                     provider.label()
                 );
             }
@@ -1094,12 +1183,25 @@ impl App {
         }
         self.refresh_login_rows();
     }
-    /// A freshly connected glm key upgrades a keyless boot immediately.
+    /// A freshly connected key upgrades a keyless boot when it owns the
+    /// current model, or when it is the only connected provider.
     fn after_login_success(&mut self, provider: Provider) {
-        if provider == Provider::Glm && !self.agent.has_api_key() {
-            if let Ok(ep) = Endpoint::for_provider(Provider::Glm) {
-                self.agent.set_endpoint(ep);
+        if cfg!(test) {
+            if !self.connected.contains(&provider) {
+                self.connected.push(provider);
+                self.available = config::available_ids(&self.connected);
             }
+        } else {
+            self.connected = auth::connected_providers();
+            self.available = config::available_ids(&self.connected);
+        }
+        if self.agent.has_api_key() {
+            return;
+        }
+        let owns = config::provider_of(&self.settings.model) == Some(provider);
+        let only = self.connected.len() == 1;
+        if owns || only {
+            self.retarget_endpoint();
         }
     }
 
@@ -1483,8 +1585,12 @@ impl App {
     fn adjust_setting(&mut self, delta: i32) {
         match SETTINGS_ROWS.get(self.settings_selected).copied().unwrap_or("") {
             "model" => {
+                if self.available.is_empty() {
+                    return;
+                }
                 self.settings.model =
-                    cycle_choice(config::MODEL_CATALOG, self.settings.model.as_str(), delta).to_string();
+                    cycle_choice(&self.available, self.settings.model.as_str(), delta).to_string();
+                self.retarget_endpoint();
             }
             "effort" => self.settings.effort = self.settings.effort.cycle(delta),
             "json mode" => self.settings.json_mode.enabled = !self.settings.json_mode.enabled,
@@ -1942,12 +2048,28 @@ impl App {
 
     fn setting_value(&self, row: usize) -> String {
         match SETTINGS_ROWS.get(row).copied().unwrap_or("") {
-            "model" => format!(
-                "{}  ({} in catalog — Enter opens picker)",
-                self.settings.model,
-                config::MODEL_CATALOG.len()
-            ),
-            "effort" => self.settings.effort.to_string(),
+            "model" => {
+                let n = self.available.len();
+                let total = config::MODEL_CATALOG.len();
+                let mut s = format!(
+                    "{}  ({n} available of {total} in catalog — Enter opens picker)",
+                    self.settings.model
+                );
+                if config::provider_of(&self.settings.model)
+                    .is_some_and(|p| !self.connected.contains(&p))
+                {
+                    s.push_str("  [no key]");
+                }
+                s
+            }
+            "effort" => match config::provider_of(&self.settings.model) {
+                Some(p) if p != Provider::Glm => format!(
+                    "{}  (glm only — ignored for {})",
+                    self.settings.effort,
+                    p.id()
+                ),
+                _ => self.settings.effort.to_string(),
+            },
             "json mode" => if self.settings.json_mode.enabled { "on" } else { "off" }.into(),
             "max_chars" => self.settings.max_chars.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
             "budget_tokens" => {
@@ -1978,37 +2100,49 @@ impl App {
     }
 
     fn draw_model_overlay(&self, f: &mut Frame, area: Rect) {
+        let rows = if self.available.is_empty() {
+            1
+        } else {
+            self.available.len()
+        };
         let popup = centered(
             area,
-            64,
-            (config::MODEL_CATALOG.len() as u16 + 2)
+            78,
+            (rows as u16 + 2)
                 .min(area.height.saturating_sub(2))
                 .max(4),
         );
-        let items: Vec<ListItem> = config::MODEL_CATALOG
-            .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                let cursor = if i == self.model_selected { "▸ " } else { "  " };
-                let applied = *id == self.settings.model;
-                let mark = if applied { "● " } else { "  " };
-                let style = if applied {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(Line::from(vec![
-                    Span::raw(cursor),
-                    Span::styled(format!("{mark}{id}"), style),
-                ]))
-            })
-            .collect();
+        let items: Vec<ListItem> = if self.available.is_empty() {
+            vec![ListItem::new("no providers connected — press Esc, then /login")]
+        } else {
+            self.available
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let cursor = if i == self.model_selected { "▸ " } else { "  " };
+                    let applied = *id == self.settings.model;
+                    let live = config::find_model(id).is_some_and(|m| m.live);
+                    let mark = if live { "● " } else { "○ " };
+                    let style = if applied {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(cursor),
+                        Span::styled(format!("{mark}{id}"), style),
+                    ]))
+                })
+                .collect()
+        };
         let mut state = ListState::default();
-        state.select(Some(self.model_selected));
+        if !self.available.is_empty() {
+            state.select(Some(self.model_selected.min(self.available.len() - 1)));
+        }
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
             List::new(items).block(Block::bordered().title(
-                " model — ↑↓ select, Enter apply, Esc cancel (only glm-5.3-flash is live) ",
+                " model — ↑↓ select, Enter apply, Esc cancel (● live · ○ refused at send) ",
             )),
             popup,
             &mut state,
@@ -2453,22 +2587,21 @@ mod tests {
     #[test]
     fn model_row_cycles_the_catalog_both_ways() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.with_connected(vec![Provider::Glm]);
         let model_row = SETTINGS_ROWS.iter().position(|r| *r == "model").unwrap();
         app.settings_selected = model_row;
         assert_eq!(app.settings.model, config::DEFAULT_MODEL);
         app.adjust_setting(1);
-        assert_eq!(app.settings.model, config::MODEL_CATALOG[0]);
+        assert_eq!(app.settings.model, "glm-4.5");
         app.settings.model = config::DEFAULT_MODEL.to_string();
         app.adjust_setting(-1);
-        assert_eq!(
-            app.settings.model,
-            config::MODEL_CATALOG[config::MODEL_CATALOG.len() - 2]
-        );
+        assert_eq!(app.settings.model, "glm-5.3");
     }
 
     #[test]
     fn cmd_model_sets_catalog_id_and_rejects_unknown() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.with_connected(vec![Provider::Glm]);
         app.cmd_model("glm-4.6");
         assert_eq!(app.settings.model, "glm-4.6");
         app.cmd_model("nope");
@@ -2483,13 +2616,51 @@ mod tests {
     #[test]
     fn open_model_picker_seeds_cursor_at_current_model() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.with_connected(vec![Provider::Glm]);
         app.settings.model = "glm-4.6".into();
         app.open_model_picker();
         assert!(matches!(app.focus, Focus::Model));
         assert_eq!(
             app.model_selected,
-            config::MODEL_CATALOG.iter().position(|m| *m == "glm-4.6").unwrap()
+            app.available.iter().position(|m| *m == "glm-4.6").unwrap()
         );
+    }
+
+    #[test]
+    fn model_picker_with_no_keys_is_empty_and_does_not_panic() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        assert!(app.available.is_empty());
+        app.open_model_picker();
+        app.handle_model_key(KeyCode::Down);
+        app.handle_model_key(KeyCode::Up);
+        app.handle_model_key(KeyCode::Enter);
+        assert_eq!(app.settings.model, config::DEFAULT_MODEL);
+        assert!(matches!(app.focus, Focus::Model));
+    }
+
+    #[test]
+    fn model_picker_hides_providers_without_keys() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.with_connected(vec![Provider::Glm]);
+        assert!(app.available.contains(&"glm-5.3-flash"));
+        assert!(!app.available.iter().any(|id| id.starts_with("deepseek") || id.contains(":free")));
+        app.with_connected(vec![Provider::Glm, Provider::OpenRouter]);
+        assert!(app.available.iter().any(|id| id.ends_with(":free")));
+        assert!(!app.available.contains(&"deepseek-chat"));
+    }
+
+    #[test]
+    fn cmd_model_on_unconnected_provider_explains_login() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.with_connected(vec![Provider::Glm]);
+        app.cmd_model("deepseek-chat");
+        assert_eq!(app.settings.model, config::DEFAULT_MODEL);
+        let Some(Entry::Info(info)) = app.entries.last() else {
+            panic!("expected Info entry after unconnected model");
+        };
+        assert!(info.contains("no DeepSeek key"), "{info}");
+        assert!(info.contains("/login deepseek"), "{info}");
+        assert!(!info.contains("unknown model"), "{info}");
     }
 
     #[test]

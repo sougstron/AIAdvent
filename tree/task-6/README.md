@@ -148,28 +148,54 @@ Completions: `POST …/chat/completions`. Endpoint `/api/coding/paas/v4` кли�
 
 1. env-переменная площадки (`$ZAI_API_KEY`, `$DEEPSEEK_API_KEY`,
    `$OPENROUTER_API_KEY`) — чтобы CI и разовые прогоны могли перекрыть всё;
-2. `~/.ask6/auth.json` → `providers.<id>.key` — то, что сохранил логин;
-3. legacy-файлы других инструментов (только чтение): pi/omp
-   `["zai-coding-cn"]["key"]` для glm, `["deepseek"]["key"]`,
-   `["openrouter"]["key"]` у pi и opencode.
+2. `~/.ask6/auth.json` → `providers.<id>.key` — то, что сохранил логин.
 
-Ключ glm по-прежнему лежит в слоте coding-плана legacy-файлов, но ходит на
-обычный paas/v4. Значение нигде не печатается: маска — префикс + последние
-4 символа (`sk-or…324e (len 73)`), `Debug` у хранимых структур маскирован,
-тест-гвардия сканирует `src/*.rs` и падает, найдя литерал вида `sk-…`.
+Ничего больше не читается. Файлы других локальных инструментов
+(`~/.pi/agent/auth.json`, `~/.omp/agent/auth.json`,
+`~/.local/share/opencode/auth.json`) намеренно игнорируются. Если такой
+файл ещё лежит на диске, ошибка «нет ключа» добавляет одну строку —
+`note: a key from another tool's file is no longer read — run ask --login <p> once to store it here` —
+без открытия и без копирования ключа. Значение нигде не печатается: маска —
+префикс + последние 4 символа (`sk-or…324e (len 73)`), `Debug` у хранимых
+структур маскирован, тест-гвардия сканирует `src/*.rs` и падает, найдя
+литерал вида `sk-…`.
 
 ```sh
 ask --login glm            # скрытый ввод, живая проверка, сохранение
 printf %s "$K" | ask --login deepseek --key-stdin   # из скрипта
-ask --keys                 # таблица: площадка | источник | маска | последняя проверка
+ask --keys                 # таблица: площадка | источник (env/store) | маска | последняя проверка
+ask --models               # каталог по площадкам: live / refused (paid) / no key
+ask --models --live        # то же + GET /models у подключённых, отчёт о дрифте
 ask --verify-login         # живо перепроверить всё настроенное
-ask --logout glm           # убрать из хранилища (env/legacy убрать нельзя)
+ask --logout glm           # убрать из хранилища (env, если есть, остаётся — unset $ZAI_API_KEY)
 ```
 
 В TUI то же самое — `/login`: три строки со статусом, `Enter` — ввод ключа
 (звёздочками), `r` — перепроверить, `d` — удалить (с подтверждением y/n).
-Без ключа glm TUI стартует keyless: сразу открывается панель `/login`,
-отправка запрещена до подключения ключа.
+Без ключей TUI стартует keyless: сразу открывается панель `/login`,
+отправка запрещена до подключения ключа. Модели площадки не предлагаются,
+пока её ключ не резолвится (env или store).
+
+### Каталог моделей
+
+Пикер и `--model` показывают только id тех площадок, чей ключ сейчас есть.
+Нет ключа — нет строк в списке. Выбор модели перенаправляет запрос на
+endpoint этой площадки (`Endpoint::for_model`).
+
+- **glm** (`GET https://api.z.ai/api/paas/v4/models`, 2026-09-07): 10 id.
+  Live только `glm-5.3-flash`. Остальные выбираются, на отправке отказ.
+- **deepseek** — из документации, не live-listed (на машине не было ключа
+  2026-09-11; `GET https://api.deepseek.com/models` без ключа отвечает
+  `Authentication Fails`): `deepseek-chat` (live), `deepseek-reasoner` (paid).
+- **openrouter** (`GET https://openrouter.ai/api/v1/models`, публично,
+  2026-09-11): 439 id, из них 19 `:free`. В каталоге — эти 19 (`live`) плюс
+  шесть платных флагманов (`anthropic/claude-opus-5`, `anthropic/claude-sonnet-5`,
+  `openai/gpt-5`, `z-ai/glm-5.3`, `deepseek/deepseek-v3.2`,
+  `meta-llama/llama-3.3-70b-instruct`). Ростер `:free` меняется еженедельно —
+  `ask --models --live` показывает дрифт, каталог сам не правится.
+
+Деньги: `api::guard_live_model` — единственное правило live-вызова; поле
+`CatalogModel::live` с ним сверяет тест. `/effort` на проводе только у glm.
 
 **Что значит вердикт.** «Подключено» пишется только когда провайдер ответил
 данными, выведенными из этого ключа (`Confirmed`): openrouter — `GET /key`
@@ -199,7 +225,7 @@ error: REJECTED (HTTP 401): OpenRouter rejected the key: Missing Authentication 
 
 $ ask --verify-login
 deepseek     — not configured (ask --login deepseek)
-glm          CONFIRMED    [legacy ~/.pi/agent/auth.json] chat/completions 200: model=glm-5.3-flash, prompt_tokens=13
+glm          CONFIRMED    [store ~/.ask6/auth.json] chat/completions 200: model=glm-5.3-flash, prompt_tokens=13
 openrouter   CONFIRMED    [store …] key 200: label=…, usage=9.675, limit=null
 ```
 
@@ -249,22 +275,21 @@ expensive».
 cargo build --release --manifest-path tree/task-6/Cargo.toml
 # бинарник: tree/task-6/target/release/ask
 # target/ в gitignore — артефакт сборки в снапшот не коммитится
-```
 
-```sh
 ./tree/task-6/target/release/ask                         # чат-TUI
 ./tree/task-6/target/release/ask "вопрос"                # one-shot
+./tree/task-6/target/release/ask --models               # каталог: live / paid / no key
+./tree/task-6/target/release/ask --login glm             # подключить ключ (живая проверка)
+./tree/task-6/target/release/ask --keys                  # таблица ключей и источников
+./tree/task-6/target/release/ask --verify-login          # живо перепроверить ключи
 ./tree/task-6/target/release/ask --verify                # живой self-test рычагов
 ./tree/task-6/target/release/ask --sessions              # список сессий
 ./tree/task-6/target/release/ask --continue              # последняя сессия
 ./tree/task-6/target/release/ask --resume ID             # сессия по id
-./tree/task-6/target/release/ask --login glm             # подключить ключ (живая проверка)
-./tree/task-6/target/release/ask --keys                  # таблица ключей и источников
-./tree/task-6/target/release/ask --verify-login          # живо перепроверить ключи
 ```
 
 `--verify-stop` — видимый алиас `--verify`. Нужен настроенный ключ glm
-(`$ZAI_API_KEY`, `ask --login glm` или legacy, см. «Логин»).
+(`$ZAI_API_KEY` или `ask --login glm`, см. «Логин»).
 
 ## Runtime-настройки
 
@@ -273,7 +298,7 @@ cargo build --release --manifest-path tree/task-6/Cargo.toml
 
 | рычаг | где | на проводе | диапазон / заметка |
 |---|---|---|---|
-| `model` | `/model`, settings, `--model` | `model` | каталог; live только `glm-5.3-flash` |
+| `model` | `/model`, settings, `--model` | `model` | каталог площадки, если есть ключ; live: glm-5.3-flash / deepseek-chat / `:free` |
 | `system_prompt` | `/system`, settings | `role: system` | дефолт: «Ты — полезный ассистент…» |
 | `context_enabled` | `/context on\|off` | файлы в system | по умолчанию on |
 | `effort` | `/effort`, settings, `--effort` | `reasoning_effort` | на проводе только `low`/`high`/`max` |
@@ -458,7 +483,7 @@ src/cli.rs       clap, one-shot (через Runtime), --verify, --verify-isolati
 src/agent.rs     сущность разговора: settings, history, context, ask/complete/stream
 src/runtime.rs   коробка: AgentBox (agent+session+policies+judge) и Runtime на N боксов
 src/isolation.rs доказательство изоляции сессий: 100 боксов офлайн + live-отзыв токена
-src/auth.rs       логин: хранилище ~/.ask6/auth.json, резолв env→store→legacy, живые проверки ключей
+src/auth.rs       логин: хранилище ~/.ask6/auth.json, резолв env→store, живые проверки ключей
 src/api.rs       транспорт: тело, POST/SSE, parse, гвардия моделей; без политики разговора
 src/context.rs   discovery + сборка AGENTS.md / CLAUDE.md в system
 src/session.rs   ~/.ask6/sessions/*.json

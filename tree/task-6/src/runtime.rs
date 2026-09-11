@@ -665,6 +665,13 @@ impl Runtime {
         ))
     }
 
+    /// Like `new`, but the process endpoint follows a specific model id, so
+    /// `--model deepseek-chat` actually reaches DeepSeek instead of posting
+    /// a deepseek model id at the glm endpoint.
+    pub fn for_model(model: &str, dir: PathBuf) -> Res<Runtime> {
+        Ok(Runtime::with_endpoint(Endpoint::for_model(model)?, dir))
+    }
+
     pub fn with_endpoint(endpoint: Endpoint, dir: PathBuf) -> Runtime {
         Runtime {
             endpoint,
