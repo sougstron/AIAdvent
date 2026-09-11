@@ -1,5 +1,6 @@
 mod agent;
 mod api;
+mod billing;
 mod cli;
 mod config;
 mod context;

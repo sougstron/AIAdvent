@@ -5,6 +5,7 @@ use clap::Parser;
 use serde_json::Value;
 use std::io::{IsTerminal, Read};
 
+use crate::billing;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
 use crate::isolation;
 use crate::render;
@@ -23,6 +24,7 @@ use crate::verify;
         ask                                   open the chat TUI\n  \
         ask \"what is the capital of France?\"   one-shot question\n  \
         ask --verify                          prove z.ai levers with causal signatures\n  \
+        ask --verify-billing                  show whether spend is metered or plan quota\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
         ask --continue                        resume the most recent session"
@@ -82,6 +84,11 @@ pub struct Cli {
     // `allow_hyphen_values` so `--top-k -1` reads as a value, not a flag.
     #[arg(long, allow_hyphen_values = true)]
     pub top_k: Option<i32>,
+
+    /// Check live whether spend goes to the metered API or the GLM Coding
+    /// Plan subscription, print the verdict and exit.
+    #[arg(long, visible_alias = "billing")]
+    pub verify_billing: bool,
 
     /// Run the live z.ai lever proof (glm-5.3-flash only) and exit.
     #[arg(long, visible_alias = "verify-stop")]
@@ -186,6 +193,15 @@ pub fn run() -> Res<()> {
 
     let settings = cli.to_settings()?;
 
+    if cli.verify_billing {
+        let report = billing::run()?;
+        print!("{}", report.render());
+        if !report.confirmed() {
+            return Err("billing is not pay-per-token".into());
+        }
+        return Ok(());
+    }
+
     if cli.verify {
         let report = verify::run()?;
         println!("{}", report.render());
@@ -266,13 +282,14 @@ fn one_shot(
         let u = &reply.usage;
         let b = rt.get(&id).ok_or("box vanished")?;
         eprintln!(
-            "« model={}  finish={}  tokens: prompt={} completion={} (reasoning={}) total={}  {}ms  |  {}",
+            "« model={}  finish={}  tokens: prompt={} completion={} (reasoning={}) total={}  ~${:.6}  {}ms  |  {}",
             if reply.model.is_empty() { "?" } else { &reply.model },
             reply.finish_reason.as_deref().unwrap_or("?"),
             u.prompt_tokens,
             u.completion_tokens,
             u.reasoning_tokens,
             u.total_tokens,
+            billing::cost_usd(u),
             reply.latency_ms,
             b.settings().summary(),
         );
