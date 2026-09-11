@@ -198,7 +198,7 @@ endpoint этой площадки (`Endpoint::for_model`).
 
 Деньги: `api::guard_live_model` — единственное правило live-вызова; поле
 `CatalogModel::live` с ним сверяет тест. `/effort` и reasoning-плашка
-работают для обеих прямых площадок: glm и каждой модели DeepSeek.
+работают для всех моделей: напрямую для glm/DeepSeek и через normalized API OpenRouter.
 
 **Что значит вердикт.** «Подключено» пишется только когда провайдер ответил
 данными, выведенными из этого ключа (`Confirmed`): openrouter — `GET /key`
@@ -506,7 +506,7 @@ cargo build --release --manifest-path tree/task-9/Cargo.toml
 | `context_strategy` | `/compress`, settings, `--compress` | что вместо истории: всё / summary + хвост | `off` (дефолт) или `summary` |
 | `keep_recent` | `/compress keep N`, `--keep-recent` | сколько последних сообщений идут дословно | 1…200, дефолт 6 |
 | `summarize_every` | `/compress every N`, `--summarize-every` | размер чанка свёртки | 1…200, дефолт 10 |
-| `effort` | `/effort`, settings, `--effort` | `thinking` + `reasoning_effort` | glm и обе модели DeepSeek; `low`/`high`/`max` |
+| `effort` | `/effort`, settings, `--effort` | `reasoning_effort` (glm/DeepSeek), `reasoning.effort` (OpenRouter) | все модели; `low`/`high`/`max` |
 | `json_mode` | `/json …` | `response_format: json_object` + подсказка в system | schema — hint, не гарантия |
 | `max_chars` | settings, `--max-chars` | hint + клиентский truncate | гарантия на видимый ответ |
 | `budget_tokens` | `/max-tokens`, settings, `--budget-tokens` / `--max-tokens` | `max_tokens` | 1…131072; reasoning + visible |

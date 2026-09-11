@@ -2348,14 +2348,7 @@ impl App {
                 }
                 s
             }
-            "effort" => match config::provider_of(&self.settings.model) {
-                Some(p) if p != Provider::Glm => format!(
-                    "{}  (glm only — ignored for {})",
-                    self.settings.effort,
-                    p.id()
-                ),
-                _ => self.settings.effort.to_string(),
-            },
+            "effort" => self.settings.effort.to_string(),
             "json mode" => if self.settings.json_mode.enabled { "on" } else { "off" }.into(),
             "compress" => match self.settings.context_strategy {
                 config::ContextStrategy::Off => "off  (вся история уходит на провод)".into(),
@@ -3208,6 +3201,18 @@ mod tests {
         app.settings.model = config::DEFAULT_MODEL.to_string();
         app.adjust_setting(-1);
         assert_eq!(app.settings.model, "glm-5.3");
+    }
+
+    #[test]
+    fn effort_row_is_available_for_openrouter_models() {
+        let settings = config::Settings {
+            model: "google/gemma-4-31b-it:free".into(),
+            effort: Effort::High,
+            ..config::Settings::default()
+        };
+        let app = App::new(Agent::dummy_with(settings.clone()), settings, None);
+        let effort_row = SETTINGS_ROWS.iter().position(|r| *r == "effort").unwrap();
+        assert_eq!(app.setting_value(effort_row), "high");
     }
 
     #[test]

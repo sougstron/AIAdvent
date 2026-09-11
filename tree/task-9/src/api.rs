@@ -205,9 +205,9 @@ impl Outcome {
 
 /// Builds the request body. Kept separate from `chat` so tests can inspect
 /// it without a network call. The agent decides *what* goes in; this just
-/// serializes the settings onto the provider's parameter names. glm and
-/// DeepSeek both accept `thinking` and `reasoning_effort`; OpenRouter's own
-/// `reasoning` block is deliberately not invented here.
+/// serializes the settings onto each provider's parameter names. Direct glm
+/// and DeepSeek use `reasoning_effort`; OpenRouter uses its normalized
+/// `reasoning.effort` field.
 pub fn build_body(
     provider: Provider,
     model: &str,
@@ -258,17 +258,25 @@ pub fn build_body(
         "model": model,
         "messages": messages,
     });
-    if matches!(provider, Provider::Glm | Provider::DeepSeek) {
-        if let Some(obj) = body.as_object_mut() {
-            let thinking = if provider == Provider::Glm {
-                // glm-5.3-flash documents clear_thinking and cannot disable
-                // thinking. DeepSeek accepts only the portable `type` field.
-                json!({ "type": "enabled", "clear_thinking": false })
-            } else {
-                json!({ "type": "enabled" })
-            };
-            obj.insert("thinking".into(), thinking);
-            obj.insert("reasoning_effort".into(), json!(settings.effort.wire()));
+    if let Some(obj) = body.as_object_mut() {
+        match provider {
+            Provider::Glm | Provider::DeepSeek => {
+                let thinking = if provider == Provider::Glm {
+                    // glm-5.3-flash documents clear_thinking and cannot disable
+                    // thinking. DeepSeek accepts only the portable `type` field.
+                    json!({ "type": "enabled", "clear_thinking": false })
+                } else {
+                    json!({ "type": "enabled" })
+                };
+                obj.insert("thinking".into(), thinking);
+                obj.insert("reasoning_effort".into(), json!(settings.effort.wire()));
+            }
+            Provider::OpenRouter => {
+                obj.insert(
+                    "reasoning".into(),
+                    json!({ "effort": settings.effort.wire() }),
+                );
+            }
         }
     }
     if let Some(obj) = body.as_object_mut() {
@@ -590,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_fields_are_sent_to_both_direct_providers() {
+    fn effort_is_sent_to_every_provider() {
         let settings = Settings::default();
         let ds = build_body(
             Provider::DeepSeek,
@@ -614,12 +622,14 @@ mod tests {
             None,
         );
         assert!(or.get("thinking").is_none());
+        assert_eq!(or["reasoning"]["effort"], "low");
         assert!(or.get("reasoning_effort").is_none());
 
         let glm = body_for(&settings);
         assert_eq!(glm["thinking"]["type"], "enabled");
         assert_eq!(glm["thinking"]["clear_thinking"], false);
-        assert!(glm.get("reasoning_effort").is_some());
+        assert_eq!(glm["reasoning_effort"], "low");
+        assert!(glm.get("reasoning").is_none());
     }
 
     #[test]
