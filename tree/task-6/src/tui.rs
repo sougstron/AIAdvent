@@ -2399,8 +2399,8 @@ const HELP: &str = "\
 /new                      start a new chat session
 /rename <title>           rename the current chat session
 /sessions                 list and switch between saved sessions
-/effort [none|low|medium|high]   get or set reasoning effort
-/model [id]               get, set, or open the model picker (only glm-5.3-flash is live)
+/effort [low|high|max]   get or set reasoning effort
+/model [id]               get, set, or open the model picker (flash/free tiers are live)
 /system [text|edit|clear] get, set, edit, or clear the system prompt
 /json on|off              toggle structured JSON output
 /json fields a,b,c        set a flat schema with these string fields
@@ -2807,14 +2807,14 @@ mod tests {
         assert!(!app.available.iter().any(|id| id.starts_with("deepseek") || id.contains(":free")));
         app.with_connected(vec![Provider::Glm, Provider::OpenRouter]);
         assert!(app.available.iter().any(|id| id.ends_with(":free")));
-        assert!(!app.available.contains(&"deepseek-chat"));
+        assert!(!app.available.contains(&"deepseek-flash"));
     }
 
     #[test]
     fn cmd_model_on_unconnected_provider_explains_login() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         app.with_connected(vec![Provider::Glm]);
-        app.cmd_model("deepseek-chat");
+        app.cmd_model("deepseek-flash");
         assert_eq!(app.settings.model, config::DEFAULT_MODEL);
         let Some(Entry::Info(info)) = app.entries.last() else {
             panic!("expected Info entry after unconnected model");
