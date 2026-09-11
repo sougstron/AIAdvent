@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 use std::io::IsTerminal;
@@ -64,7 +64,40 @@ const COMMANDS: &[&str] = &[
 ];
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
-const SPINNER_FRAMES: &[&str] = &["/", "-", "\\", "-"];
+const SPINNER_FRAMES: &[&str] =
+    &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
+
+/// The whole palette. One accent for anything the user acts on (focus,
+/// prompt, the assistant's voice) and one muted tone for anything the user
+/// only glances at; everything else keeps the terminal's own foreground, so
+/// the app reads as text rather than as a form and inherits the user's theme.
+const ACCENT: Color = Color::Cyan;
+const MUTED: Color = Color::DarkGray;
+
+fn accent() -> Style {
+    Style::default().fg(ACCENT)
+}
+
+fn muted() -> Style {
+    Style::default().fg(MUTED)
+}
+
+/// Every overlay wears the same frame: a rounded muted border, an accent
+/// title on top, and its key hints dimmed along the bottom edge instead of
+/// crowding the title line.
+fn panel(title: &str, hints: &str) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(muted())
+        .title(Span::styled(format!(" {title} "), accent().add_modifier(Modifier::BOLD)))
+        .title_bottom(Span::styled(format!(" {hints} "), muted()))
+}
+
+/// Selection inside an overlay is carried by the \u{25b8} marker; this only adds the
+/// weight, so a row that already colours itself (an applied model) keeps it.
+fn selected_row() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
 /// Maximum visible content rows of the input box; the box grows from 1 to
 /// this many rows as the wrapped text gets longer, then scrolls internally.
 const MAX_INPUT_LINES: usize = 4;
@@ -329,11 +362,18 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, terminal: &mut DefaultTerminal) {
-        // The command popup only hijacks the arrow keys; Char/Backspace/Enter/
+        // The command popup owns the arrow keys and Enter; Char/Backspace/
         // Tab/Esc fall through unchanged so typing and the existing bindings
         // keep working while the popup is open.
         if self.command_popup_active() {
             match key.code {
+                // While the popup has the line, Enter picks the highlighted
+                // command instead of submitting the raw text — it never
+                // reaches the chat send path until the popup is closed.
+                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.apply_selected_command(terminal);
+                    return;
+                }
                 KeyCode::Up => {
                     self.move_command_selection(-1);
                     return;
@@ -551,9 +591,12 @@ impl App {
 
     /// Whether the input line is currently in "/" command-selection mode:
     /// still composing the command name (no space yet), not dismissed with
-    /// Left, and at least one command matches the typed prefix.
+    /// Left, not editing a system prompt or an API key, and at least one
+    /// command matches the typed prefix. While this holds, the popup owns
+    /// Enter (see `handle_input_key`).
     fn command_popup_active(&self) -> bool {
         !self.editing_system_prompt
+            && self.editing_api_key.is_none()
             && !self.cmd_popup_dismissed
             && self.input.starts_with('/')
             && !self.input[1..].contains(char::is_whitespace)
@@ -756,6 +799,12 @@ impl App {
             other => self
                 .entries
                 .push(Entry::Info(format!("unknown command /{other} — try /help"))),
+        }
+        // Whatever a command printed landed at the end of the transcript, so
+        // keep the view pinned there — /help used to leave the reader in the
+        // middle of its own output.
+        if self.follow {
+            self.scroll_to_bottom(terminal);
         }
     }
 
@@ -1845,8 +1894,8 @@ impl App {
         let width = f.area().width;
         let input_height = self.input_box_height(width);
         let [header, body, input, footer] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(8),
+            Constraint::Length(1),
+            Constraint::Min(4),
             Constraint::Length(input_height),
             Constraint::Length(2),
         ])
@@ -1874,11 +1923,8 @@ impl App {
     /// same `wrap_input` output drives layout, rendering and cursor math, so
     /// they cannot drift out of sync.
     fn draw_input(&self, f: &mut Frame, area: Rect, width: u16) {
-        let input_style = if self.focus == Focus::Input {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        };
+        let focused = self.focus == Focus::Input;
+        let border_style = if focused { accent() } else { muted() };
         // API-key entry renders the same char count as '*' so the wrap and
         // cursor math above stay exact while nothing readable is on screen.
         let shown = if self.editing_api_key.is_some() {
@@ -1891,95 +1937,158 @@ impl App {
         let scroll = self
             .input_scroll
             .min(lines.len().saturating_sub(view.min(lines.len())));
-        let visible: Vec<Line> = lines
+        // The prompt glyph lives in the first two columns of every row (a
+        // blank continuation under it), which is why `input_width` reserves
+        // them — wrap, layout and cursor math all measure the same box.
+        let mut visible: Vec<Line> = lines
             .iter()
+            .enumerate()
             .skip(scroll)
             .take(view)
-            .map(|(_, text)| Line::raw(text.clone()))
+            .map(|(i, (_, text))| {
+                let marker = if i == 0 { "\u{203a} " } else { "  " };
+                Line::from(vec![
+                    Span::styled(marker, if focused { accent() } else { muted() }),
+                    Span::raw(text.clone()),
+                ])
+            })
             .collect();
-        let title: String = if let Some(provider) = self.editing_api_key {
-            format!(" {} API key — Enter submit · Esc cancel ", provider.label())
+        // Placeholder: the hint that used to live in the box title, shown
+        // only while there is nothing to read under it.
+        if self.input.is_empty() && !self.editing_system_prompt && self.editing_api_key.is_none() {
+            visible = vec![Line::from(vec![
+                Span::styled("\u{203a} ", if focused { accent() } else { muted() }),
+                Span::styled("Ask anything, or / for commands", muted()),
+            ])];
+        }
+        let mut block = Block::bordered().border_type(BorderType::Rounded).border_style(border_style);
+        if let Some(provider) = self.editing_api_key {
+            block = block
+                .title(Span::styled(format!(" {} API key ", provider.label()), accent()))
+                .title_bottom(Span::styled(" Enter submit \u{b7} Esc cancel ", muted()));
         } else if self.editing_system_prompt {
-            " system prompt — Enter save · Shift+Enter newline · Esc cancel ".to_string()
-        } else {
-            " message — /help for commands ".to_string()
-        };
-        f.render_widget(
-            Paragraph::new(visible)
-                .style(input_style)
-                .block(Block::bordered().title(title)),
-            area,
-        );
-        if self.focus == Focus::Input {
+            block = block
+                .title(Span::styled(" system prompt ", accent()))
+                .title_bottom(Span::styled(" Enter save \u{b7} Shift+Enter newline \u{b7} Esc cancel ", muted()));
+        }
+        f.render_widget(Paragraph::new(visible).block(block), area);
+        if focused {
             let (row, col) = cursor_visual_pos(&lines, self.cursor);
             if row >= scroll && row < scroll + view {
-                let cx = area.x + 1 + (col as u16).min(area.width.saturating_sub(3));
+                let cx = area.x + 3 + (col as u16).min(area.width.saturating_sub(5));
                 let cy = area.y + 1 + (row - scroll) as u16;
                 f.set_cursor_position((cx, cy));
             }
         }
     }
 
-    fn context_indicator(&self) -> String {
+    /// The header's right edge: the model, the reasoning effort, the context
+    /// state — plus only the levers that are actually doing something.
+    /// `Settings::summary` spells out every knob including the ones left at
+    /// their default, which is right for `--verify` output and pure noise on
+    /// a single header line, where it crowds out the values that matter.
+    fn header_meta(&self) -> String {
+        let s = &self.settings;
         let bundle = self.agent.context();
-        if !bundle.enabled {
-            return "ctx:off".into();
+        let mut parts = vec![s.model.clone(), format!("effort {}", s.effort.wire())];
+        parts.push(if !bundle.enabled {
+            "ctx off".into()
+        } else {
+            format!("ctx {}", bundle.files.len())
+        });
+        if s.json_mode.enabled {
+            parts.push("json".into());
         }
-        if bundle.files.is_empty() {
-            return "ctx:on (no files)".into();
+        if let Some(t) = s.temperature {
+            parts.push(format!("temp {t}"));
         }
-        let chars: usize = bundle.files.iter().map(|f| f.chars).sum();
-        format!(
-            "ctx:on {} file{} {} chars",
-            bundle.files.len(),
-            if bundle.files.len() == 1 { "" } else { "s" },
-            chars
-        )
+        if let Some(p) = s.top_p {
+            parts.push(format!("top_p {p}"));
+        }
+        if let Some(k) = s.top_k {
+            parts.push(format!("top_k {}", config::render_top_k(k)));
+        }
+        if let Some(n) = s.budget_tokens {
+            parts.push(format!("max_tokens {n}"));
+        }
+        if let Some(n) = s.max_chars {
+            parts.push(format!("max_chars {n}"));
+        }
+        if !s.stop.is_empty() {
+            parts.push(format!("stop {}", s.stop.len()));
+        }
+        parts.join(" \u{b7} ")
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " ask chat ",
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::raw(&self.session.title),
-                Span::raw("   "),
-                Span::styled(self.context_indicator(), Style::default().fg(Color::DarkGray)),
-                Span::raw("   "),
-                Span::styled(self.settings.summary(), Style::default().fg(Color::DarkGray)),
-            ]))
-            .block(Block::bordered()),
-            area,
-        );
+        f.render_widget(Paragraph::new(self.header_line(area.width)), area);
     }
 
-    fn transcript_text(&self) -> String {
-        let mut body = String::new();
+    /// A single unboxed line: the name and the chat title on the left, the
+    /// settings the model actually runs with pushed to the right edge in the
+    /// muted tone — status, not decoration.
+    fn header_line(&self, width: u16) -> Line<'static> {
+        let meta = self.header_meta();
+        let meta_w = meta.chars().count() + 1;
+        // The settings the model actually runs with are the part worth
+        // keeping when the window is narrow, so the chat title gives up its
+        // columns first (and disappears entirely before the meta clips).
+        let room = (width as usize).saturating_sub(4 + 2 + meta_w + 1);
+        let full = self.session.title.chars().count();
+        let title = if full <= room {
+            self.session.title.clone()
+        } else if room >= 4 {
+            let mut t: String = self.session.title.chars().take(room - 1).collect();
+            t.push('\u{2026}');
+            t
+        } else {
+            String::new()
+        };
+        let left_w = 4 + 2 + title.chars().count();
+        let gap = (width as usize).saturating_sub(left_w + meta_w).max(1);
+        Line::from(vec![
+            Span::styled(" ask", accent().add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {title}"), muted()),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(format!("{meta} "), muted()),
+        ])
+    }
+
+    /// The transcript as styled lines. Roles are told apart by a single
+    /// glyph in the margin (\u{203a} you, \u{25cf} the model, \u{00b7} the app) rather than by
+    /// shouting ALL-CAPS headers, which is what makes the pane read as a
+    /// conversation instead of a log.
+    fn transcript_lines(&self) -> Vec<Line<'static>> {
+        let mut out: Vec<Line<'static>> = Vec::new();
         for entry in &self.entries {
             match entry {
-                Entry::User(text) => body.push_str(&format!("YOU\n{text}\n\n")),
-                Entry::Assistant { text, note } => {
-                    body.push_str("ASSISTANT\n");
-                    body.push_str(text);
-                    body.push('\n');
-                    if let Some(note) = note {
-                        body.push_str(&format!("[{note}]\n"));
-                    }
-                    body.push('\n');
+                Entry::User(text) => {
+                    out.extend(marked_lines("\u{203a} ", muted(), text, Style::default().add_modifier(Modifier::BOLD)));
+                    out.push(Line::raw(""));
                 }
-                Entry::Info(text) => body.push_str(&format!("--- {text} ---\n\n")),
+                Entry::Assistant { text, note } => {
+                    out.extend(marked_lines("\u{25cf} ", accent(), text, Style::default()));
+                    if let Some(note) = note {
+                        out.push(Line::styled(format!("  \u{2937} {note}"), muted()));
+                    }
+                    out.push(Line::raw(""));
+                }
+                Entry::Info(text) => {
+                    out.extend(marked_lines("\u{00b7} ", muted(), text, muted()));
+                    out.push(Line::raw(""));
+                }
             }
         }
-        if body.is_empty() {
-            body = "No messages yet — say something.".into();
-        }
         if let Some((label, frame)) = &self.spinner {
-            body.push_str(&format!("{frame} {label}…\n"));
+            out.push(Line::from(vec![
+                Span::styled(format!("{frame} "), accent()),
+                Span::styled(format!("{label}\u{2026}"), muted()),
+            ]));
+        } else if out.is_empty() {
+            out.push(Line::styled("Ask anything.", muted()));
+            out.push(Line::styled("\u{203a} type / for commands, Tab for settings", muted()));
         }
-        body
+        out
     }
 
     /// Draw-time clamp: growing the input box shrinks the transcript area, so
@@ -1988,10 +2097,10 @@ impl App {
     fn draw_transcript(&self, f: &mut Frame, area: Rect) {
         let max = self.max_scroll_for(f.area().width, f.area().height);
         f.render_widget(
-            Paragraph::new(self.transcript_text())
+            Paragraph::new(self.transcript_lines())
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll.min(max), 0))
-                .block(Block::bordered().title(" conversation ")),
+                .block(Block::new().padding(Padding::horizontal(1))),
             area,
         );
     }
@@ -2006,14 +2115,13 @@ impl App {
 
     /// The last-page scroll offset for given frame dimensions (kept separate
     /// from `max_scroll` so `draw` can clamp without a terminal). Mirrors
-    /// the vertical layout in `draw`: header(3) + input + footer(2).
+    /// the vertical layout in `draw`: header(1) + input + footer(2).
     fn max_scroll_for(&self, width: u16, height: u16) -> u16 {
-        let body_height = height.saturating_sub(3 + self.input_box_height(width) + 2);
-        let inner_width = width.saturating_sub(2); // block borders
-        let inner_height = body_height.saturating_sub(2); // block borders
+        let body_height = height.saturating_sub(1 + self.input_box_height(width) + 2);
+        let inner_width = width.saturating_sub(2); // horizontal padding
         let total_lines =
-            Paragraph::new(self.transcript_text()).wrap(Wrap { trim: false }).line_count(inner_width) as u16;
-        total_lines.saturating_sub(inner_height)
+            Paragraph::new(self.transcript_lines()).wrap(Wrap { trim: false }).line_count(inner_width) as u16;
+        total_lines.saturating_sub(body_height)
     }
 
     /// Scrolls to the true bottom of the wrapped transcript (see `max_scroll`)
@@ -2024,7 +2132,7 @@ impl App {
     }
 
     fn draw_settings_overlay(&self, f: &mut Frame, area: Rect) {
-        let popup = centered(area, 60, SETTINGS_ROWS.len() as u16 + 2);
+        let popup = centered(area, 74, SETTINGS_ROWS.len() as u16 + 2);
         let items = SETTINGS_ROWS
             .iter()
             .enumerate()
@@ -2040,7 +2148,9 @@ impl App {
         state.select(Some(self.settings_selected));
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
-            List::new(items).block(Block::bordered().title(" settings — ↑↓ select, ←→ change, Esc close ")),
+            List::new(items)
+                .highlight_style(selected_row())
+                .block(panel("settings", "\u{2191}\u{2193} select \u{b7} \u{2190}\u{2192} change \u{b7} Enter open \u{b7} Esc close")),
             popup,
             &mut state,
         );
@@ -2141,8 +2251,9 @@ impl App {
         }
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
-            List::new(items).block(Block::bordered().title(
-                " model — ↑↓ select, Enter apply, Esc cancel (● live · ○ refused at send) ",
+            List::new(items).highlight_style(selected_row()).block(panel(
+                "model",
+                "\u{2191}\u{2193} select \u{b7} Enter apply \u{b7} Esc back    \u{25cf} live \u{b7} \u{25cb} refused at send",
             )),
             popup,
             &mut state,
@@ -2175,8 +2286,9 @@ impl App {
         state.select(Some(self.login_selected));
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
-            List::new(items).block(Block::bordered().title(
-                " login — Enter add key · r recheck · d remove · Esc close ",
+            List::new(items).highlight_style(selected_row()).block(panel(
+                "login",
+                "Enter add key \u{b7} r recheck \u{b7} d remove \u{b7} Esc close",
             )),
             popup,
             &mut state,
@@ -2204,7 +2316,8 @@ impl App {
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
             List::new(items)
-                .block(Block::bordered().title(" sessions — ↑↓ select, Enter open, d delete, Esc close ")),
+                .highlight_style(selected_row())
+                .block(panel("sessions", "\u{2191}\u{2193} select \u{b7} Enter open \u{b7} d delete \u{b7} Esc close")),
             popup,
             &mut state,
         );
@@ -2221,9 +2334,12 @@ impl App {
         let popup = centered(area, width, 3);
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_widget(
-            Paragraph::new(msg)
-                .style(Style::default().fg(Color::Red))
-                .block(Block::bordered().title(" confirm delete ")),
+            Paragraph::new(msg).style(Style::default().fg(Color::Red)).block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(Span::styled(" confirm ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+            ),
             popup,
         );
     }
@@ -2253,7 +2369,9 @@ impl App {
         state.select(Some(selected));
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
-            List::new(items).block(Block::bordered().title(" commands — ↑↓ select, → apply, ← close ")),
+            List::new(items)
+                .highlight_style(selected_row())
+                .block(panel("commands", "\u{2191}\u{2193} select \u{b7} Enter apply \u{b7} \u{2190} close")),
             popup,
             &mut state,
         );
@@ -2261,14 +2379,16 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let keys = if self.spinner.is_some() {
-            "Esc stop generation · Ctrl-Q quit"
+            "Esc stop generation \u{b7} Ctrl-Q quit"
+        } else if self.editing_system_prompt || self.editing_api_key.is_some() {
+            "Enter save \u{b7} Esc cancel"
         } else {
-            "Enter send/run · Tab settings · Ctrl-N new · / Commands · Esc quit"
+            "Enter send \u{b7} / commands \u{b7} Tab settings \u{b7} Ctrl-N new \u{b7} Esc quit"
         };
         f.render_widget(
             Paragraph::new(vec![
-                Line::styled(self.status.clone(), Style::default().fg(Color::Cyan)),
-                Line::styled(keys, Style::default().fg(Color::DarkGray)),
+                Line::styled(format!(" {}", self.status), accent()),
+                Line::styled(format!(" {keys}"), muted()),
             ]),
             area,
         );
@@ -2303,6 +2423,26 @@ const HELP: &str = "\
 Esc while generating      stop the current generation (partial reply is kept)
 Ctrl-Q                    quit, even mid-generation";
 
+/// One transcript entry as styled lines: `marker` in the left margin of the
+/// first row, two spaces of hanging indent under it, so the glyph column
+/// stays clean no matter how many lines the text has.
+fn marked_lines(marker: &'static str, marker_style: Style, text: &str, text_style: Style) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            Line::from(vec![
+                Span::styled(if i == 0 { marker } else { "  " }, marker_style),
+                Span::styled(line.to_string(), text_style),
+            ])
+        })
+        .collect();
+    if rows.is_empty() {
+        rows.push(Line::from(Span::styled(marker, marker_style)));
+    }
+    rows
+}
+
 fn entries_from_session(s: &Session) -> Vec<Entry> {
     s.messages
         .iter()
@@ -2336,7 +2476,8 @@ fn mask_input(text: &str) -> String {
 
 /// One `/login` panel row: provider, source, masked key, last live check.
 fn login_row_text(row: &auth::ProviderStatus) -> String {
-    let id = format!("{:<10}", row.provider.id());
+    // 11 wide: "openrouter" is exactly 10 chars and ran into the next column.
+    let id = format!("{:<11}", row.provider.id());
     match (&row.source, &row.masked) {
         (Some(source), Some(key)) => {
             let check = match &row.last_check {
@@ -2393,9 +2534,10 @@ fn normalize_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Inner text width of the input box for a frame of `width` columns.
+/// Inner text width of the input box for a frame of `width` columns: two
+/// border columns plus the two-column prompt margin `draw_input` renders.
 fn input_width(width: u16) -> usize {
-    width.saturating_sub(2).max(1) as usize
+    width.saturating_sub(4).max(1) as usize
 }
 
 /// The input text wrapped into visual lines for a frame of `width` columns.
@@ -2480,13 +2622,32 @@ fn wrap_input(input: &str, width: usize) -> Vec<(usize, String)> {
                 spaces += 1;
                 i += 1;
             }
-            Some('\n') => {
-                lines.push((cur_start, std::mem::take(&mut cur)));
-                cur_w = 0;
-                cur_start = i + 1;
+            // Hard break (newline) or end of input. The spaces buffered since
+            // the last word are content here — no word will follow to absorb
+            // them — so they have to be rendered. Dropping them used to leave
+            // the visual line shorter than the text, which pinned the cursor
+            // in place while the user typed trailing spaces.
+            _ => {
+                if spaces > 0 {
+                    let space_start = i - spaces;
+                    for k in 0..spaces {
+                        if cur_w == width {
+                            lines.push((cur_start, std::mem::take(&mut cur)));
+                            cur_start = space_start + k;
+                            cur_w = 0;
+                        }
+                        cur.push(' ');
+                        cur_w += 1;
+                    }
+                    spaces = 0;
+                }
+                if c == Some('\n') {
+                    lines.push((cur_start, std::mem::take(&mut cur)));
+                    cur_w = 0;
+                    cur_start = i + 1;
+                }
                 i += 1;
             }
-            _ => i += 1,
         }
     }
     lines.push((cur_start, cur));
@@ -2562,12 +2723,12 @@ mod tests {
     }
 
     #[test]
-    fn context_indicator_reports_off_and_empty() {
+    fn header_reports_context_off_and_empty() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         app.cmd_context("off");
-        assert_eq!(app.context_indicator(), "ctx:off");
+        assert!(app.header_meta().contains("ctx off"));
         app.cmd_context("on");
-        assert_eq!(app.context_indicator(), "ctx:on (no files)");
+        assert!(app.header_meta().contains("ctx 0"));
     }
 
     #[test]
@@ -2757,6 +2918,114 @@ mod tests {
             lines,
             vec![(0, "ab".to_string()), (3, "cd".to_string()), (6, String::new())]
         );
+    }
+
+    #[test]
+    fn wrap_keeps_trailing_spaces_so_the_cursor_can_move_past_them() {
+        // Typing "hi " has to leave the cursor after the space: the visual
+        // line must be as long as the text, not trimmed back to the last
+        // word, or the cursor stalls while the user keeps typing spaces.
+        let lines = wrap_input("hi ", 10);
+        assert_eq!(lines, vec![(0, "hi ".to_string())]);
+        assert_eq!(cursor_visual_pos(&lines, 3), (0, 3));
+        let lines = wrap_input("hi   ", 10);
+        assert_eq!(cursor_visual_pos(&lines, 5), (0, 5));
+        // A line of nothing but spaces still advances the cursor.
+        let lines = wrap_input("  ", 10);
+        assert_eq!(lines, vec![(0, "  ".to_string())]);
+        assert_eq!(cursor_visual_pos(&lines, 2), (0, 2));
+        // Spaces before an explicit newline are content too.
+        let lines = wrap_input("hi \nx", 10);
+        assert_eq!(lines, vec![(0, "hi ".to_string()), (4, "x".to_string())]);
+        assert_eq!(cursor_visual_pos(&lines, 3), (0, 3));
+    }
+
+    #[test]
+    fn trailing_spaces_wrap_onto_the_next_row_at_the_edge() {
+        // "aaa bbb" fills the row, so the space after it opens the next one —
+        // which is where the word typed after it lands anyway, so the cursor
+        // does not jump when the word arrives.
+        let lines = wrap_input("aaa bbb ", 7);
+        assert_eq!(lines, vec![(0, "aaa bbb".to_string()), (7, " ".to_string())]);
+        assert_eq!(cursor_visual_pos(&lines, 8), (1, 1));
+        assert_eq!(cursor_visual_pos(&wrap_input("aaa bbb c", 7), 9), (1, 1));
+    }
+
+    #[test]
+    fn header_gives_up_the_title_before_it_clips_the_settings() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.session.title = "a very long chat title indeed".into();
+        let meta = app.header_meta();
+        // Wide: title in full, settings flush to the right edge.
+        let wide = app.header_line(120).to_string();
+        assert!(wide.starts_with(" ask  a very long chat title indeed"));
+        assert!(wide.trim_end().ends_with(&meta));
+        assert_eq!(wide.chars().count(), 120);
+        // Tight: the title is cut short (with an ellipsis) but the settings
+        // still fit whole.
+        let tight = app.header_line((meta.chars().count() + 16) as u16).to_string();
+        assert!(tight.contains('\u{2026}'));
+        assert!(tight.trim_end().ends_with(&meta));
+        // Narrower than the settings themselves: the title is gone entirely.
+        let narrow = app.header_line((meta.chars().count() + 4) as u16).to_string();
+        assert!(!narrow.contains("very long"));
+        assert!(narrow.trim_end().ends_with(&meta));
+    }
+
+    #[test]
+    fn header_meta_names_the_model_and_hides_levers_left_at_default() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        let meta = app.header_meta();
+        assert!(meta.starts_with(&app.settings.model));
+        assert!(!meta.contains("json"), "{meta}");
+        assert!(!meta.contains("temp"), "{meta}");
+        // A lever that is actually set earns its place on the line.
+        app.settings.temperature = Some(0.7);
+        app.settings.json_mode.enabled = true;
+        let meta = app.header_meta();
+        assert!(meta.contains("temp 0.7"), "{meta}");
+        assert!(meta.contains("json"), "{meta}");
+    }
+
+    #[test]
+    fn transcript_marks_each_voice_with_its_own_glyph() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.entries = vec![
+            Entry::User("hi\nthere".into()),
+            Entry::Assistant { text: "yo".into(), note: Some("stopped".into()) },
+            Entry::Info("note".into()),
+        ];
+        let rendered: Vec<String> =
+            app.transcript_lines().iter().map(|l| l.to_string()).collect();
+        // First row of a message carries the glyph, continuations are indented
+        // under it, and every entry is followed by a blank separator row.
+        assert_eq!(
+            rendered,
+            vec!["\u{203a} hi", "  there", "", "\u{25cf} yo", "  \u{2937} stopped", "", "\u{b7} note", ""]
+        );
+    }
+
+    #[test]
+    fn empty_transcript_shows_the_placeholder_until_the_spinner_takes_over() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        assert!(app.transcript_lines()[0].to_string().starts_with("Ask anything"));
+        app.spinner = Some(("thinking".into(), SPINNER_FRAMES[0]));
+        let rendered: Vec<String> =
+            app.transcript_lines().iter().map(|l| l.to_string()).collect();
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("thinking"));
+    }
+
+    #[test]
+    fn command_popup_stays_out_of_api_key_entry() {
+        // The popup owns Enter while it is open, so it must not open over an
+        // API key that happens to start with a slash.
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/mod".into();
+        assert!(app.command_popup_active());
+        assert_eq!(app.filtered_commands(), vec!["model"]);
+        app.editing_api_key = Some(Provider::ALL[0]);
+        assert!(!app.command_popup_active());
     }
 
     #[test]
