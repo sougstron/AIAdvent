@@ -62,9 +62,14 @@ chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
 rest of the catalog is selectable but refused at send time because those
-ids cost money. Its `README.md` covers the Agent shape, key resolution,
-runtime settings, and the live lever self-test (temperature confirmed;
-top_p flat; top_k unsupported). It started as a verbatim copy of
+ids cost money. Task 9 added **context management**: `compress=off|summary`
+(`/compress`, the `compress` row in settings, `--compress`) keeps the last N
+messages verbatim and replaces everything older with a running summary carried
+in the system message; `ask --verify-compress` is its load-bearing proof and
+only says Confirmed when `prompt_tokens` actually drops *and* a fact that
+survives only inside the summary is still recalled. Its `README.md` covers the
+Agent shape, key resolution, runtime settings, context compression, and the
+live lever self-test (temperature confirmed; top_p flat; top_k unsupported). It started as a verbatim copy of
 `tree/task-8/`; `tree/task-8/` was a verbatim copy of `tree/task-7/`
 (task 7 already met the requirements, so it stayed frozen); `tree/task-5/`
 before that was the *Model Ladder* state. Everything below in this file

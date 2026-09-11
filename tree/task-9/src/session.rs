@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{ChatMessage, Role};
+use crate::compress::Compressor;
 use crate::config::{Res, Settings};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +65,10 @@ pub struct Session {
     /// AGENTS.md / CLAUDE.md paths ingested when this session last saved.
     #[serde(default)]
     pub context_files: Vec<String>,
+    /// Бегущее summary сжатой истории. `#[serde(default)]` — сессии,
+    /// записанные до задачи 9, читаются как «сжатия не было».
+    #[serde(default)]
+    pub compressor: Compressor,
 }
 
 /// Per-process counter that makes ids unique when many sessions are created
@@ -83,6 +88,7 @@ impl Session {
             messages: Vec::new(),
             settings,
             context_files: Vec::new(),
+            compressor: Compressor::default(),
         }
     }
 
@@ -142,8 +148,10 @@ impl Session {
         settings: &Settings,
         context_files: impl IntoIterator<Item = String>,
         history: &[ChatMessage],
+        compressor: &Compressor,
     ) {
         self.settings = settings.clone();
+        self.compressor = compressor.clone();
         self.context_files = context_files.into_iter().collect();
         let interrupted: Vec<bool> = self.messages.iter().map(|m| m.interrupted).collect();
         self.messages = history.iter().map(StoredMessage::from).collect();
@@ -364,6 +372,41 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Сессии, записанные до задачи 9, не знают ни о стратегии, ни о
+    /// summary — они обязаны читаться как «сжатия не было».
+    #[test]
+    fn pre_task9_session_files_still_load() {
+        let raw = r#"{"id":"1","title":"t","created_at":1,"updated_at":2,
+            "messages":[{"role":"user","content":"hi"}],
+            "settings":{"model":"glm-5.3-flash","system_prompt":"p","effort":"Low",
+                "json_mode":{"enabled":false,"schema":{}},"max_chars":null,"stop":[],
+                "temperature":null}}"#;
+        let s: Session = serde_json::from_str(raw).unwrap();
+        assert!(s.compressor.is_empty());
+        assert_eq!(s.settings.context_strategy, crate::config::ContextStrategy::Off);
+        assert_eq!(s.settings.keep_recent, crate::config::DEFAULT_KEEP_RECENT);
+        assert_eq!(s.settings.summarize_every, crate::config::DEFAULT_SUMMARIZE_EVERY);
+    }
+
+    /// Summary — часть памяти сессии: без него возобновлённый чат ссылается
+    /// на `covered` сообщений, которых уже никто не описывает.
+    #[test]
+    fn summary_survives_a_save_load_round_trip() {
+        let dir = tmp_dir("compressor-roundtrip");
+        let mut s = Session::new(Settings::default());
+        s.push_user("hi".into());
+        s.push_assistant("yo".into());
+        let mut c = crate::compress::Compressor::new();
+        c.apply("СВОДКА".into(), 1, 42);
+        s.capture_from(&Settings::default(), Vec::<String>::new(), &s.history(), &c);
+        s.save(&dir).unwrap();
+        let back = load_session(&dir, &s.id).unwrap();
+        assert_eq!(back.compressor.summary(), "СВОДКА");
+        assert_eq!(back.compressor.covered(), 1);
+        assert_eq!(back.compressor.folded_chars(), 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::api::{
     self, ChatMessage, ChatStream, Endpoint, Outcome, Usage,
 };
-use crate::config::{Res, Settings};
+use crate::compress::{self, Compressor, Policy};
+use crate::config::{ContextStrategy, Res, Settings};
 use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
 use crate::session::Session;
 
@@ -51,6 +52,23 @@ impl Reply {
     }
 }
 
+/// Итог одной свёртки истории — что именно ушло под summary и во что это
+/// обошлось. Front-end печатает это в статус, `--verify-compress` считает по
+/// нему экономию.
+#[derive(Clone, Debug)]
+pub struct FoldReport {
+    /// Сколько сообщений истории покрыто summary после свёртки.
+    pub covered: usize,
+    /// Сколько сообщений ушло под summary именно в этой свёртке.
+    pub chunk_len: usize,
+    /// Символов в свёрнутом чанке.
+    pub chunk_chars: usize,
+    /// Символов в получившемся summary.
+    pub summary_chars: usize,
+    /// Во что обошёлся сам вызов свёртки.
+    pub usage: Usage,
+}
+
 #[derive(Clone)]
 pub struct Agent {
     endpoint: Endpoint,
@@ -59,6 +77,9 @@ pub struct Agent {
     cwd: PathBuf,
     home: PathBuf,
     context: ContextBundle,
+    /// Бегущее summary истории (см. `compress.rs`). Пустой, пока стратегия
+    /// `off` или пока сворачивать нечего.
+    compressor: Compressor,
 }
 
 impl Agent {
@@ -87,6 +108,7 @@ impl Agent {
             cwd,
             home,
             context: ContextBundle::empty(PathBuf::from(".")),
+            compressor: Compressor::new(),
         };
         agent.refresh_context();
         agent
@@ -145,6 +167,7 @@ impl Agent {
 
     pub fn reset(&mut self) {
         self.history.clear();
+        self.compressor.reset();
     }
 
     /// Restore a saved chat: settings snapshot, message history, and the
@@ -153,7 +176,88 @@ impl Agent {
         self.settings = session.settings.clone();
         self.settings.clamp();
         self.history = session.history();
+        // Summary сохраняется вместе с сессией: без него возобновлённый чат
+        // потерял бы всё, что уже было свёрнуто, а `covered` уехал бы на
+        // историю, которую никто не описывал.
+        self.compressor = session.compressor.clone();
         self.refresh_context();
+    }
+
+    pub fn compressor(&self) -> &Compressor {
+        &self.compressor
+    }
+
+    pub fn set_compressor(&mut self, compressor: Compressor) {
+        self.compressor = compressor;
+    }
+
+    /// Текущая стратегия управления контекстом.
+    pub fn strategy(&self) -> ContextStrategy {
+        self.settings.context_strategy
+    }
+
+    /// Переключить стратегию. Смена на `off` не выбрасывает уже накопленное
+    /// summary — обратное включение продолжает с того же места.
+    pub fn set_strategy(&mut self, strategy: ContextStrategy) {
+        self.settings.context_strategy = strategy;
+    }
+
+    /// Что реально уйдёт на провод для этой истории.
+    pub fn wire_history<'a>(&self, history: &'a [ChatMessage]) -> &'a [ChatMessage] {
+        self.compressor.wire(history, self.settings.context_strategy)
+    }
+
+    /// Свернуть отставшую часть истории, если пора.
+    ///
+    /// Возвращает `Ok(None)`, когда стратегия `off` или целый чанк ещё не
+    /// накопился — в этом случае ни одного запроса не делается. Вызывать
+    /// нужно **перед** отправкой очередного хода: front-end владеет историей,
+    /// а свёртка меняет состояние агента.
+    pub fn fold_history(&mut self, history: &[ChatMessage]) -> Res<Option<FoldReport>> {
+        if !self.settings.context_strategy.enabled() {
+            return Ok(None);
+        }
+        let policy = Policy::from_settings(&self.settings);
+        let Some(target) = self.compressor.due(history.len(), policy) else {
+            return Ok(None);
+        };
+        let from = self.compressor.covered().min(history.len());
+        let target = target.min(history.len());
+        let chunk = &history[from..target];
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+
+        let prompt = compress::fold_prompt(self.compressor.summary(), chunk);
+        // Свёртка идёт своим запросом: без JSON-схемы, без stop-строк и без
+        // пользовательского лимита токенов — иначе `/stop` или budget=16
+        // обрежут summary на полуслове, и в истории останется огрызок.
+        let mut settings = self.settings.clone();
+        settings.clamp();
+        settings.json_mode.enabled = false;
+        settings.max_chars = None;
+        settings.budget_tokens = None;
+        settings.stop.clear();
+        let outcome = api::chat(
+            &self.endpoint,
+            &settings,
+            compress::SUMMARY_SYSTEM,
+            &[ChatMessage::user(prompt)],
+            None,
+        )?;
+        let summary = outcome.text().trim().to_string();
+        if summary.is_empty() {
+            return Err("свёртка вернула пустое summary".into());
+        }
+        let chunk_chars = compress::chars_of(chunk);
+        self.compressor.apply(summary.clone(), target, chunk_chars);
+        Ok(Some(FoldReport {
+            covered: target,
+            chunk_len: chunk.len(),
+            chunk_chars,
+            summary_chars: summary.chars().count(),
+            usage: outcome.usage,
+        }))
     }
 
     pub fn context(&self) -> &ContextBundle {
@@ -227,7 +331,18 @@ impl Agent {
     /// System prompt + AGENTS.md files. Sent as `role: system` (see
     /// `context.rs`), never pushed onto `history`.
     pub(crate) fn system_for_request(&self) -> String {
-        self.context.assemble(&self.settings.system_prompt)
+        let base = self.context.assemble(&self.settings.system_prompt);
+        match self
+            .settings
+            .context_strategy
+            .enabled()
+            .then(|| self.compressor.block())
+            .flatten()
+        {
+            None => base,
+            Some(block) if base.trim().is_empty() => block,
+            Some(block) => format!("{base}\n\n{block}"),
+        }
     }
 
     pub fn complete_outcome(&self, history: &[ChatMessage]) -> Res<Outcome> {
@@ -241,7 +356,7 @@ impl Agent {
             &self.endpoint,
             &settings,
             &self.system_for_request(),
-            history,
+            self.wire_history(history),
             schema.as_ref(),
         )
     }
@@ -259,7 +374,7 @@ impl Agent {
             &self.endpoint,
             &settings,
             &self.system_for_request(),
-            history,
+            self.wire_history(history),
             None,
             cancel,
         )
@@ -328,6 +443,75 @@ mod tests {
         assert_eq!(agent.history()[0].content, "hello");
         assert_eq!(agent.history()[1].content, "hi");
         assert!(agent.context_files().is_empty());
+    }
+
+    #[test]
+    fn compression_off_sends_everything_even_with_a_summary() {
+        let mut agent = Agent::dummy();
+        let history: Vec<ChatMessage> = (0..12).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        agent.set_compressor({
+            let mut c = crate::compress::Compressor::new();
+            c.apply("СВОДКА".into(), 6, 100);
+            c
+        });
+        assert_eq!(agent.strategy(), ContextStrategy::Off);
+        assert_eq!(agent.wire_history(&history).len(), 12);
+        assert!(!agent.system_for_request().contains("СВОДКА"));
+        // Включение — и та же история едет обрезанной, а summary уезжает в system.
+        agent.set_strategy(ContextStrategy::Summary);
+        let wire = agent.wire_history(&history);
+        assert_eq!(wire.len(), 6);
+        assert_eq!(wire[0].content, "m6");
+        let system = agent.system_for_request();
+        assert!(system.contains("СВОДКА"));
+        assert_eq!(system.matches("СВОДКА").count(), 1);
+    }
+
+    #[test]
+    fn fold_does_nothing_until_a_chunk_is_due() {
+        let mut agent = Agent::dummy_with(Settings {
+            context_strategy: ContextStrategy::Summary,
+            keep_recent: 6,
+            summarize_every: 10,
+            ..Settings::default()
+        });
+        // Коротко — свёртка не нужна, и запроса не будет (у dummy его некуда
+        // и отправить: сеть здесь означала бы ошибку, а не Ok(None)).
+        let short: Vec<ChatMessage> = (0..10).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        assert!(agent.fold_history(&short).unwrap().is_none());
+        // Стратегия off — no-op даже на длинной истории.
+        let long: Vec<ChatMessage> = (0..40).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        agent.set_strategy(ContextStrategy::Off);
+        assert!(agent.fold_history(&long).unwrap().is_none());
+    }
+
+    #[test]
+    fn reset_drops_the_summary_too() {
+        let mut agent = Agent::dummy_with(Settings {
+            context_strategy: ContextStrategy::Summary,
+            ..Settings::default()
+        });
+        let mut c = crate::compress::Compressor::new();
+        c.apply("СВОДКА".into(), 6, 100);
+        agent.set_compressor(c);
+        agent.reset();
+        assert!(agent.compressor().is_empty());
+        assert!(!agent.system_for_request().contains("СВОДКА"));
+    }
+
+    #[test]
+    fn resume_restores_the_summary_with_the_history() {
+        let mut session = Session::new(Settings {
+            context_strategy: ContextStrategy::Summary,
+            ..Settings::default()
+        });
+        session.push_user("hello".into());
+        session.push_assistant("hi".into());
+        session.compressor.apply("СВОДКА".into(), 1, 5);
+        let mut agent = Agent::dummy();
+        agent.resume(&session);
+        assert_eq!(agent.compressor().covered(), 1);
+        assert!(agent.system_for_request().contains("СВОДКА"));
     }
 
     #[test]

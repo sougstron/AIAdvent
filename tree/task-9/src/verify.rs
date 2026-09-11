@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::agent::{Agent, Reply};
 use crate::api::{ChatMessage, DEFAULT_BASE_URL, LIVE_COMPLETION_MODEL};
-use crate::config::{Res, Settings, DEFAULT_MODEL};
+use crate::config::{ContextStrategy, Res, Settings, DEFAULT_MODEL};
 
 const PING_PROMPT: &str = "Reply with the single word PONG.";
 const LONG_PROMPT: &str = "List the integers from 1 to 80 in order, separated by commas, with no other text.";
@@ -537,10 +537,490 @@ impl Drop for ScratchDir {
     }
 }
 
+// ------------------------------------------------ управление контекстом
+
+/// Синтетический разговор для проверки сжатия: два «факта» на разной
+/// глубине и достаточно наполнителя, чтобы экономия была видна.
+///
+/// `FOLDED_TOKEN` называется в самом начале — при `keep_recent=6`,
+/// `summarize_every=10` и 30 сообщениях он гарантированно попадает в
+/// свёрнутую часть, так что ответить на вопрос о нём можно только через
+/// summary. `TAIL_TOKEN` назван под конец и остаётся в дословном хвосте:
+/// это контроль, что сжатие не съело недавние сообщения.
+pub const FOLDED_TOKEN: &str = "NIGHTJAR7741";
+pub const TAIL_TOKEN: &str = "KESTREL9120";
+const COMPRESS_MESSAGES: usize = 30;
+const COMPRESS_KEEP_RECENT: usize = 6;
+const COMPRESS_EVERY: usize = 10;
+const FOLDED_QUESTION: &str =
+    "Какой код доступа к стенду я называл? Ответь одним словом — только кодом. Если не знаешь, ответь NONE.";
+const TAIL_QUESTION: &str =
+    "Какой код резервного канала я называл? Ответь одним словом — только кодом. Если не знаешь, ответь NONE.";
+
+/// Как разрешилась проверка сжатия.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompressionVerdict {
+    /// Сжатая история дешевле по `prompt_tokens` и оба факта на месте.
+    Confirmed,
+    /// Дешевле, но факт из свёрнутой части потерян — summary не сохранило
+    /// то, ради чего оно существует.
+    Lossy,
+    /// Экономии нет.
+    Flat,
+}
+
+impl CompressionVerdict {
+    const fn as_str(self) -> &'static str {
+        match self {
+            CompressionVerdict::Confirmed => "Confirmed",
+            CompressionVerdict::Lossy => "Lossy",
+            CompressionVerdict::Flat => "Flat",
+        }
+    }
+}
+
+/// Один и тот же вопрос, заданный к полной и к сжатой истории.
+#[derive(Clone, Debug)]
+pub struct CompressionProbe {
+    pub label: &'static str,
+    pub token: &'static str,
+    pub question: &'static str,
+    pub full: Call,
+    pub compressed: Call,
+}
+
+impl CompressionProbe {
+    pub fn full_recalled(&self) -> bool {
+        has_token(&self.full.text, self.token)
+    }
+
+    pub fn compressed_recalled(&self) -> bool {
+        has_token(&self.compressed.text, self.token)
+    }
+
+    /// Сэкономленные на этом запросе `prompt_tokens`.
+    pub fn saved(&self) -> i64 {
+        self.full.prompt_tokens as i64 - self.compressed.prompt_tokens as i64
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "[full]       {}\n  {}\n[compressed] {}\n  {}\n  recall: full={} compressed={}  prompt_tokens {} -> {} ({:+})",
+            self.full.line(),
+            clip(&self.full.text, 100),
+            self.compressed.line(),
+            clip(&self.compressed.text, 100),
+            self.full_recalled(),
+            self.compressed_recalled(),
+            self.full.prompt_tokens,
+            self.compressed.prompt_tokens,
+            -self.saved()
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CompressionReport {
+    pub messages: usize,
+    pub keep_recent: usize,
+    pub every: usize,
+    /// Сколько сообщений ушло под summary и сколько уходит на провод.
+    pub covered: usize,
+    pub wire_messages: usize,
+    pub folded_chars: usize,
+    pub summary_chars: usize,
+    pub summary: String,
+    /// Число свёрток и их суммарная цена в токенах.
+    pub folds: usize,
+    pub fold_tokens: u64,
+    pub folded_fact: CompressionProbe,
+    pub tail_fact: CompressionProbe,
+    pub verdict: CompressionVerdict,
+}
+
+impl CompressionReport {
+    pub fn confirmed(&self) -> bool {
+        self.verdict == CompressionVerdict::Confirmed
+    }
+
+    /// Средняя экономия `prompt_tokens` на один ход.
+    pub fn saved_per_turn(&self) -> i64 {
+        (self.folded_fact.saved() + self.tail_fact.saved()) / 2
+    }
+
+    /// Через сколько ходов свёртка окупается. `None` — экономии нет.
+    pub fn break_even_turns(&self) -> Option<u64> {
+        let saved = self.saved_per_turn();
+        if saved <= 0 {
+            return None;
+        }
+        Some(self.fold_tokens.div_ceil(saved as u64))
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("управление контекстом: сжатие истории (glm-5.3-flash)\n");
+        out.push_str(&format!(
+            "разговор: {} сообщений, keep_recent={}, summarize_every={}\n",
+            self.messages, self.keep_recent, self.every
+        ));
+        out.push_str(&format!(
+            "свёрнуто {} сообщений ({} симв.) в summary {} симв.; на провод уходит {} сообщений; свёрток {} ценой {} токенов\n\n",
+            self.covered,
+            self.folded_chars,
+            self.summary_chars,
+            self.wire_messages,
+            self.folds,
+            self.fold_tokens
+        ));
+        out.push_str(&format!("== summary ==\n{}\n\n", clip(&self.summary, 900)));
+        for probe in [&self.folded_fact, &self.tail_fact] {
+            out.push_str(&format!(
+                "== {} (token={}) ==\n{}\n{}\n\n",
+                probe.label,
+                probe.token,
+                probe.question,
+                probe.line()
+            ));
+        }
+        out.push_str(&format!(
+            "экономия prompt_tokens: {:+} на ход в среднем; свёртка окупается за {}\n",
+            self.saved_per_turn(),
+            match self.break_even_turns() {
+                Some(n) => format!("{n} ход(ов)"),
+                None => "никогда (экономии нет)".into(),
+            }
+        ));
+        out.push_str(&format!("=> {}\n", self.verdict.as_str()));
+        out.push_str(
+            "Confirmed требует причинной подписи: меньше prompt_tokens И факт из свёрнутой части всё ещё известен модели. \
+             Lossy — сэкономили, но потеряли факт. Flat — экономии нет. Это результат, а не сломанный тест.\n",
+        );
+        out
+    }
+
+    pub fn status_line(&self) -> String {
+        format!(
+            "compress: verdict={} saved/turn={:+} folded_recall={} tail_recall={}",
+            self.verdict.as_str(),
+            self.saved_per_turn(),
+            self.folded_fact.compressed_recalled(),
+            self.tail_fact.compressed_recalled()
+        )
+    }
+}
+
+/// Реплики синтетического разговора. Детерминированные, без сети.
+pub fn compression_dialogue() -> Vec<ChatMessage> {
+    // Реплики намеренно «человеческого» размера (150–300 символов): на
+    // репликах в два слова экономия упирается в накладные расходы на
+    // сообщение и перестаёт быть показательной.
+    let topics = [
+        (
+            "Готовлю нагрузочный стенд для сервиса заказов: нужно понять, где он ложится под пиковым трафиком и что чинить первым. Команда небольшая, времени до релиза — две недели.",
+            "Понял: цель — найти точку отказа сервиса заказов под пиком за две недели. Предлагаю сначала зафиксировать профиль нагрузки, потом прогонять сценарии по одному, меняя за прогон ровно один параметр.",
+        ),
+        (
+            "Сервис написан на Rust, база PostgreSQL 16 с репликой на чтение, очередь NATS с джетстримом. Всё крутится в Kubernetes, по три пода на сервис.",
+            "Записал стек: Rust, PostgreSQL 16 плюс read-реплика, NATS JetStream, Kubernetes по три пода. Узким местом при таком раскладе обычно оказывается пул соединений к базе, а не сам сервис.",
+        ),
+        (
+            "Целевая нагрузка — 4000 запросов в секунду, из них примерно 85 процентов чтение и 15 процентов запись. Пик приходится на вечер, с семи до девяти.",
+            "Цель 4000 rps при соотношении 85/15 зафиксирована, пик — вечерние два часа. Значит профиль прогона должен повторять именно этот перекос, а не равномерную смесь.",
+        ),
+        (
+            "p99 по чтению не должен превышать 120 миллисекунд, по записи допускаю до 400. Всё, что выше, считаем нарушением SLO и поводом остановить прогон.",
+            "SLO: p99 чтения 120 мс, записи 400 мс, выход за границы — стоп-условие прогона. Добавлю это как автоматический критерий остановки, чтобы не досматривать графики руками.",
+        ),
+        (
+            "Запись идёт батчами по 500 строк примерно раз в две секунды. Батч собирается в памяти сервиса, и при рестарте пода мы теряем то, что не успело уехать.",
+            "Батч записи: 500 строк каждые 2 секунды, накапливается в памяти и теряется при рестарте. Под нагрузкой это же место даст всплески latency — стоит померить отдельно.",
+        ),
+        (
+            "Кэш — Redis, TTL пятнадцать минут, ключи по идентификатору клиента. Инвалидация ленивая, то есть мы просто ждём истечения TTL.",
+            "Redis с TTL 15 минут и ленивой инвалидацией по ключу клиента. На прогоне это даст холодный старт первые пятнадцать минут — их лучше не считать в итоговые цифры.",
+        ),
+        (
+            "Тестовый прогон длится сорок минут: пять минут разгон, тридцать — плато, пять — спад. Между прогонами делаем паузу, чтобы база успела прийти в себя.",
+            "Профиль прогона 5/30/5 минут с паузой между итерациями принят. Сравнивать имеет смысл только участок плато — разгон и спад дают искажённые перцентили.",
+        ),
+        (
+            "Метрики собираем в Prometheus, дашборд в Grafana. Интервал скрейпа пятнадцать секунд, и мне важно, чтобы перцентили считались по гистограммам, а не по средним.",
+            "Prometheus со скрейпом раз в 15 секунд, Grafana для просмотра, перцентили по гистограммам. Учту, что при таком интервале короткие всплески короче минуты будут смазаны.",
+        ),
+        (
+            "Алерт срабатывает, когда доля ошибок превышает половину процента на интервале в пять минут. Ниже этого порога считаем, что всё в норме.",
+            "Порог алерта — 0.5% ошибок на пятиминутном окне. Для прогона это же число будет вторым стоп-условием вместе с нарушением SLO по задержке.",
+        ),
+        (
+            "Ретраи — три попытки с экспоненциальной паузой, стартовая задержка сто миллисекунд. Джиттера сейчас нет, и я подозреваю, что именно это добавляет пилу на графиках.",
+            "Три ретрая с экспоненциальной паузой от 100 мс и без джиттера. Подозрение обоснованное: без джиттера ретраи синхронизируются и бьют по базе волнами — это видно как пила.",
+        ),
+        (
+            "Деплой идёт через ArgoCD в кластер staging, окружение совпадает с продом по ресурсам, но данных там примерно вдесятеро меньше.",
+            "ArgoCD в staging, ресурсы как на проде, данных в десять раз меньше. Это важная оговорка: планы запросов на маленькой таблице будут другими, и цифры по базе занижены.",
+        ),
+        (
+            "Секреты храним в Vault, ротация раз в квартал. Сервис читает их при старте и больше не перечитывает, так что ротация требует рестарта подов.",
+            "Vault с квартальной ротацией и чтением секретов только при старте. Значит ротация — это плановый рестарт, и его стоит прогнать под нагрузкой хотя бы раз.",
+        ),
+        (
+            "Логи пишем структурированным JSON и отправляем в Loki. На пике объём логов заметно растёт, и я не уверен, что это не съедает часть производительности.",
+            "JSON-логи в Loki, объём растёт вместе с нагрузкой. Проверяется просто: прогон с урезанным уровнем логирования против обычного, разница в rps и будет ответом.",
+        ),
+        (
+            "Отчёт по прогону нужен в понедельник утром: таблица по сценариям, графики перцентилей и короткий вывод, что чинить первым.",
+            "Отчёт к понедельнику: таблица сценариев, графики перцентилей, приоритетный список починки. Соберу его по участкам плато, чтобы числа были сравнимы между прогонами.",
+        ),
+    ];
+    let mut history = Vec::with_capacity(COMPRESS_MESSAGES);
+    // Факт для свёрнутой части — самым первым сообщением.
+    history.push(ChatMessage::user(format!(
+        "Запомни: код доступа к стенду — {FOLDED_TOKEN}. Он понадобится в конце разговора."
+    )));
+    history.push(ChatMessage::assistant(format!(
+        "Запомнил: код доступа к стенду {FOLDED_TOKEN}."
+    )));
+    for (i, (q, a)) in topics.iter().enumerate() {
+        // Факт для дословного хвоста — в предпоследней паре.
+        if i == topics.len() - 2 {
+            history.push(ChatMessage::user(format!(
+                "Запомни: код резервного канала — {TAIL_TOKEN}."
+            )));
+            history.push(ChatMessage::assistant(format!(
+                "Запомнил: код резервного канала {TAIL_TOKEN}."
+            )));
+            continue;
+        }
+        history.push(ChatMessage::user((*q).to_string()));
+        history.push(ChatMessage::assistant((*a).to_string()));
+    }
+    history
+}
+
+/// Живая проверка сжатия истории: один и тот же разговор и те же вопросы,
+/// один раз с полной историей, другой — со сжатой.
+pub fn run_compression() -> Res<CompressionReport> {
+    let mut settings = isolated_settings();
+    settings.keep_recent = COMPRESS_KEEP_RECENT;
+    settings.summarize_every = COMPRESS_EVERY;
+    settings.context_strategy = ContextStrategy::Off;
+    let mut agent = Agent::new(settings)?;
+    if agent.settings().model != LIVE_COMPLETION_MODEL {
+        return Err(format!(
+            "verify refuses to run: agent model is `{}`, not `{LIVE_COMPLETION_MODEL}`",
+            agent.settings().model
+        ));
+    }
+    agent.set_context_enabled(false);
+
+    let dialogue = compression_dialogue();
+    if dialogue.len() != COMPRESS_MESSAGES {
+        return Err(format!(
+            "synthetic dialogue is {} messages, expected {COMPRESS_MESSAGES}",
+            dialogue.len()
+        ));
+    }
+
+    // 1. Базовая линия: стратегия off, вся история на провод.
+    let full_folded = ask_after(&agent, &dialogue, FOLDED_QUESTION)?;
+    let full_tail = ask_after(&agent, &dialogue, TAIL_QUESTION)?;
+
+    // 2. Включаем сжатие и сворачиваем всё, что положено свернуть.
+    agent.set_strategy(ContextStrategy::Summary);
+    let mut folds = 0usize;
+    let mut fold_tokens = 0u64;
+    while let Some(report) = agent.fold_history(&dialogue)? {
+        folds += 1;
+        fold_tokens += report.usage.total_tokens;
+    }
+    if folds == 0 {
+        return Err("сжатие не сработало: ни одной свёртки на 30 сообщениях".into());
+    }
+
+    // 3. Те же вопросы к сжатой истории.
+    let comp_folded = ask_after(&agent, &dialogue, FOLDED_QUESTION)?;
+    let comp_tail = ask_after(&agent, &dialogue, TAIL_QUESTION)?;
+
+    let folded_fact = CompressionProbe {
+        label: "факт из свёрнутой части",
+        token: FOLDED_TOKEN,
+        question: FOLDED_QUESTION,
+        full: full_folded,
+        compressed: comp_folded,
+    };
+    let tail_fact = CompressionProbe {
+        label: "факт из дословного хвоста",
+        token: TAIL_TOKEN,
+        question: TAIL_QUESTION,
+        full: full_tail,
+        compressed: comp_tail,
+    };
+    let verdict = judge_compression(&folded_fact, &tail_fact);
+    let compressor = agent.compressor();
+    Ok(CompressionReport {
+        messages: dialogue.len(),
+        keep_recent: COMPRESS_KEEP_RECENT,
+        every: COMPRESS_EVERY,
+        covered: compressor.covered(),
+        wire_messages: agent.wire_history(&dialogue).len(),
+        folded_chars: compressor.folded_chars(),
+        summary_chars: compressor.summary().chars().count(),
+        summary: compressor.summary().to_string(),
+        folds,
+        fold_tokens,
+        folded_fact,
+        tail_fact,
+        verdict,
+    })
+}
+
+/// Задать вопрос поверх готового разговора, ничего не мутируя. История,
+/// которую увидит провайдер, зависит от стратегии агента
+/// (`Agent::wire_history`), и именно в этом вся проверка.
+fn ask_after(agent: &Agent, dialogue: &[ChatMessage], question: &str) -> Res<Call> {
+    let mut history = dialogue.to_vec();
+    history.push(ChatMessage::user(question.to_string()));
+    agent.complete(&history).map(Call::from_reply)
+}
+
+/// Причинная подпись сжатия, а не «тексты отличаются».
+///
+/// * Нет экономии `prompt_tokens` → `Flat`, сколько бы ни совпало текстов.
+/// * Экономия есть, но факт из свёрнутой части потерян → `Lossy`.
+/// * Полная история сама не вспомнила факт → тоже `Lossy`: сравнивать
+///   качество не с чем, и заявлять «сжатие ничего не потеряло» нечестно.
+/// * Экономия есть и оба факта на месте → `Confirmed`.
+fn judge_compression(folded: &CompressionProbe, tail: &CompressionProbe) -> CompressionVerdict {
+    let cheaper = folded.saved() > 0 && tail.saved() > 0;
+    if !cheaper {
+        return CompressionVerdict::Flat;
+    }
+    let baseline_knows = folded.full_recalled() && tail.full_recalled();
+    let compressed_knows = folded.compressed_recalled() && tail.compressed_recalled();
+    if baseline_knows && compressed_knows {
+        CompressionVerdict::Confirmed
+    } else {
+        CompressionVerdict::Lossy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Effort;
+    use crate::compress::{Compressor, Policy};
+
+    fn probe(token: &'static str, full_prompt: u64, comp_prompt: u64, full_text: &str, comp_text: &str) -> CompressionProbe {
+        let mut full = call("stop", 5, full_text);
+        full.prompt_tokens = full_prompt;
+        let mut compressed = call("stop", 5, comp_text);
+        compressed.prompt_tokens = comp_prompt;
+        CompressionProbe {
+            label: "test",
+            token,
+            question: "?",
+            full,
+            compressed,
+        }
+    }
+
+    /// Проверка сжатия осмысленна только если посаженный факт действительно
+    /// попадает в свёрнутую часть, а контрольный — в дословный хвост. Иначе
+    /// «Confirmed» ничего не доказывает.
+    #[test]
+    fn planted_tokens_land_on_the_right_side_of_the_fold() {
+        let dialogue = compression_dialogue();
+        assert_eq!(dialogue.len(), COMPRESS_MESSAGES);
+        let policy = Policy { keep_recent: COMPRESS_KEEP_RECENT, every: COMPRESS_EVERY };
+        let mut c = Compressor::new();
+        let target = c.due(dialogue.len(), policy).expect("fold must be due");
+        let folded = &dialogue[..target];
+        let kept = &dialogue[target..];
+        assert!(folded.iter().any(|m| m.content.contains(FOLDED_TOKEN)));
+        assert!(!kept.iter().any(|m| m.content.contains(FOLDED_TOKEN)));
+        assert!(kept.iter().any(|m| m.content.contains(TAIL_TOKEN)));
+        assert!(!folded.iter().any(|m| m.content.contains(TAIL_TOKEN)));
+        // Один прохода хватает: после него сворачивать больше нечего.
+        c.apply("s".into(), target, 1);
+        assert_eq!(c.due(dialogue.len(), policy), None);
+        assert!(folded.len() > kept.len(), "экономия должна быть заметной");
+    }
+
+    #[test]
+    fn compression_is_flat_without_token_savings() {
+        let same = probe(FOLDED_TOKEN, 900, 900, FOLDED_TOKEN, FOLDED_TOKEN);
+        let tail = probe(TAIL_TOKEN, 900, 400, TAIL_TOKEN, TAIL_TOKEN);
+        assert_eq!(judge_compression(&same, &tail), CompressionVerdict::Flat);
+    }
+
+    #[test]
+    fn compression_is_lossy_when_the_summary_dropped_the_fact() {
+        let folded = probe(FOLDED_TOKEN, 900, 400, FOLDED_TOKEN, "NONE");
+        let tail = probe(TAIL_TOKEN, 900, 400, TAIL_TOKEN, TAIL_TOKEN);
+        assert_eq!(judge_compression(&folded, &tail), CompressionVerdict::Lossy);
+    }
+
+    #[test]
+    fn compression_is_lossy_when_the_baseline_did_not_know_it_either() {
+        let folded = probe(FOLDED_TOKEN, 900, 400, "NONE", FOLDED_TOKEN);
+        let tail = probe(TAIL_TOKEN, 900, 400, TAIL_TOKEN, TAIL_TOKEN);
+        assert_eq!(judge_compression(&folded, &tail), CompressionVerdict::Lossy);
+    }
+
+    #[test]
+    fn compression_confirmed_only_when_cheaper_and_both_facts_survive() {
+        let folded = probe(FOLDED_TOKEN, 1200, 500, FOLDED_TOKEN, FOLDED_TOKEN);
+        let tail = probe(TAIL_TOKEN, 1200, 500, TAIL_TOKEN, TAIL_TOKEN);
+        assert_eq!(judge_compression(&folded, &tail), CompressionVerdict::Confirmed);
+        let report = CompressionReport {
+            messages: 30,
+            keep_recent: 6,
+            every: 10,
+            covered: 20,
+            wire_messages: 10,
+            folded_chars: 1000,
+            summary_chars: 300,
+            summary: "сводка".into(),
+            folds: 1,
+            fold_tokens: 1400,
+            folded_fact: folded,
+            tail_fact: tail,
+            verdict: CompressionVerdict::Confirmed,
+        };
+        assert!(report.confirmed());
+        assert_eq!(report.saved_per_turn(), 700);
+        assert_eq!(report.break_even_turns(), Some(2));
+        let text = report.render();
+        assert!(text.contains("Confirmed"));
+        assert!(text.contains("prompt_tokens 1200 -> 500"));
+        assert!(report.status_line().contains("saved/turn=+700"));
+    }
+
+    #[test]
+    fn break_even_is_none_when_nothing_was_saved() {
+        let folded = probe(FOLDED_TOKEN, 500, 900, FOLDED_TOKEN, FOLDED_TOKEN);
+        let tail = probe(TAIL_TOKEN, 500, 900, TAIL_TOKEN, TAIL_TOKEN);
+        let report = CompressionReport {
+            messages: 30,
+            keep_recent: 6,
+            every: 10,
+            covered: 20,
+            wire_messages: 10,
+            folded_chars: 1000,
+            summary_chars: 300,
+            summary: String::new(),
+            folds: 1,
+            fold_tokens: 1400,
+            verdict: judge_compression(&folded, &tail),
+            folded_fact: folded,
+            tail_fact: tail,
+        };
+        assert_eq!(report.verdict, CompressionVerdict::Flat);
+        assert_eq!(report.break_even_turns(), None);
+        assert!(report.render().contains("никогда"));
+    }
+
     fn call(finish: &str, completion: u64, text: &str) -> Call {
         Call {
             model: LIVE_COMPLETION_MODEL.into(),
