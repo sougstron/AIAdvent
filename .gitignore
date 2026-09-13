@@ -37,6 +37,11 @@ tree/task-9/target/*
 !tree/task-9/target/release/
 tree/task-9/target/release/*
 !tree/task-9/target/release/ask
+!tree/task-10/target/
+tree/task-10/target/*
+!tree/task-10/target/release/
+tree/task-10/target/release/*
+!tree/task-10/target/release/ask
 # the current-task pointer is tracked even though docs/ is ignored
 !docs/
 docs/*
