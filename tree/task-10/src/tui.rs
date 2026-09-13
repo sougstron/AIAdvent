@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agent::Agent;
 use crate::api::{self, ChatMessage, Endpoint, Outcome};
@@ -255,6 +255,9 @@ struct App {
     cmd_path: String,
     cmd_selected: usize,
     quit: bool,
+    /// Timestamp of the last Ctrl+C press: a second press within
+    /// `QUIT_WINDOW` quits, a single press only asks for another.
+    ctrl_c_at: Option<Instant>,
     /// Token meters drawn in the footer: measured usage of the session so
     /// far plus the calibration that turns "what's in the box" into an
     /// estimate of the next request.
@@ -367,6 +370,7 @@ impl App {
             cmd_popup_dismissed: false,
             cmd_selected: 0,
             quit: false,
+            ctrl_c_at: None,
             tokens: TokenMeter::new(),
             sent_shape: Shape::default(),
             spinner: None,
@@ -402,7 +406,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('n') => self.new_chat(),
-                KeyCode::Char('q') => self.quit = true,
+                KeyCode::Char('c') => self.handle_ctrl_c(),
                 _ => {}
             }
             return;
@@ -491,7 +495,12 @@ impl App {
                 self.focus = Focus::Login;
                 self.status = "key entry cancelled".into();
             }
-            KeyCode::Esc => self.quit = true,
+            KeyCode::Esc => {
+                self.ctrl_c_at = None;
+                self.status =
+                    "Esc only interrupts a running generation — press Ctrl+C twice to quit"
+                        .into();
+            }
             KeyCode::Tab => self.apply_tab(width),
             KeyCode::Enter if self.editing_api_key.is_some() => {
                 self.finish_key_entry(terminal);
@@ -2139,7 +2148,8 @@ impl App {
     /// Non-blocking drain of pending key events while a request is in flight
     /// (the main loop is otherwise stuck polling the worker channel and no
     /// key would ever be seen). Esc asks to stop the current generation;
-    /// Ctrl-Q stops it and quits. Any other key is ignored.
+    /// a second Ctrl+C within `QUIT_WINDOW` stops it and quits. Any other
+    /// key is ignored.
     fn poll_cancel_keys(&mut self) -> bool {
         let mut stop = false;
         while event::poll(Duration::ZERO).unwrap_or(false) {
@@ -2149,14 +2159,37 @@ impl App {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
-                self.quit = true;
+            let now = Instant::now();
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                if self.ctrl_c_pending(now) {
+                    self.quit = true;
+                } else {
+                    self.ctrl_c_at = Some(now);
+                    self.status = "press Ctrl+C again to quit".into();
+                }
                 stop = true;
             } else if key.code == KeyCode::Esc {
                 stop = true;
             }
         }
         stop
+    }
+
+    /// Ctrl+C is the only way out: a single press shows a hint in the
+    /// status bar, a second press within `QUIT_WINDOW` quits.
+    fn handle_ctrl_c(&mut self) {
+        let now = Instant::now();
+        if matches!(self.ctrl_c_at, Some(t) if now.duration_since(t) <= QUIT_WINDOW) {
+            self.quit = true;
+            return;
+        }
+        self.ctrl_c_at = Some(now);
+        self.status = "press Ctrl+C again to quit".into();
+    }
+
+    /// True when a previous Ctrl+C press is still inside the quit window.
+    fn ctrl_c_pending(&self, now: Instant) -> bool {
+        matches!(self.ctrl_c_at, Some(t) if now.duration_since(t) <= QUIT_WINDOW)
     }
 
     fn adjust_setting(&mut self, delta: i32) {
@@ -3256,11 +3289,11 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let keys = if self.spinner.is_some() {
-            "Esc stop generation \u{b7} Ctrl-Q quit"
+            "Esc stop generation \u{b7} Ctrl-C \u{d7}2 quit"
         } else if self.editing_system_prompt || self.editing_api_key.is_some() {
             "Enter save \u{b7} Esc cancel"
         } else {
-            "Enter send \u{b7} / commands \u{b7} Tab settings \u{b7} Ctrl-N new \u{b7} Esc quit"
+            "Enter send \u{b7} / commands \u{b7} Tab settings \u{b7} Ctrl-N new \u{b7} Ctrl-C \u{d7}2 quit"
         };
         f.render_widget(
             Paragraph::new(vec![
@@ -3293,7 +3326,6 @@ const HELP: &str = "\
 /verify                   prove the agent reaches z.ai and that levers are honoured
 /login                    connect glm/deepseek/openrouter keys (live-checked, stored 0600)
 /personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
-/personas a,b,c: <question>   same, with your own cast instead of the default three
 /context [show|on|off|reload]  AGENTS.md files in the system prompt
 /strategy [show|off|summary|window|facts|branch]  context-management strategy
 /strategy keep N | every N    window size / how often summary folds (/compress is an alias)
@@ -3303,7 +3335,10 @@ const HELP: &str = "\
 /settings                 open the settings panel (Tab on an empty input)
 /quit                     exit
 Esc while generating      stop the current generation (partial reply is kept)
-Ctrl-Q                    quit, even mid-generation";
+Ctrl-C twice (within 3s)  quit, even mid-generation";
+
+/// How long after a first Ctrl+C press the second one still quits.
+const QUIT_WINDOW: Duration = Duration::from_secs(3);
 
 /// Packs every token meter into a dedicated, right-aligned bar. Narrow
 /// terminals gain rows instead of silently losing request/session/context.
