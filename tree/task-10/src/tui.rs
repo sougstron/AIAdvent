@@ -1808,8 +1808,9 @@ impl App {
                     .fork(name, from.filter(|f| !f.is_empty()))
                 {
                     Ok(_) => {
+                        self.switch_branch(name);
                         self.status = format!(
-                            "ветка `{name}` создана (всего {}) — /branch switch {name}",
+                            "ветка `{name}` создана и активна (всего {})",
                             self.session.tree().len()
                         );
                         self.save_session();
@@ -3837,6 +3838,21 @@ mod tests {
         // Транскрипт пересобран под путь ветки, а не остался от beta.
         assert_eq!(app.entries.len(), 4);
         assert!(matches!(&app.entries[3], Entry::Assistant { text, .. } if text == "ALPHA!"));
+    }
+
+    #[test]
+    fn branch_new_lands_you_in_the_new_branch() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_strategy("branch");
+        app.session.push_user("вопрос".into());
+        app.session.push_assistant("ответ".into());
+        app.cmd_checkpoint("");
+        app.cmd_branch("new alpha");
+        assert_eq!(app.session.tree().active_name(), "alpha");
+        assert!(app.status.contains("создана и активна"), "{}", app.status);
+        // Память переехала в ветку, транскрипт пересобран.
+        app.session.push_user("ALPHA?".into());
+        assert_eq!(app.session.history().len(), 3);
     }
 
     /// Счётчик токенов должен мерить то, что уходит на провод: иначе футер
