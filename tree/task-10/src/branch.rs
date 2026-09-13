@@ -294,7 +294,10 @@ impl BranchStore {
     }
 
     fn next_checkpoint_name(&self) -> String {
-        (1..).map(|i| format!("cp{i}")).find(|n| !self.checkpoints.iter().any(|c| &c.name == n)).unwrap_or_else(|| "cp".into())
+        (1..)
+            .map(|i| format!("cp{i}"))
+            .find(|n| !self.checkpoints.iter().any(|c| &c.name == n))
+            .unwrap_or_else(|| "cp".into())
     }
 
     pub fn find_checkpoint(&self, name: &str) -> Option<&Checkpoint> {
@@ -323,7 +326,9 @@ impl BranchStore {
                     .active()
                     .leaf
                     .and_then(|leaf| self.snap_to_assistant(leaf))
-                    .ok_or_else(|| "не от чего форкать: в ветке нет ответов ассистента".to_string())?,
+                    .ok_or_else(|| {
+                        "не от чего форкать: в ветке нет ответов ассистента".to_string()
+                    })?,
             },
         };
         let prefix_len = self.path_indices_from(Some(node)).len();
@@ -383,7 +388,12 @@ impl BranchStore {
             return Err("новое имя не должно быть пустым".into());
         }
         let i = self.resolve(selector)?;
-        if self.branches.iter().enumerate().any(|(j, b)| j != i && b.name == new_name) {
+        if self
+            .branches
+            .iter()
+            .enumerate()
+            .any(|(j, b)| j != i && b.name == new_name)
+        {
             return Err(format!("ветка `{new_name}` уже есть"));
         }
         let old = std::mem::replace(&mut self.branches[i].name, new_name.to_string());
@@ -412,7 +422,10 @@ impl BranchStore {
     pub fn line(&self) -> String {
         let b = self.active();
         let fork = match b.forked_at {
-            Some(node) => format!(", форк от узла глубины {}", self.path_indices_from(Some(node)).len()),
+            Some(node) => format!(
+                ", форк от узла глубины {}",
+                self.path_indices_from(Some(node)).len()
+            ),
             None => String::new(),
         };
         format!(
@@ -432,7 +445,10 @@ impl BranchStore {
             let marker = if i == active { "*" } else { " " };
             let depth = self.path_indices_from(b.leaf).len();
             let fork = match b.forked_at {
-                Some(node) => format!("  форк от узла глубины {}", self.path_indices_from(Some(node)).len()),
+                Some(node) => format!(
+                    "  форк от узла глубины {}",
+                    self.path_indices_from(Some(node)).len()
+                ),
                 None => "  корневая".to_string(),
             };
             lines.push(format!(
@@ -447,7 +463,13 @@ impl BranchStore {
             let cps = self
                 .checkpoints
                 .iter()
-                .map(|c| format!("{} (глубина {})", c.name, self.path_indices_from(Some(c.node)).len()))
+                .map(|c| {
+                    format!(
+                        "{} (глубина {})",
+                        c.name,
+                        self.path_indices_from(Some(c.node)).len()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!("чекпойнты: {cps}"));
@@ -556,7 +578,10 @@ mod tests {
         linear(&mut store, &[("u1", "a1")]);
         store.push(msg("user", "u2-без-ответа"));
         let cp = store.checkpoint(Some("после-вопроса")).unwrap();
-        assert!(cp.snapped, "чекпойнт на реплике пользователя должен сдвинуться");
+        assert!(
+            cp.snapped,
+            "чекпойнт на реплике пользователя должен сдвинуться"
+        );
         assert_eq!(cp.depth, 2);
         store.fork("alt", Some("после-вопроса")).unwrap();
         let (c, f) = (Compressor::new(), FactStore::new());
@@ -569,7 +594,10 @@ mod tests {
         let mut store = BranchStore::new();
         assert!(store.checkpoint(None).is_err(), "пустая ветка");
         store.push(msg("user", "u1"));
-        assert!(store.checkpoint(None).is_err(), "ответа ассистента ещё не было");
+        assert!(
+            store.checkpoint(None).is_err(),
+            "ответа ассистента ещё не было"
+        );
         assert!(store.fork("alt", None).is_err());
     }
 
@@ -615,7 +643,10 @@ mod tests {
         assert_eq!(store.len(), 1);
         // История main цела: удаление ветки не чистит общие узлы.
         assert_eq!(texts(&store), ["u1", "a1"]);
-        assert!(store.delete("main").is_err(), "последнюю ветку удалять нельзя");
+        assert!(
+            store.delete("main").is_err(),
+            "последнюю ветку удалять нельзя"
+        );
     }
 
     #[test]
@@ -640,7 +671,10 @@ mod tests {
         let mut c = Compressor::new();
         c.apply("сводка про u2/a2".into(), 4, 10);
         store.store_memory(c, FactStore::new());
-        store.checkpoints.push(Checkpoint { name: "ранний".into(), node: 1 });
+        store.checkpoints.push(Checkpoint {
+            name: "ранний".into(),
+            node: 1,
+        });
         store.fork("alt", Some("ранний")).unwrap();
         assert!(store.branches()[1].compressor.is_empty());
         // А если summary укладывается в общий префикс — копируется.
@@ -655,7 +689,10 @@ mod tests {
     fn resync_reuses_the_common_prefix_and_keeps_siblings_intact() {
         let mut store = BranchStore::new();
         linear(&mut store, &[("u1", "a1"), ("u2", "a2")]);
-        store.checkpoints.push(Checkpoint { name: "cp".into(), node: 1 });
+        store.checkpoints.push(Checkpoint {
+            name: "cp".into(),
+            node: 1,
+        });
         store.fork("alpha", Some("cp")).unwrap();
         let nodes_before = store.nodes.len();
         // Откат последнего хода: front-end убрал две последние реплики.
@@ -668,7 +705,11 @@ mod tests {
         store.switch_memory("alpha", (c, f)).unwrap();
         assert_eq!(texts(&store), ["u1", "a1"]);
         // Дописали новое — путь продолжается, узлы добавились.
-        store.resync(&[msg("user", "u1"), msg("assistant", "a1"), msg("user", "новое")]);
+        store.resync(&[
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "новое"),
+        ]);
         assert_eq!(texts(&store).last().unwrap(), "новое");
         // Полная замена с нуля тоже работает.
         store.resync(&[]);

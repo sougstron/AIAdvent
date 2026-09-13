@@ -4,6 +4,7 @@ mod auth;
 mod billing;
 mod branch;
 mod cli;
+mod complete;
 mod compress;
 mod config;
 mod context;

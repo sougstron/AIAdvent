@@ -87,7 +87,11 @@ pub fn apply<'a>(
 /// Намеренно не зависят от истории: это состояние самой стратегии (summary,
 /// факты), а не выборка из диалога. Поэтому `Agent::system_for_request`
 /// может собрать их, не зная, какую именно историю ему сейчас передадут.
-pub fn blocks(strategy: ContextStrategy, compressor: &Compressor, facts: &FactStore) -> Vec<String> {
+pub fn blocks(
+    strategy: ContextStrategy,
+    compressor: &Compressor,
+    facts: &FactStore,
+) -> Vec<String> {
     match strategy {
         ContextStrategy::Summary => compressor.block().into_iter().collect(),
         ContextStrategy::Facts => facts.block().into_iter().collect(),
@@ -170,7 +174,11 @@ mod tests {
         for n in 1..=20 {
             let w = window(&h, n);
             assert!(!w.is_empty(), "n={n}");
-            assert_eq!(w.last().unwrap().content, h.last().unwrap().content, "n={n}");
+            assert_eq!(
+                w.last().unwrap().content,
+                h.last().unwrap().content,
+                "n={n}"
+            );
         }
         // Даже когда весь хвост — ассистент и снапить некуда.
         let tail_assistants = vec![
@@ -250,7 +258,11 @@ mod tests {
     fn branch_ships_the_resolved_path_whole() {
         let h = hist(7);
         let c = Compressor::new();
-        assert_eq!(apply(ContextStrategy::Branch, &h, &c, 2).len(), 7, "путь ветки не режется окном");
+        assert_eq!(
+            apply(ContextStrategy::Branch, &h, &c, 2).len(),
+            7,
+            "путь ветки не режется окном"
+        );
         assert!(blocks(ContextStrategy::Branch, &c, &FactStore::new()).is_empty());
     }
 
@@ -264,7 +276,14 @@ mod tests {
         assert!(status(ContextStrategy::Window, &h, &c, &f, 4, None).contains("4/12"));
         let facts_line = status(ContextStrategy::Facts, &h, &c, &f, 4, None);
         assert!(facts_line.contains("фактов 1"));
-        let branch_line = status(ContextStrategy::Branch, &h, &c, &f, 4, Some("ветка B, 3 сообщения"));
+        let branch_line = status(
+            ContextStrategy::Branch,
+            &h,
+            &c,
+            &f,
+            4,
+            Some("ветка B, 3 сообщения"),
+        );
         assert!(branch_line.contains("ветка B"));
     }
 }

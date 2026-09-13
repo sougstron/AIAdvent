@@ -127,7 +127,8 @@ impl Session {
     pub fn migrate_tree(&mut self) {
         if self.tree.needs_migration() && !self.messages.is_empty() {
             self.tree = BranchStore::from_messages(&self.messages);
-            self.tree.store_memory(self.compressor.clone(), self.facts.clone());
+            self.tree
+                .store_memory(self.compressor.clone(), self.facts.clone());
         }
     }
 
@@ -223,7 +224,8 @@ impl Session {
             msg.interrupted = flag;
         }
         self.resync_tree();
-        self.tree.store_memory(self.compressor.clone(), self.facts.clone());
+        self.tree
+            .store_memory(self.compressor.clone(), self.facts.clone());
         if self.title == "New chat" {
             if let Some(title) = self
                 .messages
@@ -325,7 +327,10 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionSummary> {
         match load_session_file(&path) {
             Ok(s) => out.push(SessionSummary::from_session(&s)),
             Err(e) => {
-                eprintln!("warning: skipping corrupt session file {}: {e}", path.display());
+                eprintln!(
+                    "warning: skipping corrupt session file {}: {e}",
+                    path.display()
+                );
             }
         }
     }
@@ -363,8 +368,8 @@ pub fn format_updated(secs: u64) -> String {
 }
 
 fn load_session_file(path: &Path) -> Res<Session> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut session: Session =
         serde_json::from_str(&raw).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
     // Файл до задачи 10 знает только плоский `messages` — дерево строим на
@@ -455,9 +460,15 @@ mod tests {
                 "temperature":null}}"#;
         let s: Session = serde_json::from_str(raw).unwrap();
         assert!(s.compressor.is_empty());
-        assert_eq!(s.settings.context_strategy, crate::config::ContextStrategy::Off);
+        assert_eq!(
+            s.settings.context_strategy,
+            crate::config::ContextStrategy::Off
+        );
         assert_eq!(s.settings.keep_recent, crate::config::DEFAULT_KEEP_RECENT);
-        assert_eq!(s.settings.summarize_every, crate::config::DEFAULT_SUMMARIZE_EVERY);
+        assert_eq!(
+            s.settings.summarize_every,
+            crate::config::DEFAULT_SUMMARIZE_EVERY
+        );
     }
 
     /// Сессия, записанная до задачи 10, не знает ни о фактах, ни о дереве
@@ -501,7 +512,13 @@ mod tests {
         let mut f = FactStore::new();
         f.set("секрет", "ALPHA");
         s.set_facts(f);
-        s.capture_from(&Settings::default(), Vec::<String>::new(), &s.clone().history(), &Compressor::new(), s.clone().facts());
+        s.capture_from(
+            &Settings::default(),
+            Vec::<String>::new(),
+            &s.clone().history(),
+            &Compressor::new(),
+            s.clone().facts(),
+        );
         s.save(&dir).unwrap();
 
         let mut back = load_session(&dir, &s.id).unwrap();
@@ -527,7 +544,13 @@ mod tests {
         c.apply("СВОДКА".into(), 1, 42);
         let mut f = FactStore::new();
         f.set("цель", "стенд");
-        s.capture_from(&Settings::default(), Vec::<String>::new(), &s.history(), &c, &f);
+        s.capture_from(
+            &Settings::default(),
+            Vec::<String>::new(),
+            &s.history(),
+            &c,
+            &f,
+        );
         s.save(&dir).unwrap();
         let back = load_session(&dir, &s.id).unwrap();
         assert_eq!(back.compressor.summary(), "СВОДКА");
@@ -538,10 +561,8 @@ mod tests {
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ask6-session-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ask6-session-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -639,7 +660,8 @@ mod tests {
 
     #[test]
     fn missing_fields_default_for_compat() {
-        let raw = r#"{"id":"legacy-1","title":"old chat","messages":[{"role":"user","content":"hi"}]}"#;
+        let raw =
+            r#"{"id":"legacy-1","title":"old chat","messages":[{"role":"user","content":"hi"}]}"#;
         let s: Session = serde_json::from_str(raw).unwrap();
         assert_eq!(s.id, "legacy-1");
         assert_eq!(s.settings.model, DEFAULT_MODEL);
@@ -764,7 +786,10 @@ mod tests {
             home.join(".ask6").join("sessions")
         );
         assert_eq!(
-            sessions_dir_from(Some("/custom/sessions".into()), Some(home.display().to_string())),
+            sessions_dir_from(
+                Some("/custom/sessions".into()),
+                Some(home.display().to_string())
+            ),
             PathBuf::from("/custom/sessions")
         );
     }

@@ -134,7 +134,11 @@ pub struct ResumeProbe {
 
 impl ResumeProbe {
     pub fn verdict(&self) -> IsolationVerdict {
-        if self.recalled_after_resume.to_uppercase().contains(self.token) {
+        if self
+            .recalled_after_resume
+            .to_uppercase()
+            .contains(self.token)
+        {
             IsolationVerdict::Confirmed
         } else {
             IsolationVerdict::Amnesiac
@@ -302,7 +306,11 @@ pub fn structural() -> Res<StructuralCheck> {
         && !resumed.iter().any(|m| m.content.contains("STRUCT1#"));
 
     let fresh = rt.spawn(BoxSpec::new("fresh", probe_settings()));
-    let fresh_box_blank = rt.get(&fresh).ok_or("fresh box vanished")?.history().is_empty();
+    let fresh_box_blank = rt
+        .get(&fresh)
+        .ok_or("fresh box vanished")?
+        .history()
+        .is_empty();
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(StructuralCheck {
@@ -382,7 +390,10 @@ fn live(dir: &Path) -> Res<(Vec<BoxProbe>, ResumeProbe)> {
     rt.close(&first_id)?;
     rt.resume(&first_id, BoxSpec::new("", probe_settings()))?;
     let turns_restored = rt.get(&first_id).ok_or("resumed box vanished")?.turns();
-    let turn = rt.get_mut(&first_id).ok_or("resumed box vanished")?.ask(RECALL)?;
+    let turn = rt
+        .get_mut(&first_id)
+        .ok_or("resumed box vanished")?
+        .ask(RECALL)?;
     let resume = ResumeProbe {
         id: first_id,
         token: first_token,

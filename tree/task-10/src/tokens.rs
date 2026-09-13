@@ -44,16 +44,26 @@ pub struct Tokens {
 
 impl Tokens {
     pub fn measured(value: u64) -> Tokens {
-        Tokens { value, estimated: false }
+        Tokens {
+            value,
+            estimated: false,
+        }
     }
 
     pub fn estimated(value: u64) -> Tokens {
-        Tokens { value, estimated: true }
+        Tokens {
+            value,
+            estimated: true,
+        }
     }
 
     /// `1.2k~` — the compact form the footer renders.
     pub fn label(&self) -> String {
-        format!("{}{}", compact(self.value), if self.estimated { "~" } else { "" })
+        format!(
+            "{}{}",
+            compact(self.value),
+            if self.estimated { "~" } else { "" }
+        )
     }
 }
 
@@ -75,7 +85,10 @@ impl Default for TokenMeter {
 
 impl TokenMeter {
     pub fn new() -> TokenMeter {
-        TokenMeter { calibration: None, last: None }
+        TokenMeter {
+            calibration: None,
+            last: None,
+        }
     }
 
     /// `/new` starts a fresh session; the calibration is a property of the
@@ -174,7 +187,10 @@ impl Shape {
     }
 
     pub fn plus(self, other: Shape) -> Shape {
-        Shape { chars: self.chars + other.chars, messages: self.messages + other.messages }
+        Shape {
+            chars: self.chars + other.chars,
+            messages: self.messages + other.messages,
+        }
     }
 }
 
@@ -298,7 +314,10 @@ mod tests {
 
     #[test]
     fn context_label_shows_a_question_mark_when_the_window_is_unknown() {
-        assert_eq!(context_label(Tokens::measured(15_000), Some(1_000_000)), "15k/1.0M (2%)");
+        assert_eq!(
+            context_label(Tokens::measured(15_000), Some(1_000_000)),
+            "15k/1.0M (2%)"
+        );
         assert_eq!(context_label(Tokens::estimated(300), None), "300~/?");
         assert_eq!(context_label(Tokens::measured(300), Some(0)), "300/?");
     }

@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -56,7 +56,11 @@ impl Provider {
             "openrouter" => Ok(Provider::OpenRouter),
             other => Err(format!(
                 "unknown provider `{other}`; supported: {}",
-                Provider::ALL.iter().map(|p| p.id()).collect::<Vec<_>>().join(", ")
+                Provider::ALL
+                    .iter()
+                    .map(|p| p.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }
@@ -80,7 +84,6 @@ impl Provider {
             Provider::OpenRouter => "OPENROUTER_API_KEY",
         }
     }
-
 }
 
 /// One stored provider credential. `base_url` overrides the chat base for
@@ -158,7 +161,10 @@ impl fmt::Debug for Resolved {
 
 /// `~/.ask6/auth.json`, overridable with `$ASK_AUTH_FILE` (tests, sandboxes).
 pub fn auth_path() -> PathBuf {
-    auth_path_from(std::env::var("ASK_AUTH_FILE").ok(), std::env::var("HOME").ok())
+    auth_path_from(
+        std::env::var("ASK_AUTH_FILE").ok(),
+        std::env::var("HOME").ok(),
+    )
 }
 
 pub fn auth_path_from(override_file: Option<String>, home: Option<String>) -> PathBuf {
@@ -212,7 +218,11 @@ pub fn save_to(path: &Path, creds: &Credentials) -> Res<()> {
     }
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
-        format!("cannot rename {} over {}: {e}", tmp.to_string_lossy(), path.display())
+        format!(
+            "cannot rename {} over {}: {e}",
+            tmp.to_string_lossy(),
+            path.display()
+        )
     })
 }
 
@@ -385,8 +395,12 @@ impl fmt::Debug for CheckResult {
         // All fields are provider-derived text, never the key itself; still
         // routed through Display-ish formatting to keep this the one place.
         match self {
-            CheckResult::Confirmed { evidence } => write!(f, "Confirmed {{ evidence: {evidence:?} }}"),
-            CheckResult::Rejected { http, msg } => write!(f, "Rejected {{ http: {http}, msg: {msg:?} }}"),
+            CheckResult::Confirmed { evidence } => {
+                write!(f, "Confirmed {{ evidence: {evidence:?} }}")
+            }
+            CheckResult::Rejected { http, msg } => {
+                write!(f, "Rejected {{ http: {http}, msg: {msg:?} }}")
+            }
             CheckResult::Unreachable { msg } => write!(f, "Unreachable {{ msg: {msg:?} }}"),
         }
     }
@@ -435,7 +449,9 @@ pub fn check(provider: Provider, key: &str) -> CheckResult {
     match result {
         Ok(resp) => classify(provider, resp.status(), &read_body(resp)),
         Err(ureq::Error::Status(code, resp)) => classify(provider, code, &read_body(resp)),
-        Err(e) => CheckResult::Unreachable { msg: format!("network error: {e}") },
+        Err(e) => CheckResult::Unreachable {
+            msg: format!("network error: {e}"),
+        },
     }
 }
 
@@ -447,17 +463,33 @@ fn read_body(resp: ureq::Response) -> String {
 /// this can be tested offline against canned bodies.
 pub fn classify(provider: Provider, status: u16, body: &str) -> CheckResult {
     match status {
-        401 | 403 => CheckResult::Rejected { http: status, msg: format!("{} rejected the key{}", provider.label(), snippet(body)) },
-        429 | 500..=599 => CheckResult::Unreachable { msg: format!("HTTP {status} from {}{}", provider.label(), snippet(body)) },
+        401 | 403 => CheckResult::Rejected {
+            http: status,
+            msg: format!("{} rejected the key{}", provider.label(), snippet(body)),
+        },
+        429 | 500..=599 => CheckResult::Unreachable {
+            msg: format!("HTTP {status} from {}{}", provider.label(), snippet(body)),
+        },
         200..=299 => confirmed_or_unverifiable(provider, body),
-        _ => CheckResult::Rejected { http: status, msg: format!("unexpected HTTP {status} from {}{}", provider.label(), snippet(body)) },
+        _ => CheckResult::Rejected {
+            http: status,
+            msg: format!(
+                "unexpected HTTP {status} from {}{}",
+                provider.label(),
+                snippet(body)
+            ),
+        },
     }
 }
 
 fn confirmed_or_unverifiable(provider: Provider, body: &str) -> CheckResult {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(_) => return CheckResult::Unreachable { msg: "HTTP 200 but the body was not JSON".into() },
+        Err(_) => {
+            return CheckResult::Unreachable {
+                msg: "HTTP 200 but the body was not JSON".into(),
+            }
+        }
     };
     let evidence = match provider {
         // Only key-derived fields count: usage and the echoed model id.
@@ -465,15 +497,23 @@ fn confirmed_or_unverifiable(provider: Provider, body: &str) -> CheckResult {
             let model = v.get("model").and_then(Value::as_str);
             let prompt = v.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
             match (model, prompt) {
-                (Some(m), Some(n)) => Some(format!("chat/completions 200: model={m}, prompt_tokens={n}")),
+                (Some(m), Some(n)) => Some(format!(
+                    "chat/completions 200: model={m}, prompt_tokens={n}"
+                )),
                 _ => None,
             }
         }
         Provider::DeepSeek => {
             let info = v.pointer("/balance_infos/0");
-            match info.and_then(|i| i.get("total_balance")).and_then(Value::as_str) {
+            match info
+                .and_then(|i| i.get("total_balance"))
+                .and_then(Value::as_str)
+            {
                 Some(balance) => {
-                    let currency = info.and_then(|i| i.get("currency")).and_then(Value::as_str).unwrap_or("?");
+                    let currency = info
+                        .and_then(|i| i.get("currency"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("?");
                     Some(format!("balance 200: {balance} {currency}"))
                 }
                 None => None,
@@ -481,7 +521,10 @@ fn confirmed_or_unverifiable(provider: Provider, body: &str) -> CheckResult {
         }
         Provider::OpenRouter => {
             let data = v.get("data");
-            let label = data.and_then(|d| d.get("label")).and_then(Value::as_str).unwrap_or("?");
+            let label = data
+                .and_then(|d| d.get("label"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             let usage = data.and_then(|d| d.get("usage"));
             let limit = data.and_then(|d| d.get("limit"));
             if data.is_some() && (usage.is_some() || limit.is_some()) {
@@ -505,14 +548,12 @@ fn confirmed_or_unverifiable(provider: Provider, body: &str) -> CheckResult {
 /// Short provider-quote for messages: a JSON `error.message` when present,
 /// else the head of the body. Provider responses never contain the key.
 fn snippet(body: &str) -> String {
-    let quoted = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.pointer("/error/message")
-                .or_else(|| v.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
+    let quoted = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v.pointer("/error/message")
+            .or_else(|| v.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     let text = quoted.unwrap_or_else(|| body.trim().to_string());
     if text.is_empty() {
         return String::new();
@@ -633,7 +674,10 @@ pub fn status_all() -> Vec<ProviderStatus> {
     Provider::ALL
         .iter()
         .map(|&p| {
-            let stored = creds.providers.get(p.id()).and_then(|e| e.last_check.clone());
+            let stored = creds
+                .providers
+                .get(p.id())
+                .and_then(|e| e.last_check.clone());
             match resolve(p) {
                 Ok(r) => ProviderStatus {
                     provider: p,
@@ -641,7 +685,12 @@ pub fn status_all() -> Vec<ProviderStatus> {
                     masked: Some(mask(&r.key)),
                     last_check: stored,
                 },
-                Err(_) => ProviderStatus { provider: p, source: None, masked: None, last_check: stored },
+                Err(_) => ProviderStatus {
+                    provider: p,
+                    source: None,
+                    masked: None,
+                    last_check: stored,
+                },
             }
         })
         .collect()
@@ -670,10 +719,18 @@ mod tests {
     }
 
     fn store_with(path: &Path, id: &str, key: &str) {
-        let mut creds = Credentials { version: 1, ..Default::default() };
+        let mut creds = Credentials {
+            version: 1,
+            ..Default::default()
+        };
         creds.providers.insert(
             id.to_string(),
-            Entry { key: key.into(), base_url: None, added_at: 0, last_check: None },
+            Entry {
+                key: key.into(),
+                base_url: None,
+                added_at: 0,
+                last_check: None,
+            },
         );
         save_to(path, &creds).unwrap();
     }
@@ -713,8 +770,14 @@ mod tests {
     fn no_key_is_read_from_other_tools_files() {
         let dir = tmp("retired-files");
         let home = dir.join("home");
-        write_file(&home.join(".pi/agent/auth.json"), r#"{"zai-coding-cn":{"key":"glm-from-pi"},"deepseek":{"key":"ds-from-pi"},"openrouter":{"key":"or-from-pi"}}"#);
-        write_file(&home.join(".omp/agent/auth.json"), r#"{"zai-coding-cn":{"key":"glm-from-omp"}}"#);
+        write_file(
+            &home.join(".pi/agent/auth.json"),
+            r#"{"zai-coding-cn":{"key":"glm-from-pi"},"deepseek":{"key":"ds-from-pi"},"openrouter":{"key":"or-from-pi"}}"#,
+        );
+        write_file(
+            &home.join(".omp/agent/auth.json"),
+            r#"{"zai-coding-cn":{"key":"glm-from-omp"}}"#,
+        );
         write_file(
             &home.join(".local/share/opencode/auth.json"),
             r#"{"openrouter":{"key":"or-from-opencode"}}"#,
@@ -775,7 +838,10 @@ mod tests {
     fn store_round_trip_and_corrupt_file_error() {
         let dir = tmp("roundtrip");
         let path = dir.join("auth.json");
-        let mut creds = Credentials { version: 1, ..Default::default() };
+        let mut creds = Credentials {
+            version: 1,
+            ..Default::default()
+        };
         creds.providers.insert(
             "openrouter".into(),
             Entry {
@@ -793,7 +859,14 @@ mod tests {
         let loaded = load_from(&path).unwrap();
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.providers["openrouter"].key, "sk-or-0000000099");
-        assert_eq!(loaded.providers["openrouter"].last_check.as_ref().unwrap().verdict, "confirmed");
+        assert_eq!(
+            loaded.providers["openrouter"]
+                .last_check
+                .as_ref()
+                .unwrap()
+                .verdict,
+            "confirmed"
+        );
 
         fs::write(&path, "{{{").unwrap();
         let err = load_from(&path).unwrap_err();
@@ -811,10 +884,19 @@ mod tests {
         let mut creds = Credentials::default();
         creds.providers.insert(
             "glm".into(),
-            Entry { key: "k".into(), base_url: None, added_at: 0, last_check: None },
+            Entry {
+                key: "k".into(),
+                base_url: None,
+                added_at: 0,
+                last_check: None,
+            },
         );
         save_to(&path, &creds).unwrap();
-        let dir_mode = fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let dir_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
@@ -863,8 +945,10 @@ mod tests {
     // --- classify: offline verdicts on canned provider bodies ---
 
     const GLM_OK: &str = r#"{"model":"glm-5.3-flash","usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
-    const DS_OK: &str = r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"92.51"}]}"#;
-    const OR_OK: &str = r#"{"data":{"label":"dev","usage":1.25,"limit":20.0,"is_free_tier":false}}"#;
+    const DS_OK: &str =
+        r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"92.51"}]}"#;
+    const OR_OK: &str =
+        r#"{"data":{"label":"dev","usage":1.25,"limit":20.0,"is_free_tier":false}}"#;
 
     #[test]
     fn classify_confirms_only_on_key_derived_evidence() {
@@ -897,7 +981,10 @@ mod tests {
         ] {
             match classify(p, 200, body) {
                 CheckResult::Unreachable { msg } => assert!(msg.contains("no key-derived data")),
-                other => panic!("{:?} 200 without evidence must not confirm: {other:?}", p.id()),
+                other => panic!(
+                    "{:?} 200 without evidence must not confirm: {other:?}",
+                    p.id()
+                ),
             }
         }
         // And a non-JSON 200 body is the same story, not a confirmation.
@@ -918,8 +1005,14 @@ mod tests {
                 other => panic!("{:?} 401 must reject: {other:?}", p.id()),
             }
             assert!(matches!(classify(p, 403, ""), CheckResult::Rejected { .. }));
-            assert!(matches!(classify(p, 502, ""), CheckResult::Unreachable { .. }));
-            assert!(matches!(classify(p, 429, ""), CheckResult::Unreachable { .. }));
+            assert!(matches!(
+                classify(p, 502, ""),
+                CheckResult::Unreachable { .. }
+            ));
+            assert!(matches!(
+                classify(p, 429, ""),
+                CheckResult::Unreachable { .. }
+            ));
             match classify(p, 400, r#"{"error":{"message":"bad model"}}"#) {
                 CheckResult::Rejected { http, msg } => {
                     assert_eq!(http, 400);
@@ -962,6 +1055,9 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked >= 8, "expected to scan the real src/ tree, saw {checked} files");
+        assert!(
+            checked >= 8,
+            "expected to scan the real src/ tree, saw {checked} files"
+        );
     }
 }

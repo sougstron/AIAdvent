@@ -110,11 +110,17 @@ impl Report {
         } else {
             s.push_str(&format!(
                 "  live probe        model={} prompt={} completion={} total={}\n",
-                self.model, self.usage.prompt_tokens, self.usage.completion_tokens, self.usage.total_tokens
+                self.model,
+                self.usage.prompt_tokens,
+                self.usage.completion_tokens,
+                self.usage.total_tokens
             ));
             s.push_str(&format!(
                 "  probe cost        ${:.6} at list price ({} in / {} cached / {} out per 1M)\n",
-                self.cost_usd, PRICE_INPUT_PER_MTOK, PRICE_CACHED_INPUT_PER_MTOK, PRICE_OUTPUT_PER_MTOK
+                self.cost_usd,
+                PRICE_INPUT_PER_MTOK,
+                PRICE_CACHED_INPUT_PER_MTOK,
+                PRICE_OUTPUT_PER_MTOK
             ));
         }
         s.push_str(&format!(
@@ -174,7 +180,9 @@ pub fn run() -> Res<Report> {
             };
             (
                 verdict,
-                o.model.clone().unwrap_or_else(|| LIVE_COMPLETION_MODEL.into()),
+                o.model
+                    .clone()
+                    .unwrap_or_else(|| LIVE_COMPLETION_MODEL.into()),
                 o.usage,
                 None,
             )
@@ -233,7 +241,10 @@ mod tests {
             total_tokens: 2_000_000,
         };
         let c = cost_usd(&u);
-        assert!((c - (PRICE_INPUT_PER_MTOK + PRICE_OUTPUT_PER_MTOK)).abs() < 1e-9, "{c}");
+        assert!(
+            (c - (PRICE_INPUT_PER_MTOK + PRICE_OUTPUT_PER_MTOK)).abs() < 1e-9,
+            "{c}"
+        );
     }
 
     #[test]

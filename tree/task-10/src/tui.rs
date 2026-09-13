@@ -4,8 +4,8 @@
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -24,6 +24,7 @@ use std::time::Duration;
 use crate::agent::Agent;
 use crate::api::{self, ChatMessage, Endpoint, Outcome};
 use crate::auth::{self, CheckResult, Provider};
+use crate::complete;
 use crate::compress;
 use crate::config::{self, Effort, Res, Settings};
 use crate::render::{self, strip_fences};
@@ -31,19 +32,27 @@ use crate::session::{self, Session, SessionSummary};
 use crate::tokens::{self, Shape, TokenMeter};
 use crate::verify;
 
-const MAX_CHARS_CHOICES: &[Option<usize>] =
-    &[None, Some(100), Some(250), Some(500), Some(1000), Some(2000)];
-const BUDGET_CHOICES: &[Option<u32>] =
-    &[None, Some(32), Some(64), Some(128), Some(256), Some(512), Some(1024), Some(4096)];
+const MAX_CHARS_CHOICES: &[Option<usize>] = &[
+    None,
+    Some(100),
+    Some(250),
+    Some(500),
+    Some(1000),
+    Some(2000),
+];
+const BUDGET_CHOICES: &[Option<u32>] = &[
+    None,
+    Some(32),
+    Some(64),
+    Some(128),
+    Some(256),
+    Some(512),
+    Some(1024),
+    Some(4096),
+];
 const STOP_PRESETS: &[&[&str]] = &[&[], &["\n\n"], &["\n---\n"], &["\n\n\n"]];
 /// Up to the documented z.ai ceiling (`config::TEMP_MAX` = 1.0).
-const TEMP_CHOICES: &[Option<f32>] = &[
-    None,
-    Some(0.0),
-    Some(0.3),
-    Some(0.7),
-    Some(1.0),
-];
+const TEMP_CHOICES: &[Option<f32>] = &[None, Some(0.0), Some(0.3), Some(0.7), Some(1.0)];
 const TOP_P_CHOICES: &[Option<f32>] = &[None, Some(0.5), Some(0.8), Some(0.95), Some(1.0)];
 const TOP_K_CHOICES: &[Option<i32>] = &[None, Some(20), Some(50), Some(100), Some(-1)];
 const SETTINGS_ROWS: &[&str] = &[
@@ -59,17 +68,8 @@ const SETTINGS_ROWS: &[&str] = &[
     "top_k",
     "system_prompt",
 ];
-/// Slash commands offered by the input popup, kept in alphabetical order
-/// since that's the order the popup lists them in.
-const COMMANDS: &[&str] = &[
-    "branch", "checkpoint", "compress", "context", "effort", "facts", "help", "json", "login",
-    "max-tokens", "model", "new", "personas", "quit",
-    "rename", "sessions", "settings", "stop", "strategy", "system", "temp", "top-k", "top-p",
-    "verify",
-];
 /// Подсказка по переключателю — одна на `/strategy`, `/help` и ошибки.
-const STRATEGY_USAGE: &str =
-    "/strategy [show|off|summary|window|facts|branch|keep N|every N]";
+const STRATEGY_USAGE: &str = "/strategy [show|off|summary|window|facts|branch|keep N|every N]";
 /// Status + key hints stay separate from the always-on token bar.
 const FOOTER_HEIGHT: u16 = 2;
 const STATS_SEP: &str = " \u{b7} ";
@@ -77,8 +77,10 @@ const STATS_MARGIN: usize = 1;
 
 /// Cycled while a background call is in flight — drawn inline in the
 /// transcript instead of a full-screen "working" overlay.
-const SPINNER_FRAMES: &[&str] =
-    &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
+const SPINNER_FRAMES: &[&str] = &[
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
 
 /// The whole palette. One accent for anything the user acts on (focus,
 /// prompt, the assistant's voice) and one muted tone for anything the user
@@ -102,7 +104,10 @@ fn panel(title: &str, hints: &str) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(muted())
-        .title(Span::styled(format!(" {title} "), accent().add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            format!(" {title} "),
+            accent().add_modifier(Modifier::BOLD),
+        ))
         .title_bottom(Span::styled(format!(" {hints} "), muted()))
 }
 
@@ -245,6 +250,9 @@ struct App {
     /// Index into `sessions_list` awaiting a y/n confirmation before delete.
     sessions_pending_delete: Option<usize>,
     cmd_popup_dismissed: bool,
+    /// Completed part of a slash command (`"/branch "`), tracked so a popup
+    /// dismissed with ← reopens when the command level changes.
+    cmd_path: String,
     cmd_selected: usize,
     quit: bool,
     /// Token meters drawn in the footer: measured usage of the session so
@@ -306,6 +314,7 @@ impl App {
             model_selected: 0,
             editing_system_prompt: false,
             sessions_list: Vec::new(),
+            cmd_path: String::new(),
             sessions_selected: 0,
             sessions_pending_delete: None,
             cmd_popup_dismissed: false,
@@ -389,11 +398,13 @@ impl App {
         // keep working while the popup is open.
         if self.command_popup_active() {
             match key.code {
-                // While the popup has the line, Enter picks the highlighted
-                // command instead of submitting the raw text — it never
-                // reaches the chat send path until the popup is closed.
+                // Enter and → both complete the highlighted candidate into
+                // the input; Enter additionally submits when the candidate
+                // is terminal (nothing left to type, like /new).
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.apply_selected_command(terminal);
+                    if let Some(line) = self.accept_selected_completion(true) {
+                        self.handle_command(line.trim_start_matches('/'), terminal);
+                    }
                     return;
                 }
                 KeyCode::Up => {
@@ -409,7 +420,7 @@ impl App {
                     return;
                 }
                 KeyCode::Right => {
-                    self.apply_selected_command(terminal);
+                    self.accept_selected_completion(false);
                     return;
                 }
                 _ => {}
@@ -461,7 +472,8 @@ impl App {
                 // Keyless guard: slash commands still work (that's how you
                 // reach /login), but a chat message has nowhere to go.
                 if !line.starts_with('/') && !self.agent.has_api_key() {
-                    self.status = "no API key — /login to connect one (Enter opens the panel)".into();
+                    self.status =
+                        "no API key — /login to connect one (Enter opens the panel)".into();
                     return;
                 }
                 let line = std::mem::take(&mut self.input);
@@ -477,19 +489,19 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.delete_char_before();
-                if self.input.is_empty() {
-                    self.cmd_popup_dismissed = false;
-                }
+                self.sync_cmd_dismissal();
                 self.cmd_selected = 0;
                 self.sync_input_scroll(width);
             }
             KeyCode::Delete => {
                 self.delete_char_at();
+                self.sync_cmd_dismissal();
                 self.cmd_selected = 0;
                 self.sync_input_scroll(width);
             }
             KeyCode::Char(c) => {
                 self.insert_char(c);
+                self.sync_cmd_dismissal();
                 self.cmd_selected = 0;
                 self.sync_input_scroll(width);
             }
@@ -594,7 +606,10 @@ impl App {
     /// The input box grows with the wrapped text, from 1 to 4 content rows
     /// (plus its two borders); longer text scrolls inside those 4 rows.
     fn input_box_height(&self, width: u16) -> u16 {
-        input_lines(&self.input, width).len().clamp(1, MAX_INPUT_LINES) as u16 + 2
+        input_lines(&self.input, width)
+            .len()
+            .clamp(1, MAX_INPUT_LINES) as u16
+            + 2
     }
 
     /// Keeps the cursor's visual row inside the visible input window after
@@ -611,29 +626,82 @@ impl App {
         self.input_scroll = self.input_scroll.min(lines.len().saturating_sub(view));
     }
 
-    /// Whether the input line is currently in "/" command-selection mode:
-    /// still composing the command name (no space yet), not dismissed with
-    /// Left, not editing a system prompt or an API key, and at least one
-    /// command matches the typed prefix. While this holds, the popup owns
-    /// Enter (see `handle_input_key`).
+    /// Whether the multilevel completion popup is open: a single-line slash
+    /// input that resolves to at least one candidate, cursor at the end of
+    /// the line (→ completes there instead of moving the cursor), not
+    /// dismissed with Left, and not editing a system prompt or an API key.
     fn command_popup_active(&self) -> bool {
         !self.editing_system_prompt
             && self.editing_api_key.is_none()
             && !self.cmd_popup_dismissed
             && self.input.starts_with('/')
-            && !self.input[1..].contains(char::is_whitespace)
-            && !self.filtered_commands().is_empty()
+            && !self.input.contains('\n')
+            && self.cursor == self.input.chars().count()
+            && !self.completion_candidates().is_empty()
     }
 
-    /// Commands matching the text typed after "/", alphabetically ordered
-    /// (mirrors `COMMANDS`), case-insensitive prefix match.
-    fn filtered_commands(&self) -> Vec<&'static str> {
-        let prefix = self.input.strip_prefix('/').unwrap_or("").to_ascii_lowercase();
-        COMMANDS.iter().copied().filter(|c| c.starts_with(prefix.as_str())).collect()
+    /// Snapshot of the live value lists the completion grammar suggests:
+    /// branches, checkpoints, connected-provider models, fact keys.
+    fn completion_values(&self) -> complete::Values {
+        complete::Values {
+            branches: self
+                .session
+                .tree()
+                .branches()
+                .iter()
+                .map(|b| b.name.clone())
+                .collect(),
+            checkpoints: self
+                .session
+                .tree()
+                .checkpoints()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            models: config::available_ids(&self.connected)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            fact_keys: self
+                .agent
+                .facts()
+                .keys()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
+    /// Candidates for the current input line, per the grammar in
+    /// `complete::ROOT`.
+    fn completion_candidates(&self) -> Vec<String> {
+        complete::candidates(&self.input, &self.completion_values())
+    }
+
+    /// The completed part of a slash command (everything up to and including
+    /// the last space). When it changes after an edit, a popup dismissed
+    /// with ← comes back — otherwise it would stay dead for the whole line.
+    fn command_path(&self) -> String {
+        let boundary = self
+            .input
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        self.input[..boundary].to_string()
+    }
+
+    fn sync_cmd_dismissal(&mut self) {
+        let path = self.command_path();
+        if path != self.cmd_path {
+            self.cmd_path = path;
+            self.cmd_popup_dismissed = false;
+        }
     }
 
     fn move_command_selection(&mut self, delta: i32) {
-        let n = self.filtered_commands().len();
+        let n = self.completion_candidates().len();
         if n == 0 {
             return;
         }
@@ -641,25 +709,57 @@ impl App {
         self.cmd_selected = (i + delta).rem_euclid(n as i32) as usize;
     }
 
-    fn apply_selected_command(&mut self, terminal: &mut DefaultTerminal) {
-        let cmds = self.filtered_commands();
-        let Some(name) = cmds.get(self.cmd_selected.min(cmds.len().saturating_sub(1))) else {
-            return;
+    /// Replace the token being typed with the highlighted candidate. With
+    /// `submit`, a terminal candidate (no further level — `/new`, `/help`,
+    /// `/branch switch main`) is sent right away; a non-terminal one just
+    /// gains a single trailing space and the popup drops to the next level.
+    /// Returns `Some(line)` when the caller must execute/submit the line.
+    fn accept_selected_completion(&mut self, submit: bool) -> Option<String> {
+        let cands = self.completion_candidates();
+        let cand = cands.get(self.cmd_selected.min(cands.len().saturating_sub(1)))?;
+        let cand = cand.clone();
+        let start = complete::edit_start(&self.input);
+        let input = self.input.clone();
+        // Appending after an exactly-typed literal ("/branch" + "show")
+        // needs a separator; replacing a partial token does not.
+        let sep = if start == input.len() && start > 1 && !input.ends_with(char::is_whitespace) {
+            " "
+        } else {
+            ""
         };
-        let name = name.to_string();
-        self.input.clear();
-        self.cmd_popup_dismissed = false;
+        let completed = format!("{}{}{}", &input[..start], sep, cand);
+        if complete::continues(&completed) {
+            self.input = format!("{completed} ");
+            self.cursor = self.input.chars().count();
+            self.cmd_path = self.command_path();
+            self.cmd_selected = 0;
+            return None;
+        }
+        if submit {
+            self.input.clear();
+            self.cursor = 0;
+            self.input_scroll = 0;
+            self.cmd_popup_dismissed = false;
+            self.cmd_path.clear();
+            self.cmd_selected = 0;
+            return Some(completed);
+        }
+        self.input = completed;
+        self.cursor = self.input.chars().count();
+        self.cmd_path = self.command_path();
         self.cmd_selected = 0;
-        self.handle_command(&name, terminal);
+        None
     }
-
     fn handle_settings_key(&mut self, code: KeyCode) {
-        let row = SETTINGS_ROWS.get(self.settings_selected).copied().unwrap_or("");
+        let row = SETTINGS_ROWS
+            .get(self.settings_selected)
+            .copied()
+            .unwrap_or("");
         match code {
             KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Input,
             KeyCode::Up | KeyCode::Char('k') => {
-                self.settings_selected = (self.settings_selected + SETTINGS_ROWS.len() - 1)
-                    % SETTINGS_ROWS.len()
+                self.settings_selected =
+                    (self.settings_selected + SETTINGS_ROWS.len() - 1) % SETTINGS_ROWS.len()
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings_selected = (self.settings_selected + 1) % SETTINGS_ROWS.len()
@@ -685,13 +785,15 @@ impl App {
             KeyCode::Esc => self.focus = Focus::Input,
             KeyCode::Up | KeyCode::Char('k') => {
                 if !self.sessions_list.is_empty() {
-                    self.sessions_selected =
-                        (self.sessions_selected + self.sessions_list.len() - 1) % self.sessions_list.len();
+                    self.sessions_selected = (self.sessions_selected + self.sessions_list.len()
+                        - 1)
+                        % self.sessions_list.len();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if !self.sessions_list.is_empty() {
-                    self.sessions_selected = (self.sessions_selected + 1) % self.sessions_list.len();
+                    self.sessions_selected =
+                        (self.sessions_selected + 1) % self.sessions_list.len();
                 }
             }
             KeyCode::Enter => self.load_selected_session(terminal),
@@ -706,14 +808,20 @@ impl App {
     /// n/Esc/anything else cancels back to the plain sessions list.
     fn handle_sessions_confirm_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.delete_selected_session(),
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.delete_selected_session()
+            }
             _ => self.sessions_pending_delete = None,
         }
     }
 
     fn delete_selected_session(&mut self) {
-        let Some(idx) = self.sessions_pending_delete.take() else { return };
-        let Some(summary) = self.sessions_list.get(idx) else { return };
+        let Some(idx) = self.sessions_pending_delete.take() else {
+            return;
+        };
+        let Some(summary) = self.sessions_list.get(idx) else {
+            return;
+        };
         let id = summary.id.clone();
         let title = summary.title.clone();
         match session::delete_session(&self.sessions_dir, &id) {
@@ -1094,9 +1202,9 @@ impl App {
         self.input_scroll = 0;
         self.editing_system_prompt = true;
         self.focus = Focus::Input;
-        self.status = "editing system prompt — Enter save · Shift+Enter newline · Esc cancel".into();
+        self.status =
+            "editing system prompt — Enter save · Shift+Enter newline · Esc cancel".into();
     }
-
 
     // --- /login: connect personal provider keys -----------------------------
 
@@ -1126,17 +1234,22 @@ impl App {
         }
     }
 
-
     fn handle_login_confirm_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.logout_selected_login(),
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.logout_selected_login()
+            }
             _ => self.login_pending_delete = None,
         }
     }
 
     fn logout_selected_login(&mut self) {
-        let Some(idx) = self.login_pending_delete.take() else { return };
-        let Some(row) = self.login_rows.get(idx) else { return };
+        let Some(idx) = self.login_pending_delete.take() else {
+            return;
+        };
+        let Some(row) = self.login_rows.get(idx) else {
+            return;
+        };
         let provider = row.provider;
         let model_hit = config::provider_of(&self.settings.model) == Some(provider);
         match auth::disconnect(provider) {
@@ -1174,7 +1287,9 @@ impl App {
     /// Enter on a provider row: the input box switches to masked key entry
     /// (same mechanism as the system-prompt editor).
     fn begin_key_entry(&mut self) {
-        let Some(row) = self.login_rows.get(self.login_selected) else { return };
+        let Some(row) = self.login_rows.get(self.login_selected) else {
+            return;
+        };
         let provider = row.provider;
         self.editing_api_key = Some(provider);
         self.input.clear();
@@ -1213,12 +1328,13 @@ impl App {
 
     fn move_login_selection(&mut self, delta: i32) {
         let n = Provider::ALL.len() as i32;
-        self.login_selected =
-            ((self.login_selected as i32 + delta).rem_euclid(n)) as usize;
+        self.login_selected = ((self.login_selected as i32 + delta).rem_euclid(n)) as usize;
     }
 
     fn finish_key_entry(&mut self, terminal: &mut DefaultTerminal) {
-        let Some(provider) = self.editing_api_key.take() else { return };
+        let Some(provider) = self.editing_api_key.take() else {
+            return;
+        };
         let key = std::mem::take(&mut self.input);
         self.cursor = 0;
         self.input_scroll = 0;
@@ -1228,11 +1344,10 @@ impl App {
             return;
         }
         let label = provider.label();
-        let result = self.with_spinner(
-            terminal,
-            &format!("checking {label} key live"),
-            move || auth::connect(provider, &key),
-        );
+        let result =
+            self.with_spinner(terminal, &format!("checking {label} key live"), move || {
+                auth::connect(provider, &key)
+            });
         match result {
             Some(Ok((verdict, saved))) => {
                 match &verdict {
@@ -1242,7 +1357,8 @@ impl App {
                             "{label}: CONFIRMED — key saved to {}",
                             auth::auth_path().display()
                         );
-                        self.entries.push(Entry::Info(format!("/login {label}: {evidence}")));
+                        self.entries
+                            .push(Entry::Info(format!("/login {label}: {evidence}")));
                         self.scroll_to_bottom(terminal);
                     }
                     CheckResult::Unreachable { msg } => {
@@ -1292,7 +1408,9 @@ impl App {
 
     /// `r` on the panel: live-recheck the selected provider's key.
     fn recheck_selected_login(&mut self, terminal: &mut DefaultTerminal) {
-        let Some(row) = self.login_rows.get(self.login_selected) else { return };
+        let Some(row) = self.login_rows.get(self.login_selected) else {
+            return;
+        };
         let provider = row.provider;
         let label = provider.label();
         let key = match auth::resolve(provider) {
@@ -1302,18 +1420,16 @@ impl App {
                 return;
             }
         };
-        let result = self.with_spinner(
-            terminal,
-            &format!("rechecking {label} key"),
-            move || auth::check(provider, &key),
-        );
+        let result = self.with_spinner(terminal, &format!("rechecking {label} key"), move || {
+            auth::check(provider, &key)
+        });
         match result {
             Some(verdict) => {
                 match auth::record_check(provider, &verdict) {
                     Ok(_) => {}
-                    Err(e) => self.entries.push(Entry::Info(format!(
-                        "could not record {label} check: {e}"
-                    ))),
+                    Err(e) => self
+                        .entries
+                        .push(Entry::Info(format!("could not record {label} check: {e}"))),
                 }
                 self.status = format!("{label}: {}", login_verdict_line(&verdict));
                 self.refresh_login_rows();
@@ -1324,7 +1440,10 @@ impl App {
 
     fn cmd_effort(&mut self, rest: &str) {
         if rest.is_empty() {
-            self.status = format!("effort={} (usage: /effort none|low|medium|high)", self.settings.effort);
+            self.status = format!(
+                "effort={} (usage: /effort none|low|medium|high)",
+                self.settings.effort
+            );
             return;
         }
         match Effort::parse(rest) {
@@ -1356,7 +1475,11 @@ impl App {
             self.status = "temperature off (provider default)".into();
             return;
         }
-        match rest.parse::<f32>().map_err(|_| format!("not a number: {rest}")).and_then(config::parse_temperature) {
+        match rest
+            .parse::<f32>()
+            .map_err(|_| format!("not a number: {rest}"))
+            .and_then(config::parse_temperature)
+        {
             Ok(t) => {
                 self.settings.temperature = Some(t);
                 self.status = if self.settings.top_k.is_none() && self.settings.top_p.is_none() {
@@ -1378,7 +1501,10 @@ impl App {
                     return;
                 }
                 self.settings.stop.push(config::unescape(arg.trim()));
-                self.status = format!("stop sequences: {}", config::render_stops(&self.settings.stop));
+                self.status = format!(
+                    "stop sequences: {}",
+                    config::render_stops(&self.settings.stop)
+                );
             }
             "clear" => {
                 self.settings.stop.clear();
@@ -1422,8 +1548,10 @@ impl App {
                 Err(e) => self.status = format!("not valid JSON: {e}"),
             },
             "edit" if !arg.is_empty() => self.json_edit(arg, terminal),
-            _ => self.status =
-                "usage: /json on|off|show|fields a,b,c|schema <json>|edit <instruction>".into(),
+            _ => {
+                self.status =
+                    "usage: /json on|off|show|fields a,b,c|schema <json>|edit <instruction>".into()
+            }
         }
     }
 
@@ -1499,21 +1627,19 @@ impl App {
             "" | "show" | "status" => {
                 self.entries.push(Entry::Info(self.strategy_listing()));
             }
-            "keep" | "every" => {
-                match tail.parse::<usize>() {
-                    Ok(n) if n >= 1 => {
-                        if head == "keep" {
-                            self.settings.keep_recent = n;
-                        } else {
-                            self.settings.summarize_every = n;
-                        }
-                        self.settings.clamp();
-                        self.sync_agent_settings();
-                        self.status = self.strategy_status();
+            "keep" | "every" => match tail.parse::<usize>() {
+                Ok(n) if n >= 1 => {
+                    if head == "keep" {
+                        self.settings.keep_recent = n;
+                    } else {
+                        self.settings.summarize_every = n;
                     }
-                    _ => self.status = format!("usage: /strategy {head} <число ≥ 1>"),
+                    self.settings.clamp();
+                    self.sync_agent_settings();
+                    self.status = self.strategy_status();
                 }
-            }
+                _ => self.status = format!("usage: /strategy {head} <число ≥ 1>"),
+            },
             other => match config::ContextStrategy::parse(other) {
                 Ok(strategy) => {
                     self.settings.context_strategy = strategy;
@@ -1628,7 +1754,11 @@ impl App {
     /// `/checkpoint [имя]` — отметить точку, от которой потом форкать ветки.
     fn cmd_checkpoint(&mut self, rest: &str) {
         let name = rest.trim();
-        match self.session.tree_mut().checkpoint((!name.is_empty()).then_some(name)) {
+        match self
+            .session
+            .tree_mut()
+            .checkpoint((!name.is_empty()).then_some(name))
+        {
             Ok(cp) => {
                 self.status = format!(
                     "чекпойнт `{}` на глубине {}{}",
@@ -1660,7 +1790,8 @@ impl App {
         };
         match head {
             "" | "show" | "list" => {
-                self.entries.push(Entry::Info(self.session.tree().listing()));
+                self.entries
+                    .push(Entry::Info(self.session.tree().listing()));
             }
             "new" | "fork" => {
                 let (name, from) = match tail.split_once(char::is_whitespace) {
@@ -1671,7 +1802,11 @@ impl App {
                     self.status = "usage: /branch new <имя> [чекпойнт]".into();
                     return;
                 }
-                match self.session.tree_mut().fork(name, from.filter(|f| !f.is_empty())) {
+                match self
+                    .session
+                    .tree_mut()
+                    .fork(name, from.filter(|f| !f.is_empty()))
+                {
                     Ok(_) => {
                         self.status = format!(
                             "ветка `{name}` создана (всего {}) — /branch switch {name}",
@@ -1712,8 +1847,7 @@ impl App {
                 }
             }
             other => {
-                self.status =
-                    format!("unknown: /branch {other} — [show|new|switch|rename|delete]");
+                self.status = format!("unknown: /branch {other} — [show|new|switch|rename|delete]");
             }
         }
     }
@@ -1777,8 +1911,11 @@ impl App {
                 let text = strip_fences(outcome.text());
                 match serde_json::from_str::<Value>(text)
                     .map_err(|e| e.to_string())
-                    .and_then(|v| jsonschema::validator_for(&v).map(|_| v).map_err(|e| e.to_string()))
-                {
+                    .and_then(|v| {
+                        jsonschema::validator_for(&v)
+                            .map(|_| v)
+                            .map_err(|e| e.to_string())
+                    }) {
                     Ok(schema) => {
                         self.settings.json_mode.schema = schema;
                         self.settings.json_mode.enabled = true;
@@ -1826,8 +1963,11 @@ impl App {
         }
         let (personas, question) = match rest.split_once(':') {
             Some((list, q)) if !q.trim().is_empty() => {
-                let custom: Vec<String> =
-                    list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                let custom: Vec<String> = list
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 if custom.is_empty() {
                     (default_personas(), rest.trim().to_string())
                 } else {
@@ -1864,7 +2004,9 @@ impl App {
                         note: None,
                     });
                 }
-                Some(Err(e)) => self.entries.push(Entry::Info(format!("[{persona}] failed: {e}"))),
+                Some(Err(e)) => self
+                    .entries
+                    .push(Entry::Info(format!("[{persona}] failed: {e}"))),
                 None => {
                     cancelled = true;
                     break;
@@ -1897,7 +2039,10 @@ impl App {
         });
         let mut frame = 0usize;
         loop {
-            self.spinner = Some((label.to_string(), SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]));
+            self.spinner = Some((
+                label.to_string(),
+                SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+            ));
             if self.follow {
                 self.scroll_to_bottom(terminal);
             }
@@ -1927,7 +2072,9 @@ impl App {
     fn poll_cancel_keys(&mut self) -> bool {
         let mut stop = false;
         while event::poll(Duration::ZERO).unwrap_or(false) {
-            let Ok(event::Event::Key(key)) = event::read() else { continue };
+            let Ok(event::Event::Key(key)) = event::read() else {
+                continue;
+            };
             if key.kind != KeyEventKind::Press {
                 continue;
             }
@@ -1942,7 +2089,11 @@ impl App {
     }
 
     fn adjust_setting(&mut self, delta: i32) {
-        match SETTINGS_ROWS.get(self.settings_selected).copied().unwrap_or("") {
+        match SETTINGS_ROWS
+            .get(self.settings_selected)
+            .copied()
+            .unwrap_or("")
+        {
             "model" => {
                 if self.available.is_empty() {
                     return;
@@ -1962,7 +2113,8 @@ impl App {
                 self.agent.set_strategy(self.settings.context_strategy);
             }
             "max_chars" => {
-                self.settings.max_chars = cycle_choice(MAX_CHARS_CHOICES, self.settings.max_chars, delta)
+                self.settings.max_chars =
+                    cycle_choice(MAX_CHARS_CHOICES, self.settings.max_chars, delta)
             }
             "budget_tokens" => {
                 self.settings.budget_tokens =
@@ -1971,17 +2123,22 @@ impl App {
             "stop" => {
                 let current = STOP_PRESETS
                     .iter()
-                    .position(|p| p.iter().map(|s| s.to_string()).collect::<Vec<_>>() == self.settings.stop)
+                    .position(|p| {
+                        p.iter().map(|s| s.to_string()).collect::<Vec<_>>() == self.settings.stop
+                    })
                     .unwrap_or(0) as i32;
                 let n = STOP_PRESETS.len() as i32;
                 let next = STOP_PRESETS[(current + delta).rem_euclid(n) as usize];
                 self.settings.stop = next.iter().map(|s| s.to_string()).collect();
             }
             "temperature" => {
-                self.settings.temperature = cycle_float(TEMP_CHOICES, self.settings.temperature, delta)
+                self.settings.temperature =
+                    cycle_float(TEMP_CHOICES, self.settings.temperature, delta)
             }
             "top_p" => self.settings.top_p = cycle_float(TOP_P_CHOICES, self.settings.top_p, delta),
-            "top_k" => self.settings.top_k = cycle_choice(TOP_K_CHOICES, self.settings.top_k, delta),
+            "top_k" => {
+                self.settings.top_k = cycle_choice(TOP_K_CHOICES, self.settings.top_k, delta)
+            }
             "system_prompt" => {}
             _ => {}
         }
@@ -2101,7 +2258,10 @@ impl App {
             return;
         }
 
-        self.entries.push(Entry::Assistant { text: String::new(), note: None });
+        self.entries.push(Entry::Assistant {
+            text: String::new(),
+            note: None,
+        });
         let idx = self.entries.len() - 1;
         self.status = "generating…".into();
 
@@ -2116,14 +2276,13 @@ impl App {
         let agent = self.prepared_agent();
         let cancel_worker = cancel.clone();
         thread::spawn(move || {
-            let mut stream =
-                match agent.stream(&history, Some(cancel_worker)) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(StreamEvent::Done(Err(e)));
-                        return;
-                    }
-                };
+            let mut stream = match agent.stream(&history, Some(cancel_worker)) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Done(Err(e)));
+                    return;
+                }
+            };
             loop {
                 match stream.next_chunk() {
                     Ok(Some(piece)) => {
@@ -2156,7 +2315,10 @@ impl App {
 
         let mut frame = 0usize;
         loop {
-            self.spinner = Some(("model is thinking".into(), SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]));
+            self.spinner = Some((
+                "model is thinking".into(),
+                SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+            ));
             if self.follow {
                 self.scroll_to_bottom(terminal);
             }
@@ -2183,7 +2345,7 @@ impl App {
                         Ok(outcome) => self.finish_reply_at(idx, outcome, terminal),
                         Err(e) => {
                             self.session.messages.pop();
-                    self.session.resync_tree();
+                            self.session.resync_tree();
                             self.entries.remove(idx);
                             self.status = format!("request failed: {e}");
                         }
@@ -2221,7 +2383,10 @@ impl App {
             let (capped, was_cut) = api::enforce_max_chars(&partial, self.settings.max_chars);
             let mut note = "stopped by Esc".to_string();
             if was_cut {
-                note = format!("{note} · truncated to {} chars", self.settings.max_chars.unwrap_or(0));
+                note = format!(
+                    "{note} · truncated to {} chars",
+                    self.settings.max_chars.unwrap_or(0)
+                );
             }
             if let Some(Entry::Assistant { text, note: n }) = self.entries.get_mut(idx) {
                 *text = capped.clone();
@@ -2239,7 +2404,12 @@ impl App {
     /// Shared tail of both the streaming and blocking reply paths: enforce
     /// `max_chars`, persist to the session, build the status/note text, and
     /// write the final text into `entries[idx]`.
-    fn finish_reply_at(&mut self, idx: usize, outcome: api::Outcome, terminal: &mut DefaultTerminal) {
+    fn finish_reply_at(
+        &mut self,
+        idx: usize,
+        outcome: api::Outcome,
+        terminal: &mut DefaultTerminal,
+    ) {
         let raw_text = outcome.text();
         let (display, parse_note) = if self.settings.json_mode.enabled {
             render::render_json_reply(raw_text)
@@ -2265,7 +2435,11 @@ impl App {
         if let Some(e) = parse_note {
             note_parts.push(e);
         }
-        if let Some(r) = outcome.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(r) = outcome
+            .reasoning
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
             note_parts.push(format!("reasoning: {} chars", r.trim().chars().count()));
         }
         let note = (!note_parts.is_empty()).then(|| note_parts.join(" · "));
@@ -2290,7 +2464,10 @@ impl App {
 
     /// Blocking-path variant: no live entry exists yet, so append one first.
     fn finish_reply(&mut self, outcome: api::Outcome, terminal: &mut DefaultTerminal) {
-        self.entries.push(Entry::Assistant { text: String::new(), note: None });
+        self.entries.push(Entry::Assistant {
+            text: String::new(),
+            note: None,
+        });
         let idx = self.entries.len() - 1;
         self.finish_reply_at(idx, outcome, terminal);
     }
@@ -2370,15 +2547,37 @@ impl App {
                 Span::styled("Ask anything, or / for commands", muted()),
             ])];
         }
-        let mut block = Block::bordered().border_type(BorderType::Rounded).border_style(border_style);
+        // Gray structure hint ("/branch new " → `name`). Rendered only —
+        // never touches self.input, wrap math or the cursor position; the
+        // hint vanishes as soon as a partial token is being typed because
+        // complete::hint returns "" then.
+        let hint = if self.editing_system_prompt || self.editing_api_key.is_some() {
+            ""
+        } else {
+            complete::hint(&self.input)
+        };
+        if !hint.is_empty() {
+            if let Some(last) = visible.last_mut() {
+                last.spans.push(Span::styled(format!(" {hint}"), muted()));
+            }
+        }
+        let mut block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(border_style);
         if let Some(provider) = self.editing_api_key {
             block = block
-                .title(Span::styled(format!(" {} API key ", provider.label()), accent()))
+                .title(Span::styled(
+                    format!(" {} API key ", provider.label()),
+                    accent(),
+                ))
                 .title_bottom(Span::styled(" Enter submit \u{b7} Esc cancel ", muted()));
         } else if self.editing_system_prompt {
             block = block
                 .title(Span::styled(" system prompt ", accent()))
-                .title_bottom(Span::styled(" Enter save \u{b7} Shift+Enter newline \u{b7} Esc cancel ", muted()));
+                .title_bottom(Span::styled(
+                    " Enter save \u{b7} Shift+Enter newline \u{b7} Esc cancel ",
+                    muted(),
+                ));
         }
         f.render_widget(Paragraph::new(visible).block(block), area);
         if focused {
@@ -2424,11 +2623,13 @@ impl App {
                 }
                 config::ContextStrategy::Window => format!(
                     "{st} {}/{history_len}",
-                    crate::strategy::window(&self.session.history(), self.settings.keep_recent).len()
+                    crate::strategy::window(&self.session.history(), self.settings.keep_recent)
+                        .len()
                 ),
                 config::ContextStrategy::Facts => format!(
                     "{st} {}/{history_len} · фактов {}",
-                    crate::strategy::window(&self.session.history(), self.settings.keep_recent).len(),
+                    crate::strategy::window(&self.session.history(), self.settings.keep_recent)
+                        .len(),
                     self.agent.facts().len()
                 ),
                 config::ContextStrategy::Branch => format!(
@@ -2503,7 +2704,12 @@ impl App {
         for entry in &self.entries {
             match entry {
                 Entry::User(text) => {
-                    out.extend(marked_lines("\u{203a} ", muted(), text, Style::default().add_modifier(Modifier::BOLD)));
+                    out.extend(marked_lines(
+                        "\u{203a} ",
+                        muted(),
+                        text,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
                     out.push(Line::raw(""));
                 }
                 Entry::Assistant { text, note } => {
@@ -2526,7 +2732,10 @@ impl App {
             ]));
         } else if out.is_empty() {
             out.push(Line::styled("Ask anything.", muted()));
-            out.push(Line::styled("\u{203a} type / for commands, Tab for settings", muted()));
+            out.push(Line::styled(
+                "\u{203a} type / for commands, Tab for settings",
+                muted(),
+            ));
         }
         out
     }
@@ -2549,7 +2758,9 @@ impl App {
     /// clips rather than clamps, so any offset past this renders a blank pane —
     /// every manual or automatic scroll must be capped to this value.
     fn max_scroll(&self, terminal: &DefaultTerminal) -> u16 {
-        let Ok(size) = terminal.size() else { return self.scroll };
+        let Ok(size) = terminal.size() else {
+            return self.scroll;
+        };
         self.max_scroll_for(size.width, size.height)
     }
 
@@ -2561,8 +2772,9 @@ impl App {
         let body_height =
             height.saturating_sub(1 + self.input_box_height(width) + stats_height + FOOTER_HEIGHT);
         let inner_width = width.saturating_sub(2); // horizontal padding
-        let total_lines =
-            Paragraph::new(self.transcript_lines()).wrap(Wrap { trim: false }).line_count(inner_width) as u16;
+        let total_lines = Paragraph::new(self.transcript_lines())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width) as u16;
         total_lines.saturating_sub(body_height)
     }
 
@@ -2579,7 +2791,11 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                let marker = if i == self.settings_selected { "▸ " } else { "  " };
+                let marker = if i == self.settings_selected {
+                    "▸ "
+                } else {
+                    "  "
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{marker}{name:<14}")),
                     Span::styled(self.setting_value(i), Style::default().fg(Color::Green)),
@@ -2615,7 +2831,12 @@ impl App {
                 s
             }
             "effort" => self.settings.effort.to_string(),
-            "json mode" => if self.settings.json_mode.enabled { "on" } else { "off" }.into(),
+            "json mode" => if self.settings.json_mode.enabled {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
             "strategy" => {
                 let st = self.settings.context_strategy;
                 let detail = match st {
@@ -2639,14 +2860,22 @@ impl App {
                 };
                 format!("{st}  ({}{detail})", st.describe())
             }
-            "max_chars" => self.settings.max_chars.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
-            "budget_tokens" => {
-                self.settings.budget_tokens.map(|n| n.to_string()).unwrap_or_else(|| "off".into())
-            }
+            "max_chars" => self
+                .settings
+                .max_chars
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "off".into()),
+            "budget_tokens" => self
+                .settings
+                .budget_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "off".into()),
             "stop" => config::render_stops(&self.settings.stop),
-            "temperature" => {
-                self.settings.temperature.map(|t| t.to_string()).unwrap_or_else(|| "off".into())
-            }
+            "temperature" => self
+                .settings
+                .temperature
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "off".into()),
             "top_p" => self
                 .settings
                 .top_p
@@ -2661,7 +2890,10 @@ impl App {
                 let text = &self.settings.system_prompt;
                 let preview: String = text.chars().take(40).collect();
                 let suffix = if text.chars().count() > 40 { "…" } else { "" };
-                format!("{preview}{suffix}  ({} chars, Enter to edit)", text.chars().count())
+                format!(
+                    "{preview}{suffix}  ({} chars, Enter to edit)",
+                    text.chars().count()
+                )
             }
             _ => String::new(),
         }
@@ -2676,23 +2908,29 @@ impl App {
         let popup = centered(
             area,
             78,
-            (rows as u16 + 2)
-                .min(area.height.saturating_sub(2))
-                .max(4),
+            (rows as u16 + 2).min(area.height.saturating_sub(2)).max(4),
         );
         let items: Vec<ListItem> = if self.available.is_empty() {
-            vec![ListItem::new("no providers connected — press Esc, then /login")]
+            vec![ListItem::new(
+                "no providers connected — press Esc, then /login",
+            )]
         } else {
             self.available
                 .iter()
                 .enumerate()
                 .map(|(i, id)| {
-                    let cursor = if i == self.model_selected { "▸ " } else { "  " };
+                    let cursor = if i == self.model_selected {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
                     let applied = *id == self.settings.model;
                     let live = config::find_model(id).is_some_and(|m| m.live);
                     let mark = if live { "● " } else { "○ " };
                     let style = if applied {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
@@ -2733,7 +2971,11 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, row)| {
-                let cursor = if i == self.login_selected { "▸ " } else { "  " };
+                let cursor = if i == self.login_selected {
+                    "▸ "
+                } else {
+                    "  "
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(cursor),
                     Span::raw(login_row_text(row)),
@@ -2744,10 +2986,12 @@ impl App {
         state.select(Some(self.login_selected));
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
-            List::new(items).highlight_style(selected_row()).block(panel(
-                "login",
-                "Enter add key \u{b7} r recheck \u{b7} d remove \u{b7} Esc close",
-            )),
+            List::new(items)
+                .highlight_style(selected_row())
+                .block(panel(
+                    "login",
+                    "Enter add key \u{b7} r recheck \u{b7} d remove \u{b7} Esc close",
+                )),
             popup,
             &mut state,
         );
@@ -2775,7 +3019,10 @@ impl App {
         f.render_stateful_widget(
             List::new(items)
                 .highlight_style(selected_row())
-                .block(panel("sessions", "\u{2191}\u{2193} select \u{b7} Enter open \u{b7} d delete \u{b7} Esc close")),
+                .block(panel(
+                    "sessions",
+                    "\u{2191}\u{2193} select \u{b7} Enter open \u{b7} d delete \u{b7} Esc close",
+                )),
             popup,
             &mut state,
         );
@@ -2788,16 +3035,23 @@ impl App {
 
     fn draw_delete_confirm(&self, f: &mut Frame, area: Rect, title: &str) {
         let msg = format!("Delete '{title}'? y/n");
-        let width = (msg.chars().count() as u16 + 4).min(area.width.saturating_sub(2)).max(20);
+        let width = (msg.chars().count() as u16 + 4)
+            .min(area.width.saturating_sub(2))
+            .max(20);
         let popup = centered(area, width, 3);
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_widget(
-            Paragraph::new(msg).style(Style::default().fg(Color::Red)).block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Red))
-                    .title(Span::styled(" confirm ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
-            ),
+            Paragraph::new(msg)
+                .style(Style::default().fg(Color::Red))
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Red))
+                        .title(Span::styled(
+                            " confirm ",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                ),
             popup,
         );
     }
@@ -2805,31 +3059,41 @@ impl App {
     /// Anchored to the bottom of the transcript area, directly above the
     /// input box, so it reads like a dropdown under the cursor.
     fn draw_command_popup(&self, f: &mut Frame, body: Rect) {
-        let cmds = self.filtered_commands();
+        let cmds = self.completion_candidates();
         let selected = self.cmd_selected.min(cmds.len().saturating_sub(1));
         let height = (cmds.len() as u16 + 2).min(body.height);
-        let width = 40.min(body.width);
+        // Wide enough for model ids and branch names, never over the panel.
+        let longest = cmds
+            .iter()
+            .map(|c| c.chars().count() + 2)
+            .max()
+            .unwrap_or(0) as u16;
+        let width = 40.max(longest + 4).min(body.width);
         let popup = Rect {
             x: body.x,
             y: body.y + body.height.saturating_sub(height),
             width,
             height,
         };
+        // "/" decorates root commands only; deeper levels show bare tokens.
+        let at_root = complete::popup_title(&self.input).is_none_or(|t| t == "commands");
         let items: Vec<ListItem> = cmds
             .iter()
             .enumerate()
             .map(|(i, name)| {
                 let marker = if i == selected { "▸ " } else { "  " };
-                ListItem::new(format!("{marker}/{name}"))
+                let slash = if at_root { "/" } else { "" };
+                ListItem::new(format!("{marker}{slash}{name}"))
             })
             .collect();
+        let title = complete::popup_title(&self.input).unwrap_or_else(|| "commands".into());
         let mut state = ListState::default();
         state.select(Some(selected));
         f.render_widget(ratatui::widgets::Clear, popup);
         f.render_stateful_widget(
             List::new(items)
                 .highlight_style(selected_row())
-                .block(panel("commands", "\u{2191}\u{2193} select \u{b7} Enter apply \u{b7} \u{2190} close")),
+                .block(panel(&title, "\u{2191}\u{2193} select \u{b7} \u{2192} complete \u{b7} Enter apply \u{b7} \u{2190} close")),
             popup,
             &mut state,
         );
@@ -2853,7 +3117,9 @@ impl App {
         self.agent
             .wire_history(&history)
             .iter()
-            .fold(system_shape, |acc, m| acc.plus(Shape::new(m.content.chars().count(), 1)))
+            .fold(system_shape, |acc, m| {
+                acc.plus(Shape::new(m.content.chars().count(), 1))
+            })
     }
 
     /// The text in the input box, when it would be sent as a chat message.
@@ -2894,15 +3160,26 @@ impl App {
         let pending = self.pending_shape();
         let used = self.tokens.context_used(&conversation, &pending);
         vec![
-            format!("req {}", self.tokens.current_request(&self.current_query_shape()).label()),
+            format!(
+                "req {}",
+                self.tokens
+                    .current_request(&self.current_query_shape())
+                    .label()
+            ),
             format!("sess {}", self.tokens.session(&conversation).label()),
             format!("last {}", self.tokens.last_reply().label()),
-            format!("ctx {}", tokens::context_label(used, config::context_window(&self.settings.model))),
+            format!(
+                "ctx {}",
+                tokens::context_label(used, config::context_window(&self.settings.model))
+            ),
         ]
     }
 
     fn draw_token_bar(&self, f: &mut Frame, area: Rect, rows: Vec<String>) {
-        let lines = rows.into_iter().map(|row| Line::styled(row, muted())).collect::<Vec<_>>();
+        let lines = rows
+            .into_iter()
+            .map(|row| Line::styled(row, muted()))
+            .collect::<Vec<_>>();
         f.render_widget(Paragraph::new(lines), area);
     }
 
@@ -2996,7 +3273,12 @@ fn right_aligned(text: String, room: usize) -> String {
 /// One transcript entry as styled lines: `marker` in the left margin of the
 /// first row, two spaces of hanging indent under it, so the glyph column
 /// stays clean no matter how many lines the text has.
-fn marked_lines(marker: &'static str, marker_style: Style, text: &str, text_style: Style) -> Vec<Line<'static>> {
+fn marked_lines(
+    marker: &'static str,
+    marker_style: Style,
+    text: &str,
+    text_style: Style,
+) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = text
         .lines()
         .enumerate()
@@ -3051,11 +3333,7 @@ fn login_row_text(row: &auth::ProviderStatus) -> String {
     match (&row.source, &row.masked) {
         (Some(source), Some(key)) => {
             let check = match &row.last_check {
-                Some(c) => format!(
-                    "  {} {}",
-                    c.verdict,
-                    session::format_updated(c.at)
-                ),
+                Some(c) => format!("  {} {}", c.verdict, session::format_updated(c.at)),
                 None => String::new(),
             };
             format!("{id}{:<30} {key}{check}", source.describe())
@@ -3094,7 +3372,10 @@ fn cycle_float(choices: &[Option<f32>], current: Option<f32>, delta: i32) -> Opt
 /// Byte offset of the char at `char_idx` (`s.len()` when the index is at/past
 /// the end) — bridges the char-offset cursor and the byte-offset `String` API.
 fn byte_pos(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 /// Pasted newlines arrive as `\n` from most terminals but as `\r` (tmux)
@@ -3148,7 +3429,11 @@ fn wrap_input(input: &str, width: usize) -> Vec<(usize, String)> {
         // Word boundary (space, newline, or end of input): commit the word.
         if !word.is_empty() {
             let wlen = word.chars().count();
-            let fits = if cur_w == 0 { spaces + wlen <= width } else { cur_w + spaces + wlen <= width };
+            let fits = if cur_w == 0 {
+                spaces + wlen <= width
+            } else {
+                cur_w + spaces + wlen <= width
+            };
             if fits {
                 if cur_w == 0 {
                     cur_start = word_start.saturating_sub(spaces);
@@ -3271,7 +3556,10 @@ mod tests {
         // Nothing has been sent yet, so the first three are estimates and the
         // context meter divides by glm-5.3-flash's published window.
         assert!(stats[0].ends_with('~'), "{stats:?}");
-        assert!(stats[3].starts_with("ctx ") && stats[3].contains("/1.0M"), "{stats:?}");
+        assert!(
+            stats[3].starts_with("ctx ") && stats[3].contains("/1.0M"),
+            "{stats:?}"
+        );
         assert_eq!(stats[2], "last 0");
     }
 
@@ -3298,9 +3586,15 @@ mod tests {
         // estimate again; measured history does not move until a reply.
         app.input = "next question".into();
         let typing = app.token_stats();
-        assert!(typing[0].ends_with('~') && typing[0] != stats[0], "{typing:?}");
+        assert!(
+            typing[0].ends_with('~') && typing[0] != stats[0],
+            "{typing:?}"
+        );
         assert!(typing[3].contains('~'), "{typing:?}");
-        assert_eq!(typing[1], stats[1], "session history does not move until a reply");
+        assert_eq!(
+            typing[1], stats[1],
+            "session history does not move until a reply"
+        );
     }
 
     #[test]
@@ -3314,15 +3608,24 @@ mod tests {
 
     #[test]
     fn an_unknown_model_shows_a_question_mark_instead_of_a_made_up_window() {
-        let settings = config::Settings { model: "not-in-the-catalog".into(), ..Default::default() };
+        let settings = config::Settings {
+            model: "not-in-the-catalog".into(),
+            ..Default::default()
+        };
         let app = App::new(Agent::dummy(), settings, None);
-        assert!(app.token_stats()[3].ends_with("/?"), "{:?}", app.token_stats());
+        assert!(
+            app.token_stats()[3].ends_with("/?"),
+            "{:?}",
+            app.token_stats()
+        );
     }
 
     #[test]
     fn stats_rows_right_align_and_wrap_without_dropping_meters() {
-        let stats: Vec<String> =
-            ["req 1.2k~", "sess 8.4k", "last 512", "ctx 15k/1.0M (2%)"].iter().map(|s| s.to_string()).collect();
+        let stats: Vec<String> = ["req 1.2k~", "sess 8.4k", "last 512", "ctx 15k/1.0M (2%)"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let wide = stats_rows(&stats, 80);
         assert_eq!(wide.len(), 1);
         assert_eq!(wide[0].chars().count(), 80);
@@ -3334,7 +3637,10 @@ mod tests {
         assert!(narrow.len() > 1);
         let rendered = narrow.join("\n");
         for stat in &stats {
-            assert!(rendered.contains(stat), "missing {stat:?} from {rendered:?}");
+            assert!(
+                rendered.contains(stat),
+                "missing {stat:?} from {rendered:?}"
+            );
         }
     }
 
@@ -3375,7 +3681,10 @@ mod tests {
     #[test]
     fn sampling_rows_render_and_cycle() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
-        let temp_row = SETTINGS_ROWS.iter().position(|r| *r == "temperature").unwrap();
+        let temp_row = SETTINGS_ROWS
+            .iter()
+            .position(|r| *r == "temperature")
+            .unwrap();
         let top_p_row = SETTINGS_ROWS.iter().position(|r| *r == "top_p").unwrap();
         let top_k_row = SETTINGS_ROWS.iter().position(|r| *r == "top_k").unwrap();
         assert_eq!(app.setting_value(temp_row), "off");
@@ -3405,14 +3714,20 @@ mod tests {
         assert_eq!(app.settings.context_strategy, config::ContextStrategy::Off);
         // И назад тем же кругом.
         app.adjust_setting(-1);
-        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Branch);
+        assert_eq!(
+            app.settings.context_strategy,
+            config::ContextStrategy::Branch
+        );
     }
 
     #[test]
     fn slash_strategy_switches_strategy_and_reports_state() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         app.cmd_strategy("summary");
-        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Summary);
+        assert_eq!(
+            app.settings.context_strategy,
+            config::ContextStrategy::Summary
+        );
         assert!(app.agent.strategy().enabled());
         assert!(app.status.contains("compress=summary"));
         app.cmd_strategy("keep 3");
@@ -3422,18 +3737,30 @@ mod tests {
         assert_eq!(app.settings.summarize_every, 4);
         app.cmd_strategy("keep 0");
         assert!(app.status.starts_with("usage:"), "{}", app.status);
-        assert_eq!(app.settings.keep_recent, 3, "битый аргумент ничего не меняет");
+        assert_eq!(
+            app.settings.keep_recent, 3,
+            "битый аргумент ничего не меняет"
+        );
         app.cmd_strategy("off");
         assert_eq!(app.settings.context_strategy, config::ContextStrategy::Off);
         app.cmd_strategy("nonsense");
         assert!(app.status.starts_with("/strategy"), "{}", app.status);
         // Каждое значение доступно и по алиасу, и через старое имя команды.
         app.cmd_strategy("window");
-        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Window);
+        assert_eq!(
+            app.settings.context_strategy,
+            config::ContextStrategy::Window
+        );
         app.cmd_strategy("kv");
-        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Facts);
+        assert_eq!(
+            app.settings.context_strategy,
+            config::ContextStrategy::Facts
+        );
         app.cmd_strategy("tree");
-        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Branch);
+        assert_eq!(
+            app.settings.context_strategy,
+            config::ContextStrategy::Branch
+        );
     }
 
     #[test]
@@ -3630,7 +3957,10 @@ mod tests {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         app.with_connected(vec![Provider::Glm]);
         assert!(app.available.contains(&"glm-5.3-flash"));
-        assert!(!app.available.iter().any(|id| id.starts_with("deepseek") || id.contains(":free")));
+        assert!(!app
+            .available
+            .iter()
+            .any(|id| id.starts_with("deepseek") || id.contains(":free")));
         app.with_connected(vec![Provider::Glm, Provider::OpenRouter]);
         assert!(app.available.iter().any(|id| id.ends_with(":free")));
         assert!(!app.available.contains(&"deepseek-flash"));
@@ -3725,7 +4055,10 @@ mod tests {
     #[test]
     fn wrap_breaks_at_word_boundary() {
         let lines = wrap_input("aaa bbb ccc", 7);
-        assert_eq!(lines, vec![(0, "aaa bbb".to_string()), (8, "ccc".to_string())]);
+        assert_eq!(
+            lines,
+            vec![(0, "aaa bbb".to_string()), (8, "ccc".to_string())]
+        );
     }
 
     #[test]
@@ -3733,7 +4066,11 @@ mod tests {
         let lines = wrap_input("abcdefgh", 3);
         assert_eq!(
             lines,
-            vec![(0, "abc".to_string()), (3, "def".to_string()), (6, "gh".to_string())]
+            vec![
+                (0, "abc".to_string()),
+                (3, "def".to_string()),
+                (6, "gh".to_string())
+            ]
         );
     }
 
@@ -3742,7 +4079,11 @@ mod tests {
         let lines = wrap_input("ab\ncd\n", 10);
         assert_eq!(
             lines,
-            vec![(0, "ab".to_string()), (3, "cd".to_string()), (6, String::new())]
+            vec![
+                (0, "ab".to_string()),
+                (3, "cd".to_string()),
+                (6, String::new())
+            ]
         );
     }
 
@@ -3772,7 +4113,10 @@ mod tests {
         // which is where the word typed after it lands anyway, so the cursor
         // does not jump when the word arrives.
         let lines = wrap_input("aaa bbb ", 7);
-        assert_eq!(lines, vec![(0, "aaa bbb".to_string()), (7, " ".to_string())]);
+        assert_eq!(
+            lines,
+            vec![(0, "aaa bbb".to_string()), (7, " ".to_string())]
+        );
         assert_eq!(cursor_visual_pos(&lines, 8), (1, 1));
         assert_eq!(cursor_visual_pos(&wrap_input("aaa bbb c", 7), 9), (1, 1));
     }
@@ -3789,11 +4133,15 @@ mod tests {
         assert_eq!(wide.chars().count(), 120);
         // Tight: the title is cut short (with an ellipsis) but the settings
         // still fit whole.
-        let tight = app.header_line((meta.chars().count() + 16) as u16).to_string();
+        let tight = app
+            .header_line((meta.chars().count() + 16) as u16)
+            .to_string();
         assert!(tight.contains('\u{2026}'));
         assert!(tight.trim_end().ends_with(&meta));
         // Narrower than the settings themselves: the title is gone entirely.
-        let narrow = app.header_line((meta.chars().count() + 4) as u16).to_string();
+        let narrow = app
+            .header_line((meta.chars().count() + 4) as u16)
+            .to_string();
         assert!(!narrow.contains("very long"));
         assert!(narrow.trim_end().ends_with(&meta));
     }
@@ -3818,26 +4166,46 @@ mod tests {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         app.entries = vec![
             Entry::User("hi\nthere".into()),
-            Entry::Assistant { text: "yo".into(), note: Some("stopped".into()) },
+            Entry::Assistant {
+                text: "yo".into(),
+                note: Some("stopped".into()),
+            },
             Entry::Info("note".into()),
         ];
-        let rendered: Vec<String> =
-            app.transcript_lines().iter().map(|l| l.to_string()).collect();
+        let rendered: Vec<String> = app
+            .transcript_lines()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
         // First row of a message carries the glyph, continuations are indented
         // under it, and every entry is followed by a blank separator row.
         assert_eq!(
             rendered,
-            vec!["\u{203a} hi", "  there", "", "\u{25cf} yo", "  \u{2937} stopped", "", "\u{b7} note", ""]
+            vec![
+                "\u{203a} hi",
+                "  there",
+                "",
+                "\u{25cf} yo",
+                "  \u{2937} stopped",
+                "",
+                "\u{b7} note",
+                ""
+            ]
         );
     }
 
     #[test]
     fn empty_transcript_shows_the_placeholder_until_the_spinner_takes_over() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
-        assert!(app.transcript_lines()[0].to_string().starts_with("Ask anything"));
+        assert!(app.transcript_lines()[0]
+            .to_string()
+            .starts_with("Ask anything"));
         app.spinner = Some(("thinking".into(), SPINNER_FRAMES[0]));
-        let rendered: Vec<String> =
-            app.transcript_lines().iter().map(|l| l.to_string()).collect();
+        let rendered: Vec<String> = app
+            .transcript_lines()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].contains("thinking"));
     }
@@ -3848,10 +4216,97 @@ mod tests {
         // API key that happens to start with a slash.
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         app.input = "/mod".into();
+        app.cursor = 4;
         assert!(app.command_popup_active());
-        assert_eq!(app.filtered_commands(), vec!["model"]);
+        assert_eq!(app.completion_candidates(), vec!["model"]);
         app.editing_api_key = Some(Provider::ALL[0]);
         assert!(!app.command_popup_active());
+    }
+
+    #[test]
+    fn popup_stays_closed_when_cursor_is_not_at_line_end() {
+        // → completes at the cursor; with the cursor mid-line it must keep
+        // its original job of moving the cursor instead.
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/branch ".into();
+        app.cursor = 8;
+        assert!(app.command_popup_active());
+        app.cursor = 1;
+        assert!(!app.command_popup_active());
+    }
+
+    #[test]
+    fn dismissed_popup_reopens_when_command_level_changes() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/branch ".into();
+        app.cursor = 8;
+        app.cmd_path = "/branch ".into();
+        app.cmd_popup_dismissed = true;
+        assert!(!app.command_popup_active());
+        // Typing `new` does not reopen it (same level)…
+        app.input = "/branch new".into();
+        app.cursor = 11;
+        app.sync_cmd_dismissal();
+        assert!(app.cmd_popup_dismissed);
+        // …but the space after it moves up a level and does.
+        app.input = "/branch new ".into();
+        app.cursor = 12;
+        app.sync_cmd_dismissal();
+        assert!(!app.cmd_popup_dismissed);
+    }
+
+    #[test]
+    fn completion_offers_live_branch_names() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/branch switch ".into();
+        assert_eq!(app.completion_candidates(), vec!["main"]);
+        assert_eq!(app.completion_candidates(), vec!["main"]);
+    }
+
+    #[test]
+    fn right_completes_instead_of_executing() {
+        // → must substitute the candidate into the input, not run the bare
+        // command: no new session, nothing sent.
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        let entries_before = app.entries.len();
+        app.input = "/new".into();
+        app.cursor = 4;
+        app.accept_selected_completion(false);
+        assert_eq!(app.input, "/new");
+        assert_eq!(app.entries.len(), entries_before);
+    }
+
+    #[test]
+    fn non_terminal_completion_appends_exactly_one_space() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/branch sw".into();
+        app.cursor = 9;
+        app.accept_selected_completion(false);
+        assert_eq!(app.input, "/branch switch ");
+    }
+
+    #[test]
+    fn enter_submits_terminal_candidate_from_sublevel() {
+        // /branch show — терминальный лист: Enter завершает подстановку и
+        // отдаёт строку на исполнение (пустой ввод = команда ушла).
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/branch s".into();
+        app.cursor = app.input.chars().count();
+        let submitted = app.accept_selected_completion(true);
+        assert_eq!(submitted.as_deref(), Some("/branch show"));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn enter_on_value_level_completes_instead_of_submitting() {
+        // /branch switch <branch> — уровень живых значений: Enter сначала
+        // подставляет имя, и только следующий Enter отправляет.
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/branch switch ".into();
+        app.cursor = app.input.chars().count();
+        let submitted = app.accept_selected_completion(true);
+        assert!(submitted.is_none());
+        assert_eq!(app.input, "/branch switch main ");
     }
 
     #[test]
@@ -3876,7 +4331,7 @@ mod tests {
         // Column is preserved when the target line is long enough…
         let lines = wrap_input("aaaa\nbbbb", 10);
         assert_eq!(move_cursor_line(&lines, 3, 1), Some(8)); // col 3 on row 1
-        // …and clamped to a shorter target line.
+                                                             // …and clamped to a shorter target line.
         let lines = wrap_input("aaaa\nbb", 10);
 
         assert_eq!(move_cursor_line(&lines, 3, 1), Some(7)); // col 2 (clamped)
@@ -3954,7 +4409,7 @@ mod tests {
         let lines = wrap_input("aaaa\nbbbb", 10);
         assert_eq!(move_cursor_line(&lines, 2, -1), None); // on first row
         assert_eq!(move_cursor_line(&lines, 7, 1), None); // on last row
-        // Single-line input: both directions hit an edge → transcript scrolls.
+                                                          // Single-line input: both directions hit an edge → transcript scrolls.
         let lines = wrap_input("single", 10);
         assert_eq!(move_cursor_line(&lines, 3, -1), None);
         assert_eq!(move_cursor_line(&lines, 3, 1), None);

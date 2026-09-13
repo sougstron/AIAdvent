@@ -25,10 +25,20 @@ pub struct CatalogModel {
     pub context_window: Option<u64>,
 }
 const fn glm(id: &'static str, live: bool, ctx: u64) -> CatalogModel {
-    CatalogModel { id, provider: Provider::Glm, live, context_window: Some(ctx) }
+    CatalogModel {
+        id,
+        provider: Provider::Glm,
+        live,
+        context_window: Some(ctx),
+    }
 }
 const fn or(id: &'static str, live: bool, ctx: u64) -> CatalogModel {
-    CatalogModel { id, provider: Provider::OpenRouter, live, context_window: Some(ctx) }
+    CatalogModel {
+        id,
+        provider: Provider::OpenRouter,
+        live,
+        context_window: Some(ctx),
+    }
 }
 
 pub const MODEL_CATALOG: &[CatalogModel] = &[
@@ -60,8 +70,18 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
     // are OpenRouter's for the same two models (`deepseek/deepseek-v4-flash`,
     // `deepseek/deepseek-v4-pro`), which is a second-hand figure — if the
     // direct API ever disagrees, the meter is the thing to fix.
-    CatalogModel { id: "deepseek-flash", provider: Provider::DeepSeek, live: true, context_window: Some(1_024_000) },
-    CatalogModel { id: "deepseek-v4-pro", provider: Provider::DeepSeek, live: false, context_window: Some(1_024_000) },
+    CatalogModel {
+        id: "deepseek-flash",
+        provider: Provider::DeepSeek,
+        live: true,
+        context_window: Some(1_024_000),
+    },
+    CatalogModel {
+        id: "deepseek-v4-pro",
+        provider: Provider::DeepSeek,
+        live: false,
+        context_window: Some(1_024_000),
+    },
     // openrouter — GET https://openrouter.ai/api/v1/models (public, no key)
     // on 2026-09-11: 439 ids, 19 ending in `:free`. The `:free` roster
     // churns weekly — `ask --models --live` diffs catalog against upstream.
@@ -82,7 +102,11 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
     or("cohere/north-mini-code:free", true, 256_000),
     or("nvidia/nemotron-3.5-content-safety:free", true, 128_000),
     or("nvidia/nemotron-3-ultra-550b-a55b:free", true, 1_000_000),
-    or("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", true, 256_000),
+    or(
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        true,
+        256_000,
+    ),
     or("google/gemma-4-26b-a4b-it:free", true, 262_144),
     or("google/gemma-4-31b-it:free", true, 262_144),
     or("nvidia/nemotron-3-super-120b-a12b:free", true, 262_144),
@@ -122,14 +146,21 @@ pub fn available_models(connected: &[Provider]) -> Vec<&'static CatalogModel> {
 
 /// Same as [`available_models`], ids only.
 pub fn available_ids(connected: &[Provider]) -> Vec<&'static str> {
-    available_models(connected).into_iter().map(|m| m.id).collect()
+    available_models(connected)
+        .into_iter()
+        .map(|m| m.id)
+        .collect()
 }
 
 /// The shared "no such model" error naming the full catalog.
 pub fn catalog_error(model: &str) -> String {
     format!(
         "unknown model `{model}`; catalog: {}",
-        MODEL_CATALOG.iter().map(|m| m.id).collect::<Vec<_>>().join(", ")
+        MODEL_CATALOG
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -325,10 +356,7 @@ impl Effort {
             Effort::Medium | Effort::High => Effort::High,
             Effort::Max => Effort::Max,
         };
-        let i = Effort::ALL
-            .iter()
-            .position(|e| *e == current)
-            .unwrap_or(0) as i32;
+        let i = Effort::ALL.iter().position(|e| *e == current).unwrap_or(0) as i32;
         let n = Effort::ALL.len() as i32;
         Effort::ALL[(i + delta).rem_euclid(n) as usize]
     }
@@ -647,7 +675,10 @@ mod tests {
             assert_eq!(s.cycle(1).cycle(-1), s);
             assert_eq!(s.cycle(ContextStrategy::ALL.len() as i32), s);
         }
-        assert_eq!(ContextStrategy::parse("ON").unwrap(), ContextStrategy::Summary);
+        assert_eq!(
+            ContextStrategy::parse("ON").unwrap(),
+            ContextStrategy::Summary
+        );
         assert!(ContextStrategy::parse("vector-memory").is_err());
     }
 
@@ -689,12 +720,30 @@ mod tests {
 
     #[test]
     fn every_strategy_parses_its_aliases_and_describes_itself() {
-        assert_eq!(ContextStrategy::parse("sliding").unwrap(), ContextStrategy::Window);
-        assert_eq!(ContextStrategy::parse("last-n").unwrap(), ContextStrategy::Window);
-        assert_eq!(ContextStrategy::parse(" KV ").unwrap(), ContextStrategy::Facts);
-        assert_eq!(ContextStrategy::parse("memory").unwrap(), ContextStrategy::Facts);
-        assert_eq!(ContextStrategy::parse("branching").unwrap(), ContextStrategy::Branch);
-        assert_eq!(ContextStrategy::parse("tree").unwrap(), ContextStrategy::Branch);
+        assert_eq!(
+            ContextStrategy::parse("sliding").unwrap(),
+            ContextStrategy::Window
+        );
+        assert_eq!(
+            ContextStrategy::parse("last-n").unwrap(),
+            ContextStrategy::Window
+        );
+        assert_eq!(
+            ContextStrategy::parse(" KV ").unwrap(),
+            ContextStrategy::Facts
+        );
+        assert_eq!(
+            ContextStrategy::parse("memory").unwrap(),
+            ContextStrategy::Facts
+        );
+        assert_eq!(
+            ContextStrategy::parse("branching").unwrap(),
+            ContextStrategy::Branch
+        );
+        assert_eq!(
+            ContextStrategy::parse("tree").unwrap(),
+            ContextStrategy::Branch
+        );
         for s in ContextStrategy::ALL {
             assert!(!s.describe().is_empty());
         }
@@ -788,7 +837,6 @@ mod tests {
         assert_eq!(cleared.max_chars, Some(200));
     }
 
-
     #[test]
     fn catalog_includes_the_live_default() {
         let entry = find_model(DEFAULT_MODEL).expect("default model in catalog");
@@ -811,7 +859,10 @@ mod tests {
     fn provider_of_routes_each_provider_block() {
         assert_eq!(provider_of("glm-5.3-flash"), Some(Provider::Glm));
         assert_eq!(provider_of("deepseek-flash"), Some(Provider::DeepSeek));
-        assert_eq!(provider_of("nvidia/nemotron-3.5-lightning:free"), Some(Provider::OpenRouter));
+        assert_eq!(
+            provider_of("nvidia/nemotron-3.5-lightning:free"),
+            Some(Provider::OpenRouter)
+        );
         // Distinct strings: z.ai direct vs OpenRouter alias.
         assert_eq!(provider_of("glm-5.3"), Some(Provider::Glm));
         assert_eq!(provider_of("z-ai/glm-5.3"), Some(Provider::OpenRouter));
@@ -823,7 +874,9 @@ mod tests {
         assert!(available_ids(&[]).is_empty());
         let glm_only = available_ids(&[Provider::Glm]);
         assert!(glm_only.contains(&"glm-5.3-flash"));
-        assert!(!glm_only.iter().any(|id| id.contains(':') || id.starts_with("deepseek")));
+        assert!(!glm_only
+            .iter()
+            .any(|id| id.contains(':') || id.starts_with("deepseek")));
         let with_or = available_ids(&[Provider::Glm, Provider::OpenRouter]);
         assert!(with_or.contains(&"google/gemma-4-31b-it:free"));
         assert!(!with_or.contains(&"deepseek-flash"));

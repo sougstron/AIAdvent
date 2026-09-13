@@ -98,10 +98,22 @@ impl ContextBundle {
         let mut files = Vec::new();
         let mut seen = Vec::new();
         if let Some(path) = discover_global(home) {
-            push_loaded(&mut files, &mut seen, &path, ContextScope::Global, max_file_chars);
+            push_loaded(
+                &mut files,
+                &mut seen,
+                &path,
+                ContextScope::Global,
+                max_file_chars,
+            );
         }
         for path in discover_local(&cwd) {
-            push_loaded(&mut files, &mut seen, &path, ContextScope::Local, max_file_chars);
+            push_loaded(
+                &mut files,
+                &mut seen,
+                &path,
+                ContextScope::Local,
+                max_file_chars,
+            );
         }
         ContextBundle {
             enabled: true,
@@ -266,10 +278,8 @@ mod tests {
         fn new(label: &str) -> Scratch {
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "ask-ctx-{}-{n}-{label}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("ask-ctx-{}-{n}-{label}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             Scratch(path)

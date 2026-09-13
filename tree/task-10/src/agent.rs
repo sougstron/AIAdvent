@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::api::{
-    self, ChatMessage, ChatStream, Endpoint, Outcome, Usage,
-};
+use crate::api::{self, ChatMessage, ChatStream, Endpoint, Outcome, Usage};
 use crate::compress::{self, Compressor, Policy};
 use crate::config::{ContextStrategy, Res, Settings};
 use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
@@ -89,7 +87,10 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(settings: Settings) -> Res<Agent> {
-        Ok(Agent::with_endpoint(Endpoint::for_model(&settings.model)?, settings))
+        Ok(Agent::with_endpoint(
+            Endpoint::for_model(&settings.model)?,
+            settings,
+        ))
     }
 
     /// Build an agent on an already-resolved endpoint. This is the constructor
@@ -384,7 +385,8 @@ impl Agent {
         self.history.push(ChatMessage::user(prompt));
         match self.complete(&self.history.clone()) {
             Ok(reply) => {
-                self.history.push(ChatMessage::assistant(reply.text.clone()));
+                self.history
+                    .push(ChatMessage::assistant(reply.text.clone()));
                 Ok(reply)
             }
             Err(e) => {
@@ -467,7 +469,6 @@ impl Agent {
         settings.max_chars = None;
         api::chat(&self.endpoint, &settings, system, history, None)
     }
-
 }
 
 #[cfg(test)]
@@ -526,7 +527,9 @@ mod tests {
     #[test]
     fn compression_off_sends_everything_even_with_a_summary() {
         let mut agent = Agent::dummy();
-        let history: Vec<ChatMessage> = (0..12).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        let history: Vec<ChatMessage> = (0..12)
+            .map(|i| ChatMessage::user(format!("m{i}")))
+            .collect();
         agent.set_compressor({
             let mut c = crate::compress::Compressor::new();
             c.apply("СВОДКА".into(), 6, 100);
@@ -555,10 +558,14 @@ mod tests {
         });
         // Коротко — свёртка не нужна, и запроса не будет (у dummy его некуда
         // и отправить: сеть здесь означала бы ошибку, а не Ok(None)).
-        let short: Vec<ChatMessage> = (0..10).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        let short: Vec<ChatMessage> = (0..10)
+            .map(|i| ChatMessage::user(format!("m{i}")))
+            .collect();
         assert!(agent.fold_history(&short).unwrap().is_none());
         // Стратегия off — no-op даже на длинной истории.
-        let long: Vec<ChatMessage> = (0..40).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        let long: Vec<ChatMessage> = (0..40)
+            .map(|i| ChatMessage::user(format!("m{i}")))
+            .collect();
         agent.set_strategy(ContextStrategy::Off);
         assert!(agent.fold_history(&long).unwrap().is_none());
     }
@@ -616,9 +623,7 @@ mod tests {
             model: "glm-5.3".into(),
             ..Settings::default()
         });
-        let err = agent
-            .complete(&[ChatMessage::user("hi")])
-            .unwrap_err();
+        let err = agent.complete(&[ChatMessage::user("hi")]).unwrap_err();
         assert!(err.contains("glm-5.3-flash"));
         assert!(err.contains("expensive"));
     }
@@ -667,10 +672,8 @@ mod tests {
     }
 
     fn scratch(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ask-agent-ctx-{}-{label}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ask-agent-ctx-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
