@@ -447,13 +447,11 @@ impl App {
         // Tab/Esc fall through so typing, completion, and Esc keep working.
         if self.command_popup_active() {
             match key.code {
-                // Enter and → both complete the highlighted candidate into
-                // the input; Enter additionally submits when the candidate
-                // is terminal (nothing left to type, like /new).
+                // Enter and → both only complete the highlighted candidate
+                // into the input (review MSG-008: Enter never executes —
+                // after dismissal with ←, Enter sends what was typed).
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if let Some(line) = self.accept_selected_completion(true) {
-                        self.handle_command(line.trim_start_matches('/'), terminal);
-                    }
+                    self.accept_selected_completion(false);
                     return;
                 }
                 KeyCode::Up => {
@@ -760,11 +758,12 @@ impl App {
         self.cmd_selected = (i + delta).rem_euclid(n as i32) as usize;
     }
 
-    /// Replace the token being typed with the highlighted candidate. With
-    /// `submit`, a terminal candidate (no further level — `/new`, `/help`,
-    /// `/branch switch main`) is sent right away; a non-terminal one just
-    /// gains a single trailing space and the popup drops to the next level.
-    /// Returns `Some(line)` when the caller must execute/submit the line.
+    /// Replace the token being typed with the highlighted candidate. The
+    /// `submit` flag is retained for tests/manual calls: when set, a
+    /// terminal candidate (no further level — `/new`, `/help`,
+    /// `/branch switch main`) is returned for the caller to execute.
+    /// Key handling never passes it — Enter and → only complete.
+    /// Returns `Some(line)` only when `submit` is set.
     fn accept_selected_completion(&mut self, submit: bool) -> Option<String> {
         let cands = self.completion_candidates();
         let cand = cands.get(self.cmd_selected.min(cands.len().saturating_sub(1)))?;
@@ -3165,7 +3164,7 @@ impl App {
         f.render_stateful_widget(
             List::new(items)
                 .highlight_style(selected_row())
-                .block(panel(&title, "\u{2191}\u{2193} select \u{b7} Tab/\u{2192} complete \u{b7} Enter apply \u{b7} \u{2190} close")),
+                .block(panel(&title, "\u{2191}\u{2193} select \u{b7} Tab/\u{2192}/Enter complete \u{b7} \u{2190} close")),
             popup,
             &mut state,
         );
@@ -4373,9 +4372,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_submits_terminal_candidate_from_sublevel() {
-        // /branch show — терминальный лист: Enter завершает подстановку и
-        // отдаёт строку на исполнение (пустой ввод = команда ушла).
+    fn submit_flag_returns_terminal_line_for_manual_calls() {
+        // The `submit` flag exists only for manual calls; key handling never
+        // passes it (review MSG-008). It still returns the terminal line.
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
         app.input = "/branch s".into();
         app.cursor = app.input.chars().count();
@@ -4385,15 +4384,17 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_value_level_completes_instead_of_submitting() {
-        // /branch switch <branch> — уровень живых значений: Enter сначала
-        // подставляет имя, и только следующий Enter отправляет.
+    fn enter_completes_terminal_candidate_without_executing() {
+        // MSG-008: Enter must only complete, never execute — even a terminal
+        // candidate like `show` just lands in the input, entries untouched.
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
-        app.input = "/branch switch ".into();
+        let entries_before = app.entries.len();
+        app.input = "/branch s".into();
         app.cursor = app.input.chars().count();
-        let submitted = app.accept_selected_completion(true);
+        let submitted = app.accept_selected_completion(false);
         assert!(submitted.is_none());
-        assert_eq!(app.input, "/branch switch main ");
+        assert_eq!(app.input, "/branch show");
+        assert_eq!(app.entries.len(), entries_before);
     }
 
     #[test]
