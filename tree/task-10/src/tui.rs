@@ -271,6 +271,53 @@ struct App {
     spinner: Option<(String, &'static str)>,
 }
 
+/// Release is the other half of a Press (Windows / kitty event types) and
+/// must not apply the key twice. Repeat is a held key: only editing keys
+/// auto-repeat, otherwise a held Enter would resend the message.
+fn key_is_actionable(key: &KeyEvent) -> bool {
+    match key.kind {
+        KeyEventKind::Release => false,
+        KeyEventKind::Press => true,
+        KeyEventKind::Repeat => repeats_as_edit(key),
+    }
+}
+
+fn repeats_as_edit(key: &KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(
+            key.code,
+            KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Char(_)
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+        )
+}
+
+/// Fold terminal-specific backspace aliases onto `KeyCode::Backspace`.
+/// Konsole can send ASCII BS (0x08), which crossterm reports as Ctrl+H;
+/// some paths deliver DEL as `Char('\u{7f}')`.
+fn normalize_key(mut key: KeyEvent) -> KeyEvent {
+    match key.code {
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            key.code = KeyCode::Backspace;
+            key.modifiers.remove(KeyModifiers::CONTROL);
+        }
+        KeyCode::Char('\u{8}' | '\u{7f}') => {
+            key.code = KeyCode::Backspace;
+            key.modifiers.remove(KeyModifiers::CONTROL);
+        }
+        KeyCode::Backspace => {
+            key.modifiers.remove(KeyModifiers::CONTROL);
+        }
+        _ => {}
+    }
+    key
+}
+
 impl App {
     fn new(agent: Agent, settings: Settings, loaded: Option<Session>) -> App {
         let (session, entries, status) = match loaded {
@@ -349,7 +396,10 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &mut DefaultTerminal) {
-        if key.kind != KeyEventKind::Press {
+        // Normalize before the kind filter so Ctrl+H (Konsole BS) Repeat
+        // is treated as Backspace Repeat, not swallowed as a Ctrl shortcut.
+        let key = normalize_key(key);
+        if !key_is_actionable(&key) {
             return;
         }
 
@@ -398,8 +448,7 @@ impl App {
 
     fn handle_input_key(&mut self, key: KeyEvent, terminal: &mut DefaultTerminal) {
         // The command popup owns the arrow keys and Enter; Char/Backspace/
-        // Tab/Esc fall through unchanged so typing and the existing bindings
-        // keep working while the popup is open.
+        // Tab/Esc fall through so typing, completion, and Esc keep working.
         if self.command_popup_active() {
             match key.code {
                 // Enter and → both only complete the highlighted candidate
@@ -452,10 +501,7 @@ impl App {
                     "Esc only interrupts a running generation — press Ctrl+C twice to quit"
                         .into();
             }
-            KeyCode::Tab => {
-                self.focus = Focus::Settings;
-                self.settings_selected = 0;
-            }
+            KeyCode::Tab => self.apply_tab(width),
             KeyCode::Enter if self.editing_api_key.is_some() => {
                 self.finish_key_entry(terminal);
             }
@@ -584,8 +630,13 @@ impl App {
     }
 
     /// Inserts `c` at the cursor (which is a char offset; the `String` API
-    /// wants a byte offset).
+    /// wants a byte offset). Control characters other than newline are
+    /// dropped — a stray Tab/DEL from the terminal would otherwise sit
+    /// invisibly in the buffer and eat the next Backspace.
     fn insert_char(&mut self, c: char) {
+        if c.is_control() && c != '\n' {
+            return;
+        }
         let byte = byte_pos(&self.input, self.cursor);
         self.input.insert(byte, c);
         self.cursor += 1;
@@ -758,6 +809,26 @@ impl App {
         self.cmd_selected = 0;
         None
     }
+
+    /// Tab completes the slash-command popup; on an empty chat input it
+    /// opens settings. A non-empty input keeps focus — jumping to settings
+    /// mid-edit made the next Backspace look like it jammed.
+    fn apply_tab(&mut self, width: u16) {
+        if self.editing_system_prompt || self.editing_api_key.is_some() {
+            return;
+        }
+        if self.command_popup_active() {
+            self.accept_selected_completion(false);
+            self.sync_input_scroll(width);
+            return;
+        }
+        if !self.input.is_empty() {
+            return;
+        }
+        self.focus = Focus::Settings;
+        self.settings_selected = 0;
+    }
+
     fn handle_settings_key(&mut self, code: KeyCode) {
         let row = SETTINGS_ROWS
             .get(self.settings_selected)
@@ -3126,7 +3197,7 @@ impl App {
         f.render_stateful_widget(
             List::new(items)
                 .highlight_style(selected_row())
-                .block(panel(&title, "\u{2191}\u{2193} select \u{b7} \u{2192}/Enter complete \u{b7} \u{2190} close")),
+                .block(panel(&title, "\u{2191}\u{2193} select \u{b7} Tab/\u{2192}/Enter complete \u{b7} \u{2190} close")),
             popup,
             &mut state,
         );
@@ -3261,7 +3332,7 @@ const HELP: &str = "\
 /facts [show|clear|set k v|del k]  key-value memory used by strategy `facts`
 /checkpoint [name]        mark the current point so branches can fork from it
 /branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
-/settings                 open the settings panel (Tab does the same)
+/settings                 open the settings panel (Tab on an empty input)
 /quit                     exit
 Esc while generating      stop the current generation (partial reply is kept)
 Ctrl-C twice (within 3s)  quit, even mid-generation";
@@ -4482,5 +4553,112 @@ mod tests {
         assert_eq!(normalize_paste("a\rb"), "a\nb");
         assert_eq!(normalize_paste("a\r\nb"), "a\nb");
         assert_eq!(normalize_paste("no breaks"), "no breaks");
+    }
+
+    #[test]
+    fn ctrl_h_and_del_char_normalize_to_backspace() {
+        let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        let got = normalize_key(ctrl_h);
+        assert_eq!(got.code, KeyCode::Backspace);
+        assert!(!got.modifiers.contains(KeyModifiers::CONTROL));
+
+        let del = KeyEvent::new(KeyCode::Char('\u{7f}'), KeyModifiers::NONE);
+        assert_eq!(normalize_key(del).code, KeyCode::Backspace);
+
+        let bs = KeyEvent::new(KeyCode::Char('\u{8}'), KeyModifiers::NONE);
+        assert_eq!(normalize_key(bs).code, KeyCode::Backspace);
+    }
+
+    #[test]
+    fn key_repeat_edits_but_release_does_not() {
+        let press = KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        );
+        let repeat = KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        );
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert!(key_is_actionable(&press));
+        assert!(key_is_actionable(&repeat));
+        assert!(!key_is_actionable(&release));
+
+        // A held Enter must not resend the message.
+        let enter_repeat = KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        );
+        assert!(!key_is_actionable(&enter_repeat));
+    }
+
+    #[test]
+    fn control_characters_do_not_enter_the_input() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.insert_char('a');
+        app.insert_char('\t');
+        app.insert_char('\u{7f}');
+        app.insert_char('\u{8}');
+        app.insert_char('b');
+        assert_eq!(app.input, "ab");
+        assert_eq!(app.cursor, 2);
+        // Newline is the one control char Shift+Enter is allowed to insert.
+        app.insert_char('\n');
+        assert_eq!(app.input, "ab\n");
+    }
+
+    #[test]
+    fn backspace_deletes_the_char_before_the_cursor() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        for c in "привет".chars() {
+            app.insert_char(c);
+        }
+        app.delete_char_before();
+        assert_eq!(app.input, "приве");
+        assert_eq!(app.cursor, 5);
+        app.cursor = 1;
+        app.delete_char_before();
+        assert_eq!(app.input, "риве");
+        assert_eq!(app.cursor, 0);
+        app.delete_char_before();
+        assert_eq!(app.input, "риве", "backspace at column 0 is a no-op");
+    }
+
+    #[test]
+    fn tab_completes_when_the_command_popup_is_open() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "/mod".into();
+        app.cursor = 4;
+        assert!(app.command_popup_active());
+        app.apply_tab(80);
+        assert!(matches!(app.focus, Focus::Input));
+        assert_eq!(app.input, "/model ");
+        assert_eq!(app.cursor, app.input.chars().count());
+    }
+
+    #[test]
+    fn tab_does_not_leave_a_nonempty_input() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.input = "hello".into();
+        app.cursor = 5;
+        app.apply_tab(80);
+        assert!(matches!(app.focus, Focus::Input));
+        assert_eq!(app.input, "hello");
+        app.delete_char_before();
+        assert_eq!(app.input, "hell");
+    }
+
+    #[test]
+    fn tab_on_empty_input_opens_settings() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.apply_tab(80);
+        assert!(matches!(app.focus, Focus::Settings));
     }
 }
