@@ -62,13 +62,24 @@ chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
 rest of the catalog is selectable but refused at send time because those
-ids cost money. Task 9 added **context management**: `compress=off|summary`
-(`/compress`, the `compress` row in settings, `--compress`) keeps the last N
-messages verbatim and replaces everything older with a running summary carried
-in the system message; `ask --verify-compress` is its load-bearing proof and
-only says Confirmed when `prompt_tokens` actually drops *and* a fact that
-survives only inside the summary is still recalled. Its `README.md` covers the
-Agent shape, key resolution, runtime settings, context compression, and the
+ids cost money. Task 9 added **context management** and task 10 grew it into
+**five strategies behind one switch** (`/strategy`, the `strategy` row in
+settings, `--strategy`; `/compress` and `--compress` remain aliases):
+`off` (whole history), `summary` (running summary + last N), `window`
+(sliding window: last N only, the rest discarded), `facts` (key-value memory
+in the system message + last N, refreshed by an extractor call after every
+user turn) and `branch` (a conversation tree: checkpoints, forks, per-branch
+memory, only the active path on the wire). One dispatcher — `strategy::apply`
+/ `strategy::blocks` — turns the selected value into what goes on the wire.
+The proofs are load-bearing and causal, never "the texts differ":
+`ask --verify-compress` for summary and `ask --verify-context
+window|facts|branch|all` for the rest (`--verify-model` runs them on any id
+the money guard allows live, including OpenRouter `:free`). `window` is only
+Confirmed when the old fact is honestly **forgotten**, `facts` only when the
+control window lost the fact and memory brought it back cheaper than the full
+history, `branch` only when neither branch sees the other's token. Its
+`README.md` covers the Agent shape, key resolution, runtime settings, all five
+strategies with their corner cases and real verify output, and the
 live lever self-test (temperature confirmed; top_p flat; top_k unsupported). It started as a verbatim copy of
 `tree/task-9/`, which itself was a verbatim copy of `tree/task-8/`
 (a verbatim copy of `tree/task-7/` — task 7 already met the requirements,

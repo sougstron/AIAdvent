@@ -151,17 +151,21 @@ impl Compressor {
 
     /// Что реально уходит на провод для данной истории.
     ///
-    /// При `Off` — история целиком. При `Summary` — хвост после `covered`
-    /// (само summary уезжает отдельно, в system).
+    /// Только для стратегии `Summary`: хвост после `covered` (само summary
+    /// уезжает отдельно, в system). Для любой другой стратегии summary ни при
+    /// чём, и история возвращается как есть — что с ней делать дальше, решает
+    /// `strategy::apply`.
     pub fn wire<'a>(&self, history: &'a [ChatMessage], strategy: ContextStrategy) -> &'a [ChatMessage] {
-        if strategy == ContextStrategy::Off || self.is_empty() {
+        if strategy != ContextStrategy::Summary || self.is_empty() {
             return history;
         }
         let cut = self.covered.min(history.len());
         &history[cut..]
     }
 
-    /// Одна строка для статуса/футера.
+    /// Одна строка про состояние summary. Для стратегий, которым summary не
+    /// нужен, строку собирает `strategy::status` — здесь только честное
+    /// «эта стратегия сюда не ходит».
     pub fn status(&self, strategy: ContextStrategy, history_len: usize) -> String {
         match strategy {
             ContextStrategy::Off => "compress=off".into(),
@@ -176,6 +180,7 @@ impl Compressor {
                 self.folded_chars,
                 self.folds
             ),
+            other => format!("compress=off (стратегия {other} не сворачивает историю)"),
         }
     }
 }

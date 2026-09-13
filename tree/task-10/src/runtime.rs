@@ -662,6 +662,7 @@ impl AgentBox {
                 .map(|f| f.path.to_string_lossy().into_owned()),
             &history,
             self.agent.compressor(),
+            self.agent.facts(),
         );
         self.session.save(dir)
     }

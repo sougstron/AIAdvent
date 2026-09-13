@@ -136,11 +136,11 @@ pub fn catalog_error(model: &str) -> String {
 /// Стратегия управления контекстом — что уходит провайдеру вместо всей
 /// истории.
 ///
-/// Переключатель намеренно сделан списком, а не булевым флагом: следующие
-/// стратегии сохранения контекста (окно по токенам, векторная память,
-/// иерархические summary) добавляются сюда новым вариантом, и вся обвязка —
-/// настройки TUI, `/compress`, `--compress`, сериализация сессии — начинает
-/// их видеть без изменений.
+/// Переключатель намеренно сделан списком, а не булевым флагом: новая
+/// стратегия добавляется сюда одним вариантом, и вся обвязка — строка
+/// `strategy` в настройках TUI, `/strategy`, `--strategy`, сериализация
+/// сессии — начинает её видеть без изменений. Что именно каждая стратегия
+/// кладёт на провод, решает один диспетчер — `strategy::apply`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum ContextStrategy {
     /// История уходит целиком, как было до задачи 9.
@@ -148,16 +148,45 @@ pub enum ContextStrategy {
     Off,
     /// Последние N сообщений дословно, всё старше — одним summary.
     Summary,
+    /// Sliding window: только последние N сообщений, остальное отброшено.
+    /// Ничего не запоминает — то, что уехало за окно, потеряно навсегда.
+    Window,
+    /// Sticky facts: блок key-value в system плюс последние N сообщений.
+    /// Факты извлекает модель после каждого хода пользователя (`facts.rs`).
+    Facts,
+    /// Ветки диалога: на провод уходит путь активной ветки от корня к листу,
+    /// соседние ветки не видны (`branch.rs`).
+    Branch,
 }
 
 impl ContextStrategy {
     /// Порядок в переключателе настроек.
-    pub const ALL: [ContextStrategy; 2] = [ContextStrategy::Off, ContextStrategy::Summary];
+    pub const ALL: [ContextStrategy; 5] = [
+        ContextStrategy::Off,
+        ContextStrategy::Summary,
+        ContextStrategy::Window,
+        ContextStrategy::Facts,
+        ContextStrategy::Branch,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             ContextStrategy::Off => "off",
             ContextStrategy::Summary => "summary",
+            ContextStrategy::Window => "window",
+            ContextStrategy::Facts => "facts",
+            ContextStrategy::Branch => "branch",
+        }
+    }
+
+    /// Короткое пояснение для настроек и `/help`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ContextStrategy::Off => "вся история уходит на провод",
+            ContextStrategy::Summary => "хвост из N сообщений + бегущее summary в system",
+            ContextStrategy::Window => "только последние N сообщений, остальное отброшено",
+            ContextStrategy::Facts => "блок фактов (key-value) в system + последние N сообщений",
+            ContextStrategy::Branch => "путь активной ветки диалога; соседние ветки не видны",
         }
     }
 
@@ -165,10 +194,21 @@ impl ContextStrategy {
         self != ContextStrategy::Off
     }
 
+    /// Стратегии, которым нужен хвост `keep_recent`.
+    pub fn uses_keep_recent(self) -> bool {
+        matches!(
+            self,
+            ContextStrategy::Summary | ContextStrategy::Window | ContextStrategy::Facts
+        )
+    }
+
     pub fn parse(s: &str) -> Res<ContextStrategy> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "full" => Ok(ContextStrategy::Off),
             "summary" | "on" | "compress" => Ok(ContextStrategy::Summary),
+            "window" | "sliding" | "last-n" | "last_n" => Ok(ContextStrategy::Window),
+            "facts" | "kv" | "memory" => Ok(ContextStrategy::Facts),
+            "branch" | "branching" | "tree" => Ok(ContextStrategy::Branch),
             other => Err(format!(
                 "unknown context strategy `{other}`; expected one of: {}",
                 ContextStrategy::ALL
@@ -510,11 +550,15 @@ impl Settings {
             if self.context_enabled { "on" } else { "off" }
         ));
         parts.push(match self.context_strategy {
-            ContextStrategy::Off => "compress=off".into(),
-            other => format!(
-                "compress={other}(keep={},every={})",
+            ContextStrategy::Off => "strategy=off".into(),
+            ContextStrategy::Summary => format!(
+                "strategy=summary(keep={},every={})",
                 self.keep_recent, self.summarize_every
             ),
+            other if other.uses_keep_recent() => {
+                format!("strategy={other}(keep={})", self.keep_recent)
+            }
+            other => format!("strategy={other}"),
         });
         parts.push(match self.max_chars {
             Some(n) => format!("max_chars={n}"),
@@ -628,11 +672,37 @@ mod tests {
     }
 
     #[test]
-    fn summary_line_shows_the_compression_strategy() {
+    fn summary_line_shows_the_context_strategy() {
         let mut s = Settings::default();
-        assert!(s.summary().contains("compress=off"));
+        assert!(s.summary().contains("strategy=off"));
         s.context_strategy = ContextStrategy::Summary;
-        assert!(s.summary().contains("compress=summary(keep=6,every=10)"));
+        assert!(s.summary().contains("strategy=summary(keep=6,every=10)"));
+        // Окну и фактам `summarize_every` не нужен — его и не показываем.
+        s.context_strategy = ContextStrategy::Window;
+        assert!(s.summary().contains("strategy=window(keep=6)"));
+        s.context_strategy = ContextStrategy::Facts;
+        assert!(s.summary().contains("strategy=facts(keep=6)"));
+        s.context_strategy = ContextStrategy::Branch;
+        assert!(s.summary().contains("strategy=branch"));
+        assert!(!s.summary().contains("branch(keep"));
+    }
+
+    #[test]
+    fn every_strategy_parses_its_aliases_and_describes_itself() {
+        assert_eq!(ContextStrategy::parse("sliding").unwrap(), ContextStrategy::Window);
+        assert_eq!(ContextStrategy::parse("last-n").unwrap(), ContextStrategy::Window);
+        assert_eq!(ContextStrategy::parse(" KV ").unwrap(), ContextStrategy::Facts);
+        assert_eq!(ContextStrategy::parse("memory").unwrap(), ContextStrategy::Facts);
+        assert_eq!(ContextStrategy::parse("branching").unwrap(), ContextStrategy::Branch);
+        assert_eq!(ContextStrategy::parse("tree").unwrap(), ContextStrategy::Branch);
+        for s in ContextStrategy::ALL {
+            assert!(!s.describe().is_empty());
+        }
+        // Ошибка перечисляет все пять значений — это и есть подсказка в TUI.
+        let err = ContextStrategy::parse("vector-memory").unwrap_err();
+        for s in ContextStrategy::ALL {
+            assert!(err.contains(s.label()), "{err} должно называть {s}");
+        }
     }
 
     #[test]

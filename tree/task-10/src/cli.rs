@@ -33,8 +33,10 @@ use crate::verify;
         ask --verify-login                    live-recheck every configured key\n  \
         ask --verify                          prove z.ai levers with causal signatures\n  \
         ask --verify-billing                  show whether spend is metered or plan quota\n  \
-        ask --compress summary                history compression: keep the last N, summarize the rest\n  \
+        ask --strategy summary                history compression: keep the last N, summarize the rest\n  \
         ask --verify-compress                 prove compression saves tokens without losing facts\n  \
+        ask --verify-context all              prove window / facts / branch strategies live\n  \
+        ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
         ask --continue                        resume the most recent session"
@@ -97,17 +99,18 @@ pub struct Cli {
     #[arg(long, allow_hyphen_values = true)]
     pub top_k: Option<i32>,
 
-    /// Context-management strategy: `off` (send the whole history) or
-    /// `summary` (keep the last --keep-recent messages verbatim, replace the
-    /// rest with a running summary).
-    #[arg(long, env = "ASK_COMPRESS", value_name = "STRATEGY")]
+    /// Context-management strategy: `off` (whole history), `summary`
+    /// (running summary + last --keep-recent), `window` (last --keep-recent
+    /// only), `facts` (key-value memory + last --keep-recent) or `branch`
+    /// (the active conversation branch). `--compress` is the old name.
+    #[arg(long = "strategy", visible_alias = "compress", env = "ASK_COMPRESS", value_name = "STRATEGY")]
     pub compress: Option<String>,
 
-    /// With --compress summary: how many recent messages stay verbatim.
+    /// With summary/window/facts: how many recent messages stay verbatim.
     #[arg(long, value_name = "N")]
     pub keep_recent: Option<usize>,
 
-    /// With --compress summary: how many messages one summary fold covers.
+    /// With --strategy summary: how many messages one summary fold covers.
     #[arg(long, value_name = "N")]
     pub summarize_every: Option<usize>,
 
@@ -115,6 +118,18 @@ pub struct Cli {
     /// from the folded part. Exits after printing.
     #[arg(long)]
     pub verify_compress: bool,
+
+    /// Live proof for the other context strategies: `window`, `facts`,
+    /// `branch` or `all`. Each verdict is a causal signature, not a text
+    /// diff. Exits after printing.
+    #[arg(long, value_name = "WHICH")]
+    pub verify_context: Option<String>,
+
+    /// Model to run --verify-context / --verify-compress against. Any id the
+    /// money guard allows live (glm-5.3-flash, deepseek-flash, OpenRouter
+    /// `:free`). Default: glm-5.3-flash.
+    #[arg(long, value_name = "ID")]
+    pub verify_model: Option<String>,
 
     /// Check live whether spend goes to the metered API or the GLM Coding
     /// Plan subscription, print the verdict and exit.
@@ -321,8 +336,31 @@ pub fn run() -> Res<()> {
         return Ok(());
     }
 
+    if let Some(which) = cli.verify_context.as_deref() {
+        let checks = verify::ContextCheck::parse(which)?;
+        println!(
+            "проверяю стратегии: {}",
+            checks.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ")
+        );
+        let reports = verify::run_context(&checks, cli.verify_model.as_deref())?;
+        let mut calls = 0;
+        for report in &reports {
+            print!("{}", report.render());
+            println!();
+            calls += report.calls();
+        }
+        for report in &reports {
+            println!("{}", report.status_line());
+        }
+        println!("живых вызовов всего: {calls}");
+        if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
+            return Err(format!("context strategy not confirmed: {}", bad.status_line()));
+        }
+        return Ok(());
+    }
+
     if cli.verify_compress {
-        let report = verify::run_compression()?;
+        let report = verify::run_compression(cli.verify_model.as_deref())?;
         print!("{}", report.render());
         if !report.confirmed() {
             return Err(format!(
