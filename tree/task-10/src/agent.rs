@@ -12,7 +12,9 @@ use crate::api::{
 use crate::compress::{self, Compressor, Policy};
 use crate::config::{ContextStrategy, Res, Settings};
 use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
+use crate::facts::{self, FactStore, FactsDelta};
 use crate::session::Session;
+use crate::strategy;
 
 /// Assistant turn plus the provider metadata the app already displays.
 #[derive(Clone, Debug)]
@@ -80,6 +82,9 @@ pub struct Agent {
     /// Бегущее summary истории (см. `compress.rs`). Пустой, пока стратегия
     /// `off` или пока сворачивать нечего.
     compressor: Compressor,
+    /// Key-value память диалога (см. `facts.rs`). Пустая, пока стратегия не
+    /// `facts`.
+    facts: FactStore,
 }
 
 impl Agent {
@@ -109,6 +114,7 @@ impl Agent {
             home,
             context: ContextBundle::empty(PathBuf::from(".")),
             compressor: Compressor::new(),
+            facts: FactStore::new(),
         };
         agent.refresh_context();
         agent
@@ -168,6 +174,7 @@ impl Agent {
     pub fn reset(&mut self) {
         self.history.clear();
         self.compressor.reset();
+        self.facts.reset();
     }
 
     /// Restore a saved chat: settings snapshot, message history, and the
@@ -180,6 +187,7 @@ impl Agent {
         // потерял бы всё, что уже было свёрнуто, а `covered` уехал бы на
         // историю, которую никто не описывал.
         self.compressor = session.compressor.clone();
+        self.facts = session.facts().clone();
         self.refresh_context();
     }
 
@@ -189,6 +197,14 @@ impl Agent {
 
     pub fn set_compressor(&mut self, compressor: Compressor) {
         self.compressor = compressor;
+    }
+
+    pub fn facts(&self) -> &FactStore {
+        &self.facts
+    }
+
+    pub fn set_facts(&mut self, facts: FactStore) {
+        self.facts = facts;
     }
 
     /// Текущая стратегия управления контекстом.
@@ -202,9 +218,66 @@ impl Agent {
         self.settings.context_strategy = strategy;
     }
 
-    /// Что реально уйдёт на провод для этой истории.
+    /// Что реально уйдёт на провод для этой истории — решает один диспетчер
+    /// (`strategy::apply`), а не сам агент.
     pub fn wire_history<'a>(&self, history: &'a [ChatMessage]) -> &'a [ChatMessage] {
-        self.compressor.wire(history, self.settings.context_strategy)
+        strategy::apply(
+            self.settings.context_strategy,
+            history,
+            &self.compressor,
+            self.settings.keep_recent,
+        )
+    }
+
+    /// Строка состояния текущей стратегии для футера и `/strategy show`.
+    pub fn strategy_status(&self, history: &[ChatMessage], branch_line: Option<&str>) -> String {
+        strategy::status(
+            self.settings.context_strategy,
+            history,
+            &self.compressor,
+            &self.facts,
+            self.settings.keep_recent,
+            branch_line,
+        )
+    }
+
+    /// Обновить key-value память по последним репликам.
+    ///
+    /// Запрос идёт своим вызовом с теми же послаблениями, что и свёртка
+    /// (`fold_history`): без JSON-схемы, без stop-строк и без лимита токенов,
+    /// иначе `/stop` обрежет JSON операций на полуслове. Разбор толерантный:
+    /// неразобранный ответ оставляет старые факты и записывается в
+    /// `last_error`, но **никогда** не роняет ход.
+    pub fn update_facts(&mut self, history: &[ChatMessage]) -> Res<FactsDelta> {
+        if self.settings.context_strategy != ContextStrategy::Facts {
+            return Ok(FactsDelta::default());
+        }
+        let recent = facts::recent_slice(history);
+        if recent.is_empty() {
+            return Ok(FactsDelta::default());
+        }
+        let prompt = facts::extract_prompt(&self.facts, recent);
+        let mut settings = self.settings.clone();
+        settings.clamp();
+        settings.json_mode.enabled = false;
+        settings.max_chars = None;
+        settings.budget_tokens = None;
+        settings.stop.clear();
+        let outcome = api::chat(
+            &self.endpoint,
+            &settings,
+            facts::FACTS_SYSTEM,
+            &[ChatMessage::user(prompt)],
+            None,
+        )?;
+        self.facts.note_extraction();
+        match facts::parse_ops(outcome.text()) {
+            Ok(ops) => Ok(self.facts.apply_ops(&ops)),
+            Err(e) => {
+                self.facts.note_error(e.clone());
+                Err(format!("ответ экстрактора не разобран: {e}"))
+            }
+        }
     }
 
     /// Свернуть отставшую часть истории, если пора.
@@ -332,16 +405,21 @@ impl Agent {
     /// `context.rs`), never pushed onto `history`.
     pub(crate) fn system_for_request(&self) -> String {
         let base = self.context.assemble(&self.settings.system_prompt);
-        match self
-            .settings
-            .context_strategy
-            .enabled()
-            .then(|| self.compressor.block())
-            .flatten()
-        {
-            None => base,
-            Some(block) if base.trim().is_empty() => block,
-            Some(block) => format!("{base}\n\n{block}"),
+        // Sticky-слоты стратегии (summary, факты) уезжают сюда же, рядом с
+        // AGENTS.md. Какие именно — решает `strategy::apply`.
+        let blocks = strategy::blocks(
+            self.settings.context_strategy,
+            &self.compressor,
+            &self.facts,
+        );
+        if blocks.is_empty() {
+            return base;
+        }
+        let joined = blocks.join("\n\n");
+        if base.trim().is_empty() {
+            joined
+        } else {
+            format!("{base}\n\n{joined}")
         }
     }
 

@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{ChatMessage, Role};
+use crate::branch::BranchStore;
 use crate::compress::Compressor;
 use crate::config::{Res, Settings};
+use crate::facts::FactStore;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub role: String,
     pub content: String,
@@ -69,6 +71,15 @@ pub struct Session {
     /// записанные до задачи 9, читаются как «сжатия не было».
     #[serde(default)]
     pub compressor: Compressor,
+    /// Key-value память диалога (стратегия `facts`). Сессии до задачи 10
+    /// читаются как «фактов нет».
+    #[serde(default)]
+    facts: FactStore,
+    /// Дерево веток (стратегия `branch`). `messages` остаётся плоским путём
+    /// активной ветки — так старые сессии, `SessionSummary` и всё, что читает
+    /// `messages`, продолжают работать без изменений.
+    #[serde(default)]
+    tree: BranchStore,
 }
 
 /// Per-process counter that makes ids unique when many sessions are created
@@ -89,7 +100,54 @@ impl Session {
             settings,
             context_files: Vec::new(),
             compressor: Compressor::default(),
+            facts: FactStore::default(),
+            tree: BranchStore::new(),
         }
+    }
+
+    pub fn facts(&self) -> &FactStore {
+        &self.facts
+    }
+
+    pub fn set_facts(&mut self, facts: FactStore) {
+        self.facts = facts;
+    }
+
+    pub fn tree(&self) -> &BranchStore {
+        &self.tree
+    }
+
+    pub fn tree_mut(&mut self) -> &mut BranchStore {
+        &mut self.tree
+    }
+
+    /// Сессия, записанная до задачи 10, приходит с плоским `messages` и
+    /// пустым деревом — собираем из неё единственную ветку `main`. Вызывать
+    /// сразу после загрузки с диска.
+    pub fn migrate_tree(&mut self) {
+        if self.tree.needs_migration() && !self.messages.is_empty() {
+            self.tree = BranchStore::from_messages(&self.messages);
+            self.tree.store_memory(self.compressor.clone(), self.facts.clone());
+        }
+    }
+
+    /// Переключиться на другую ветку: память текущей уезжает в дерево,
+    /// память целевой поднимается в сессию, а `messages` становится путём
+    /// новой ветки. Возвращает её имя.
+    pub fn switch_branch(&mut self, selector: &str) -> Res<String> {
+        let current = (self.compressor.clone(), self.facts.clone());
+        let (compressor, facts) = self.tree.switch_memory(selector, current)?;
+        self.compressor = compressor;
+        self.facts = facts;
+        self.messages = self.tree.path();
+        self.updated_at = now_secs();
+        Ok(self.tree.active_name().to_string())
+    }
+
+    /// Привести дерево в соответствие с `messages` — front-end иногда правит
+    /// список напрямую (откат хода после ошибки сети).
+    pub fn resync_tree(&mut self) {
+        self.tree.resync(&self.messages);
     }
 
     pub fn history(&self) -> Vec<ChatMessage> {
@@ -107,11 +165,13 @@ impl Session {
                 self.title = title;
             }
         }
-        self.messages.push(StoredMessage {
+        let msg = StoredMessage {
             role: "user".into(),
             content,
             interrupted: false,
-        });
+        };
+        self.tree.push(msg.clone());
+        self.messages.push(msg);
         self.updated_at = now_secs();
     }
 
@@ -124,11 +184,13 @@ impl Session {
     }
 
     fn push_assistant_marked(&mut self, content: String, interrupted: bool) {
-        self.messages.push(StoredMessage {
+        let msg = StoredMessage {
             role: "assistant".into(),
             content,
             interrupted,
-        });
+        };
+        self.tree.push(msg.clone());
+        self.messages.push(msg);
         self.updated_at = now_secs();
     }
 
@@ -149,15 +211,19 @@ impl Session {
         context_files: impl IntoIterator<Item = String>,
         history: &[ChatMessage],
         compressor: &Compressor,
+        facts: &FactStore,
     ) {
         self.settings = settings.clone();
         self.compressor = compressor.clone();
+        self.facts = facts.clone();
         self.context_files = context_files.into_iter().collect();
         let interrupted: Vec<bool> = self.messages.iter().map(|m| m.interrupted).collect();
         self.messages = history.iter().map(StoredMessage::from).collect();
         for (msg, flag) in self.messages.iter_mut().zip(interrupted) {
             msg.interrupted = flag;
         }
+        self.resync_tree();
+        self.tree.store_memory(self.compressor.clone(), self.facts.clone());
         if self.title == "New chat" {
             if let Some(title) = self
                 .messages
@@ -299,7 +365,12 @@ pub fn format_updated(secs: u64) -> String {
 fn load_session_file(path: &Path) -> Res<Session> {
     let raw = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+    let mut session: Session =
+        serde_json::from_str(&raw).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    // Файл до задачи 10 знает только плоский `messages` — дерево строим на
+    // лету, одной линейной веткой.
+    session.migrate_tree();
+    Ok(session)
 }
 
 fn session_file(dir: &Path, id: &str) -> Res<PathBuf> {
@@ -389,6 +460,61 @@ mod tests {
         assert_eq!(s.settings.summarize_every, crate::config::DEFAULT_SUMMARIZE_EVERY);
     }
 
+    /// Сессия, записанная до задачи 10, не знает ни о фактах, ни о дереве
+    /// веток: она обязана читаться и превращаться в одну линейную ветку
+    /// `main` с той же самой историей.
+    #[test]
+    fn pre_task10_session_migrates_to_a_single_branch() {
+        let dir = tmp_dir("task10-migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{"id":"legacy-1","title":"t","created_at":1,"updated_at":2,
+            "messages":[{"role":"user","content":"hi"},
+                        {"role":"assistant","content":"yo"},
+                        {"role":"user","content":"ещё"}],
+            "settings":{"model":"glm-5.3-flash","system_prompt":"p","effort":"Low",
+                "json_mode":{"enabled":false,"schema":{}},"max_chars":null,"stop":[],
+                "temperature":null}}"#;
+        std::fs::write(dir.join("legacy-1.json"), raw).unwrap();
+        let s = load_session(&dir, "legacy-1").unwrap();
+        assert!(s.facts().is_empty());
+        assert_eq!(s.tree().branches().len(), 1);
+        assert_eq!(s.tree().active_name(), crate::branch::MAIN_BRANCH);
+        // Путь ветки побайтово равен плоской истории файла.
+        assert_eq!(s.tree().path(), s.messages);
+        let history = s.history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].content, "ещё");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ветки должны переживать запись на диск вместе со своей памятью.
+    #[test]
+    fn branches_and_facts_survive_a_round_trip() {
+        let dir = tmp_dir("branch-roundtrip");
+        let mut s = Session::new(Settings::default());
+        s.push_user("общий".into());
+        s.push_assistant("ответ".into());
+        s.tree_mut().checkpoint(None).unwrap();
+        s.tree_mut().fork("alpha", None).unwrap();
+        s.switch_branch("alpha").unwrap();
+        s.push_user("ALPHA?".into());
+        let mut f = FactStore::new();
+        f.set("секрет", "ALPHA");
+        s.set_facts(f);
+        s.capture_from(&Settings::default(), Vec::<String>::new(), &s.clone().history(), &Compressor::new(), s.clone().facts());
+        s.save(&dir).unwrap();
+
+        let mut back = load_session(&dir, &s.id).unwrap();
+        assert_eq!(back.tree().branches().len(), 2);
+        assert_eq!(back.tree().active_name(), "alpha");
+        assert_eq!(back.facts().get("секрет"), Some("ALPHA"));
+        // Возврат в main не тащит за собой ни реплики, ни факты alpha.
+        back.switch_branch("main").unwrap();
+        assert_eq!(back.messages.len(), 2);
+        assert!(back.facts().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Summary — часть памяти сессии: без него возобновлённый чат ссылается
     /// на `covered` сообщений, которых уже никто не описывает.
     #[test]
@@ -399,12 +525,15 @@ mod tests {
         s.push_assistant("yo".into());
         let mut c = crate::compress::Compressor::new();
         c.apply("СВОДКА".into(), 1, 42);
-        s.capture_from(&Settings::default(), Vec::<String>::new(), &s.history(), &c);
+        let mut f = FactStore::new();
+        f.set("цель", "стенд");
+        s.capture_from(&Settings::default(), Vec::<String>::new(), &s.history(), &c, &f);
         s.save(&dir).unwrap();
         let back = load_session(&dir, &s.id).unwrap();
         assert_eq!(back.compressor.summary(), "СВОДКА");
         assert_eq!(back.compressor.covered(), 1);
         assert_eq!(back.compressor.folded_chars(), 42);
+        assert_eq!(back.facts().get("цель"), Some("стенд"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,8 +11,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::agent::{Agent, Reply};
-use crate::api::{ChatMessage, DEFAULT_BASE_URL, LIVE_COMPLETION_MODEL};
-use crate::config::{ContextStrategy, Res, Settings, DEFAULT_MODEL};
+use crate::api::{self, ChatMessage, DEFAULT_BASE_URL, LIVE_COMPLETION_MODEL};
+use crate::branch::BranchStore;
+use crate::config::{self, ContextStrategy, Res, Settings, DEFAULT_MODEL};
+use crate::session::StoredMessage;
 
 const PING_PROMPT: &str = "Reply with the single word PONG.";
 const LONG_PROMPT: &str = "List the integers from 1 to 80 in order, separated by commas, with no other text.";
@@ -259,14 +261,19 @@ fn isolated_settings() -> Settings {
 }
 
 fn probe(agent: &Agent, prompt: &str) -> Res<Call> {
-    if agent.settings().model != LIVE_COMPLETION_MODEL {
-        return Err(format!(
-            "refusing to call `{}` from verify (only `{LIVE_COMPLETION_MODEL}`)",
-            agent.settings().model
-        ));
-    }
+    guard_verify_model(agent.settings())?;
     let history = [ChatMessage::user(prompt)];
     agent.complete(&history).map(Call::from_reply)
+}
+
+/// Денежный guard для verify — тот же, что и на отправке (`api::guard_live_model`):
+/// `glm-5.3-flash`, `deepseek-flash` и любой OpenRouter `:free`. Ослабления
+/// здесь нет: расширился только набор моделей, на которых можно гонять
+/// проверку, а не правило «что разрешено звать живьём».
+fn guard_verify_model(settings: &Settings) -> Res<()> {
+    let provider = config::provider_of(&settings.model)
+        .ok_or_else(|| config::catalog_error(&settings.model))?;
+    api::guard_live_model(provider, &settings.model)
 }
 
 fn reset_sampling(agent: &mut Agent) {
@@ -800,18 +807,16 @@ pub fn compression_dialogue() -> Vec<ChatMessage> {
 
 /// Живая проверка сжатия истории: один и тот же разговор и те же вопросы,
 /// один раз с полной историей, другой — со сжатой.
-pub fn run_compression() -> Res<CompressionReport> {
+pub fn run_compression(model: Option<&str>) -> Res<CompressionReport> {
     let mut settings = isolated_settings();
     settings.keep_recent = COMPRESS_KEEP_RECENT;
     settings.summarize_every = COMPRESS_EVERY;
     settings.context_strategy = ContextStrategy::Off;
-    let mut agent = Agent::new(settings)?;
-    if agent.settings().model != LIVE_COMPLETION_MODEL {
-        return Err(format!(
-            "verify refuses to run: agent model is `{}`, not `{LIVE_COMPLETION_MODEL}`",
-            agent.settings().model
-        ));
+    if let Some(m) = model {
+        settings.model = m.to_string();
     }
+    guard_verify_model(&settings)?;
+    let mut agent = Agent::new(settings)?;
     agent.set_context_enabled(false);
 
     let dialogue = compression_dialogue();
@@ -903,6 +908,704 @@ fn judge_compression(folded: &CompressionProbe, tail: &CompressionProbe) -> Comp
     } else {
         CompressionVerdict::Lossy
     }
+}
+
+// ------------------------------------------- стратегии управления контекстом
+
+/// Токены, которые сажаются в синтетические разговоры проверок стратегий.
+pub const OLD_TOKEN: &str = "NIGHTJAR7741";
+pub const RECENT_TOKEN: &str = "KESTREL9120";
+pub const SHARED_TOKEN: &str = "HERON4413";
+pub const ALPHA_TOKEN: &str = "ALPACA5567";
+pub const BETA_TOKEN: &str = "BADGER8802";
+
+const WINDOW_KEEP: usize = 6;
+const FACTS_KEEP: usize = 4;
+/// Пауза перед единственным ретраем на HTTP 429. Бесплатный тариф
+/// OpenRouter — около 20 запросов в минуту.
+const RATE_LIMIT_PAUSE: std::time::Duration = std::time::Duration::from_secs(25);
+
+const OLD_QUESTION: &str =
+    "Какой код доступа к стенду я называл? Ответь одним словом — только кодом. Если не знаешь, ответь NONE.";
+const RECENT_QUESTION: &str =
+    "Какой код резервного канала я называл? Ответь одним словом — только кодом. Если не знаешь, ответь NONE.";
+const ALL_CODES_QUESTION: &str =
+    "Перечисли через запятую ВСЕ кодовые слова, которые я называл в этом разговоре. Только сами коды, без пояснений. Если ни одного — ответь NONE.";
+
+/// Что именно проверяем.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContextCheck {
+    Window,
+    Facts,
+    Branch,
+}
+
+impl ContextCheck {
+    pub const ALL: [ContextCheck; 3] = [ContextCheck::Window, ContextCheck::Facts, ContextCheck::Branch];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContextCheck::Window => "window",
+            ContextCheck::Facts => "facts",
+            ContextCheck::Branch => "branch",
+        }
+    }
+
+    /// `window|facts|branch|all`.
+    pub fn parse(s: &str) -> Res<Vec<ContextCheck>> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Ok(ContextCheck::ALL.to_vec()),
+            "window" | "sliding" => Ok(vec![ContextCheck::Window]),
+            "facts" | "kv" => Ok(vec![ContextCheck::Facts]),
+            "branch" | "branching" => Ok(vec![ContextCheck::Branch]),
+            other => Err(format!(
+                "unknown context check `{other}`; expected window, facts, branch or all"
+            )),
+        }
+    }
+}
+
+/// Как разрешилась проверка стратегии.
+///
+/// `Leaky` и `Flat` — такие же честные результаты, как `Confirmed`: они
+/// означают, что подписи нет, а не что сломался прогон. `Inconclusive` —
+/// база сама не знала посаженного факта, сравнивать не с чем.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContextVerdict {
+    Confirmed,
+    Leaky,
+    Flat,
+    Inconclusive,
+}
+
+impl ContextVerdict {
+    const fn as_str(self) -> &'static str {
+        match self {
+            ContextVerdict::Confirmed => "Confirmed",
+            ContextVerdict::Leaky => "Leaky",
+            ContextVerdict::Flat => "Flat",
+            ContextVerdict::Inconclusive => "Inconclusive",
+        }
+    }
+}
+
+/// Один живой вопрос в рамках проверки стратегии.
+#[derive(Clone, Debug)]
+pub struct ContextProbe {
+    pub label: String,
+    pub token: &'static str,
+    pub call: Call,
+}
+
+impl ContextProbe {
+    pub fn recalled(&self) -> bool {
+        has_token(&self.call.text, self.token)
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "[{}] {}\n  {}\n  помнит {}: {}",
+            self.label,
+            self.call.line(),
+            clip(&self.call.text, 120),
+            self.token,
+            self.recalled()
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowReport {
+    pub model: String,
+    pub asked_model: String,
+    pub messages: usize,
+    pub keep_recent: usize,
+    pub wire_messages: usize,
+    pub calls: usize,
+    /// База (`off`): вся история.
+    pub base_old: ContextProbe,
+    pub base_recent: ContextProbe,
+    /// Окно: последние `keep_recent`.
+    pub win_old: ContextProbe,
+    pub win_recent: ContextProbe,
+    pub verdict: ContextVerdict,
+}
+
+#[derive(Clone, Debug)]
+pub struct FactsReport {
+    pub model: String,
+    pub asked_model: String,
+    pub messages: usize,
+    pub keep_recent: usize,
+    pub calls: usize,
+    pub extractor_calls: usize,
+    pub extractor_errors: Vec<String>,
+    pub facts_block: String,
+    pub fact_count: usize,
+    /// Три конфигурации на одном разговоре.
+    pub base: ContextProbe,
+    pub window: ContextProbe,
+    pub facts: ContextProbe,
+    pub verdict: ContextVerdict,
+}
+
+#[derive(Clone, Debug)]
+pub struct BranchReport {
+    pub model: String,
+    pub asked_model: String,
+    pub calls: usize,
+    pub branches: String,
+    /// Линейный разговор, содержащий обе ветки — цена «без веток».
+    pub linear: Call,
+    pub linear_len: usize,
+    pub alpha: Call,
+    pub alpha_len: usize,
+    pub beta: Call,
+    pub beta_len: usize,
+    pub verdict: ContextVerdict,
+}
+
+/// Отчёт одной проверки стратегии.
+#[derive(Clone, Debug)]
+pub enum ContextReport {
+    Window(WindowReport),
+    Facts(FactsReport),
+    Branch(BranchReport),
+}
+
+impl ContextReport {
+    pub fn verdict(&self) -> ContextVerdict {
+        match self {
+            ContextReport::Window(r) => r.verdict,
+            ContextReport::Facts(r) => r.verdict,
+            ContextReport::Branch(r) => r.verdict,
+        }
+    }
+
+    pub fn confirmed(&self) -> bool {
+        self.verdict() == ContextVerdict::Confirmed
+    }
+
+    pub fn calls(&self) -> usize {
+        match self {
+            ContextReport::Window(r) => r.calls,
+            ContextReport::Facts(r) => r.calls,
+            ContextReport::Branch(r) => r.calls,
+        }
+    }
+
+    pub fn status_line(&self) -> String {
+        match self {
+            ContextReport::Window(r) => format!(
+                "window: verdict={} старое забыто={} свежее помнит={} prompt_tokens {}->{}",
+                r.verdict.as_str(),
+                !r.win_old.recalled(),
+                r.win_recent.recalled(),
+                r.base_old.call.prompt_tokens,
+                r.win_old.call.prompt_tokens
+            ),
+            ContextReport::Facts(r) => format!(
+                "facts: verdict={} факт выжил={} у окна без фактов={} prompt_tokens {}->{}",
+                r.verdict.as_str(),
+                r.facts.recalled(),
+                r.window.recalled(),
+                r.base.call.prompt_tokens,
+                r.facts.call.prompt_tokens
+            ),
+            ContextReport::Branch(r) => format!(
+                "branch: verdict={} alpha={} beta={} prompt_tokens линейно {} против веток {}/{}",
+                r.verdict.as_str(),
+                clip(&r.alpha.text, 40),
+                clip(&r.beta.text, 40),
+                r.linear.prompt_tokens,
+                r.alpha.prompt_tokens,
+                r.beta.prompt_tokens
+            ),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            ContextReport::Window(r) => {
+                let mut out = format!(
+                    "== стратегия window (sliding window) ==\nмодель: просили {}, ответила {}\nразговор {} сообщений, keep_recent={}, на проводе {} + вопрос; живых вызовов {}\n\n",
+                    r.asked_model, model_or_q(&r.model), r.messages, r.keep_recent, r.wire_messages, r.calls
+                );
+                out.push_str(&format!("-- факт из начала разговора (token={OLD_TOKEN}) --\n{}\n{}\n\n", r.base_old.line(), r.win_old.line()));
+                out.push_str(&format!("-- факт из хвоста (token={RECENT_TOKEN}) --\n{}\n{}\n\n", r.base_recent.line(), r.win_recent.line()));
+                out.push_str(&format!(
+                    "prompt_tokens: {} -> {} ({:+})\n",
+                    r.base_old.call.prompt_tokens,
+                    r.win_old.call.prompt_tokens,
+                    r.win_old.call.prompt_tokens as i64 - r.base_old.call.prompt_tokens as i64
+                ));
+                out.push_str(&format!("=> {}\n", r.verdict.as_str()));
+                out.push_str(
+                    "Confirmed требует причинной подписи: prompt_tokens упали, свежий факт помнится И старый честно ЗАБЫТ. \
+Leaky — окно не режет (старое всё ещё помнится). Flat — экономии нет. Inconclusive — полная история сама не знала факта.\n",
+                );
+                out
+            }
+            ContextReport::Facts(r) => {
+                let mut out = format!(
+                    "== стратегия facts (sticky key-value память) ==\nмодель: просили {}, ответила {}\nразговор {} сообщений, keep_recent={}, живых вызовов {} (из них экстрактор {})\n\n",
+                    r.asked_model, model_or_q(&r.model), r.messages, r.keep_recent, r.calls, r.extractor_calls
+                );
+                out.push_str(&format!("-- блок фактов ({} шт.) --\n{}\n\n", r.fact_count, clip(&r.facts_block, 1200)));
+                if !r.extractor_errors.is_empty() {
+                    out.push_str(&format!("ошибки разбора экстрактора: {}\n\n", r.extractor_errors.join("; ")));
+                }
+                out.push_str(&format!("-- один и тот же вопрос (token={OLD_TOKEN}) --\n{}\n{}\n{}\n\n", r.base.line(), r.window.line(), r.facts.line()));
+                out.push_str(&format!(
+                    "prompt_tokens: off {} | window {} | facts {}\n",
+                    r.base.call.prompt_tokens, r.window.call.prompt_tokens, r.facts.call.prompt_tokens
+                ));
+                out.push_str(&format!("=> {}\n", r.verdict.as_str()));
+                out.push_str(
+                    "Confirmed требует, чтобы окно БЕЗ фактов факт потеряло, окно С фактами его вспомнило и вышло дешевле полной истории: \
+разница между этими двумя прогонами — ровно блок фактов. Lossy/Flat/Inconclusive — честный результат, а не сломанный тест.\n",
+                );
+                out
+            }
+            ContextReport::Branch(r) => {
+                let mut out = format!(
+                    "== стратегия branch (ветки диалога) ==\nмодель: просили {}, ответила {}\nживых вызовов {}\n{}\n\n",
+                    r.asked_model, model_or_q(&r.model), r.calls, r.branches
+                );
+                out.push_str(&format!(
+                    "-- линейный разговор с обеими ветками ({} сообщений) --\n{}\n  {}\n\n",
+                    r.linear_len,
+                    r.linear.line(),
+                    clip(&r.linear.text, 120)
+                ));
+                out.push_str(&format!(
+                    "-- ветка alpha ({} сообщений; свой токен {ALPHA_TOKEN}) --\n{}\n  {}\n  знает SHARED={} ALPHA={} BETA={}\n\n",
+                    r.alpha_len,
+                    r.alpha.line(),
+                    clip(&r.alpha.text, 120),
+                    has_token(&r.alpha.text, SHARED_TOKEN),
+                    has_token(&r.alpha.text, ALPHA_TOKEN),
+                    has_token(&r.alpha.text, BETA_TOKEN)
+                ));
+                out.push_str(&format!(
+                    "-- ветка beta ({} сообщений; свой токен {BETA_TOKEN}) --\n{}\n  {}\n  знает SHARED={} ALPHA={} BETA={}\n\n",
+                    r.beta_len,
+                    r.beta.line(),
+                    clip(&r.beta.text, 120),
+                    has_token(&r.beta.text, SHARED_TOKEN),
+                    has_token(&r.beta.text, ALPHA_TOKEN),
+                    has_token(&r.beta.text, BETA_TOKEN)
+                ));
+                out.push_str(&format!(
+                    "prompt_tokens: линейно {} | alpha {} | beta {}\n",
+                    r.linear.prompt_tokens, r.alpha.prompt_tokens, r.beta.prompt_tokens
+                ));
+                out.push_str(&format!("=> {}\n", r.verdict.as_str()));
+                out.push_str(
+                    "Confirmed требует непротекания: обе ветки знают общий токен, каждая знает только свой и НЕ знает чужой, \
+и любая ветка дешевле линейного разговора с обеими. Leaky — чужой токен протёк (именно эту багу даёт общая на всё дерево память).\n",
+                );
+                out
+            }
+        }
+    }
+}
+
+fn model_or_q(model: &str) -> &str {
+    if model.is_empty() {
+        "?"
+    } else {
+        model
+    }
+}
+
+/// Настройки для проверки стратегий: изоляция от AGENTS.md и от системного
+/// промпта плюс выбранная модель.
+fn context_settings(model: Option<&str>) -> Res<Settings> {
+    let mut settings = isolated_settings();
+    if let Some(m) = model {
+        settings.model = m.trim().to_string();
+    }
+    guard_verify_model(&settings)?;
+    Ok(settings)
+}
+
+/// Один живой вопрос поверх готовой истории, с единственным ретраем на 429.
+fn ask_call(agent: &Agent, history: &[ChatMessage], question: &str) -> Res<Call> {
+    let mut full = history.to_vec();
+    full.push(ChatMessage::user(question.to_string()));
+    match agent.complete(&full) {
+        Err(e) if is_rate_limited(&e) => {
+            std::thread::sleep(RATE_LIMIT_PAUSE);
+            agent.complete(&full).map(Call::from_reply)
+        }
+        other => other.map(Call::from_reply),
+    }
+}
+
+fn is_rate_limited(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("429") || e.contains("rate limit") || e.contains("too many requests")
+}
+
+/// `--verify-context`: запускает выбранные проверки последовательно.
+pub fn run_context(checks: &[ContextCheck], model: Option<&str>) -> Res<Vec<ContextReport>> {
+    let mut out = Vec::new();
+    for check in checks {
+        out.push(match check {
+            ContextCheck::Window => ContextReport::Window(run_window(model)?),
+            ContextCheck::Facts => ContextReport::Facts(run_facts(model)?),
+            ContextCheck::Branch => ContextReport::Branch(run_branch(model)?),
+        });
+    }
+    Ok(out)
+}
+
+/// Проверка sliding window.
+///
+/// Тот же разговор задаётся дважды: со стратегией `off` (база знает всё) и с
+/// окном на `keep_recent` сообщений. Доказательство именно в асимметрии:
+/// свежий факт обязан помниться, а старый — обязан быть забыт. «Старое
+/// забыто» здесь не провал, а подпись: она показывает, что окно реально
+/// режет, а не что модель подглядела ответ.
+pub fn run_window(model: Option<&str>) -> Res<WindowReport> {
+    let mut settings = context_settings(model)?;
+    settings.keep_recent = WINDOW_KEEP;
+    settings.context_strategy = ContextStrategy::Off;
+    let asked_model = settings.model.clone();
+    let mut agent = Agent::new(settings)?;
+    agent.set_context_enabled(false);
+
+    let dialogue = compression_dialogue();
+    let base_old = ContextProbe {
+        label: "off".into(),
+        token: OLD_TOKEN,
+        call: ask_call(&agent, &dialogue, OLD_QUESTION)?,
+    };
+    let base_recent = ContextProbe {
+        label: "off".into(),
+        token: RECENT_TOKEN,
+        call: ask_call(&agent, &dialogue, RECENT_QUESTION)?,
+    };
+
+    agent.set_strategy(ContextStrategy::Window);
+    let win_old = ContextProbe {
+        label: "window".into(),
+        token: OLD_TOKEN,
+        call: ask_call(&agent, &dialogue, OLD_QUESTION)?,
+    };
+    let win_recent = ContextProbe {
+        label: "window".into(),
+        token: RECENT_TOKEN,
+        call: ask_call(&agent, &dialogue, RECENT_QUESTION)?,
+    };
+
+    let mut with_question = dialogue.clone();
+    with_question.push(ChatMessage::user(OLD_QUESTION));
+    let verdict = judge_window(&base_old, &base_recent, &win_old, &win_recent);
+    Ok(WindowReport {
+        model: win_old.call.model.clone(),
+        asked_model,
+        messages: dialogue.len(),
+        keep_recent: WINDOW_KEEP,
+        wire_messages: agent.wire_history(&with_question).len(),
+        calls: 4,
+        base_old,
+        base_recent,
+        win_old,
+        win_recent,
+        verdict,
+    })
+}
+
+/// Причинная подпись окна.
+///
+/// * `prompt_tokens` не упали (или провайдер не отдал usage) → `Flat`.
+/// * Полная история сама не вспомнила факты → `Inconclusive`.
+/// * Старый факт всё ещё помнится → `Leaky`: окно не режет.
+/// * Дешевле, свежее помнится, старое забыто → `Confirmed`.
+fn judge_window(
+    base_old: &ContextProbe,
+    base_recent: &ContextProbe,
+    win_old: &ContextProbe,
+    win_recent: &ContextProbe,
+) -> ContextVerdict {
+    let usage_known = base_old.call.prompt_tokens > 0 && win_old.call.prompt_tokens > 0;
+    let cheaper = win_old.call.prompt_tokens < base_old.call.prompt_tokens
+        && win_recent.call.prompt_tokens < base_recent.call.prompt_tokens;
+    if !usage_known || !cheaper {
+        return ContextVerdict::Flat;
+    }
+    if !base_old.recalled() || !base_recent.recalled() {
+        return ContextVerdict::Inconclusive;
+    }
+    if win_old.recalled() {
+        return ContextVerdict::Leaky;
+    }
+    if win_recent.recalled() {
+        ContextVerdict::Confirmed
+    } else {
+        ContextVerdict::Inconclusive
+    }
+}
+
+/// Проверка sticky facts.
+///
+/// Три конфигурации на одном и том же разговоре: `off` (знает всё), `window`
+/// (контроль — факт старше окна потерян) и `facts` (то же окно плюс блок
+/// памяти). Разница между вторым и третьим прогоном — ровно блок фактов,
+/// больше ничего, поэтому вспомненный в третьем факт приписать нечему, кроме
+/// памяти.
+pub fn run_facts(model: Option<&str>) -> Res<FactsReport> {
+    let mut settings = context_settings(model)?;
+    settings.keep_recent = FACTS_KEEP;
+    settings.context_strategy = ContextStrategy::Off;
+    let asked_model = settings.model.clone();
+    let mut agent = Agent::new(settings)?;
+    agent.set_context_enabled(false);
+
+    let dialogue = facts_dialogue();
+    let base = ContextProbe {
+        label: "off".into(),
+        token: OLD_TOKEN,
+        call: ask_call(&agent, &dialogue, OLD_QUESTION)?,
+    };
+
+    agent.set_strategy(ContextStrategy::Window);
+    let window = ContextProbe {
+        label: "window (без фактов)".into(),
+        token: OLD_TOKEN,
+        call: ask_call(&agent, &dialogue, OLD_QUESTION)?,
+    };
+
+    // Экстрактор гоняем ровно так, как это делает TUI: после каждой реплики
+    // пользователя, по текущим фактам и последней паре.
+    agent.set_strategy(ContextStrategy::Facts);
+    let mut extractor_calls = 0usize;
+    let mut extractor_errors = Vec::new();
+    for i in 0..dialogue.len() {
+        if dialogue[i].role != crate::api::Role::User {
+            continue;
+        }
+        extractor_calls += 1;
+        if let Err(e) = agent.update_facts(&dialogue[..=i]) {
+            extractor_errors.push(e);
+        }
+    }
+    let facts = ContextProbe {
+        label: "facts (окно + память)".into(),
+        token: OLD_TOKEN,
+        call: ask_call(&agent, &dialogue, OLD_QUESTION)?,
+    };
+
+    let verdict = judge_facts(&base, &window, &facts);
+    Ok(FactsReport {
+        model: facts.call.model.clone(),
+        asked_model,
+        messages: dialogue.len(),
+        keep_recent: FACTS_KEEP,
+        calls: 3 + extractor_calls,
+        extractor_calls,
+        extractor_errors,
+        facts_block: agent.facts().block().unwrap_or_else(|| "(пусто)".into()),
+        fact_count: agent.facts().len(),
+        base,
+        window,
+        facts,
+        verdict,
+    })
+}
+
+/// Причинная подпись памяти фактов.
+///
+/// * Дороже полной истории (или usage неизвестен) → `Flat`: платить столько
+///   же и помнить меньше — не стратегия.
+/// * База сама не знала факта → `Inconclusive`.
+/// * Окно без фактов факт помнит → `Leaky`: окно не резало, и проверка
+///   ничего не доказывает про память.
+/// * Окно потеряло, память вернула, и это дешевле базы → `Confirmed`.
+fn judge_facts(base: &ContextProbe, window: &ContextProbe, facts: &ContextProbe) -> ContextVerdict {
+    let usage_known = base.call.prompt_tokens > 0 && facts.call.prompt_tokens > 0;
+    if !usage_known || facts.call.prompt_tokens >= base.call.prompt_tokens {
+        return ContextVerdict::Flat;
+    }
+    if !base.recalled() {
+        return ContextVerdict::Inconclusive;
+    }
+    if window.recalled() {
+        return ContextVerdict::Leaky;
+    }
+    if facts.recalled() {
+        ContextVerdict::Confirmed
+    } else {
+        ContextVerdict::Inconclusive
+    }
+}
+
+/// Проверка веток.
+///
+/// Общий префикс с токеном `SHARED`, чекпойнт, две ветки: в одной посажен
+/// `ALPHA`, в другой `BETA`. Дерево строит настоящий `BranchStore` — тот же,
+/// что и в TUI, — поэтому проверяется реализация, а не отдельная модель для
+/// теста.
+pub fn run_branch(model: Option<&str>) -> Res<BranchReport> {
+    let mut settings = context_settings(model)?;
+    settings.context_strategy = ContextStrategy::Branch;
+    let asked_model = settings.model.clone();
+    let mut agent = Agent::new(settings)?;
+    agent.set_context_enabled(false);
+
+    let mut tree = BranchStore::new();
+    for m in shared_prefix() {
+        tree.push(m);
+    }
+    tree.checkpoint(Some("развилка"))?;
+    tree.fork("alpha", Some("развилка"))?;
+    tree.fork("beta", Some("развилка"))?;
+
+    let empty = || (crate::compress::Compressor::new(), crate::facts::FactStore::new());
+    tree.switch_memory("alpha", empty())?;
+    for m in branch_tail("alpha", ALPHA_TOKEN) {
+        tree.push(m);
+    }
+    let alpha_path = to_messages(&tree.path());
+
+    tree.switch_memory("beta", empty())?;
+    for m in branch_tail("beta", BETA_TOKEN) {
+        tree.push(m);
+    }
+    let beta_path = to_messages(&tree.path());
+
+    // Контроль «без веток»: линейный разговор, в котором обе ветки лежат
+    // подряд. Именно его цену экономит изоляция.
+    let mut linear = alpha_path.clone();
+    linear.extend(beta_path[shared_prefix().len()..].iter().cloned());
+
+    let linear_call = ask_call(&agent, &linear, ALL_CODES_QUESTION)?;
+    let alpha_call = ask_call(&agent, &alpha_path, ALL_CODES_QUESTION)?;
+    let beta_call = ask_call(&agent, &beta_path, ALL_CODES_QUESTION)?;
+
+    let verdict = judge_branch(&linear_call, &alpha_call, &beta_call);
+    Ok(BranchReport {
+        model: alpha_call.model.clone(),
+        asked_model,
+        calls: 3,
+        branches: tree.listing(),
+        linear_len: linear.len(),
+        alpha_len: alpha_path.len(),
+        beta_len: beta_path.len(),
+        linear: linear_call,
+        alpha: alpha_call,
+        beta: beta_call,
+        verdict,
+    })
+}
+
+/// Причинная подпись веток — непротекание, а не «тексты отличаются».
+///
+/// * Ветка не дешевле линейного разговора с обеими (или usage неизвестен)
+///   → `Flat`.
+/// * Обе ветки обязаны знать общий префикс; если нет — `Inconclusive`.
+/// * Чужой токен виден в ветке → `Leaky`. Это ровно та бага, которую даёт
+///   общая на всё дерево память.
+/// * Каждая ветка знает свой токен и не знает чужой → `Confirmed`.
+fn judge_branch(linear: &Call, alpha: &Call, beta: &Call) -> ContextVerdict {
+    let usage_known = linear.prompt_tokens > 0 && alpha.prompt_tokens > 0 && beta.prompt_tokens > 0;
+    let cheaper = alpha.prompt_tokens < linear.prompt_tokens && beta.prompt_tokens < linear.prompt_tokens;
+    if !usage_known || !cheaper {
+        return ContextVerdict::Flat;
+    }
+    let shared = has_token(&alpha.text, SHARED_TOKEN) && has_token(&beta.text, SHARED_TOKEN);
+    if !shared {
+        return ContextVerdict::Inconclusive;
+    }
+    if has_token(&alpha.text, BETA_TOKEN) || has_token(&beta.text, ALPHA_TOKEN) {
+        return ContextVerdict::Leaky;
+    }
+    if has_token(&alpha.text, ALPHA_TOKEN) && has_token(&beta.text, BETA_TOKEN) {
+        ContextVerdict::Confirmed
+    } else {
+        ContextVerdict::Inconclusive
+    }
+}
+
+/// Короткий разговор для проверки фактов: 14 сообщений, посаженный в самом
+/// начале код и достаточно наполнителя, чтобы при `keep_recent=4` он ушёл за
+/// окно. Короче, чем разговор для сжатия, — бесплатный тариф OpenRouter
+/// считает запросы, а не только токены.
+pub fn facts_dialogue() -> Vec<ChatMessage> {
+    let topics = [
+        (
+            "Цель — подготовить нагрузочный стенд сервиса заказов за две недели, команда маленькая.",
+            "Понял: стенд для сервиса заказов, срок две недели, команда небольшая.",
+        ),
+        (
+            "Стек: Rust, PostgreSQL 16 с репликой на чтение, очередь NATS, всё в Kubernetes.",
+            "Записал стек: Rust, PostgreSQL 16 с репликой, NATS, Kubernetes.",
+        ),
+        (
+            "Целевая нагрузка 4000 запросов в секунду, 85 процентов чтение, пик вечером.",
+            "Цель 4000 rps с перекосом 85/15 и вечерним пиком зафиксирована.",
+        ),
+        (
+            "SLO: p99 чтения 120 миллисекунд, записи 400. Выход за границы — стоп прогона.",
+            "SLO записал: 120 мс на чтение, 400 мс на запись, нарушение останавливает прогон.",
+        ),
+        (
+            "Отчёт нужен в понедельник утром: таблица сценариев и вывод, что чинить первым.",
+            "Отчёт к понедельнику: таблица по сценариям и приоритет починки.",
+        ),
+    ];
+    let mut history = vec![
+        ChatMessage::user(format!(
+            "Запомни: код доступа к стенду — {OLD_TOKEN}. Он понадобится в конце разговора."
+        )),
+        ChatMessage::assistant(format!("Запомнил: код доступа к стенду {OLD_TOKEN}.")),
+    ];
+    for (q, a) in topics {
+        history.push(ChatMessage::user(q.to_string()));
+        history.push(ChatMessage::assistant(a.to_string()));
+    }
+    history.push(ChatMessage::user(format!(
+        "И ещё: код резервного канала — {RECENT_TOKEN}."
+    )));
+    history.push(ChatMessage::assistant(format!(
+        "Запомнил: код резервного канала {RECENT_TOKEN}."
+    )));
+    history
+}
+
+/// Общий префикс обеих веток.
+fn shared_prefix() -> Vec<StoredMessage> {
+    vec![
+        stored("user", &format!("Запомни общий код проекта — {SHARED_TOKEN}. Он относится ко всему разговору.")),
+        stored("assistant", &format!("Запомнил общий код проекта {SHARED_TOKEN}.")),
+        stored("user", "Дальше мы разойдёмся на два варианта плана; общий код остаётся в силе."),
+        stored("assistant", "Хорошо, общий код держу; жду, какой вариант разбираем."),
+    ]
+}
+
+/// Хвост одной ветки с её собственным кодом.
+fn branch_tail(name: &str, token: &str) -> Vec<StoredMessage> {
+    vec![
+        stored(
+            "user",
+            &format!("Берём вариант {name}. Его код — {token}. Запомни именно этот код."),
+        ),
+        stored("assistant", &format!("Принято: вариант {name}, код {token}.")),
+    ]
+}
+
+fn stored(role: &str, content: &str) -> StoredMessage {
+    StoredMessage {
+        role: role.into(),
+        content: content.into(),
+        interrupted: false,
+    }
+}
+
+fn to_messages(path: &[StoredMessage]) -> Vec<ChatMessage> {
+    path.iter().map(StoredMessage::to_chat_message).collect()
 }
 
 #[cfg(test)]

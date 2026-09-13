@@ -50,7 +50,7 @@ const SETTINGS_ROWS: &[&str] = &[
     "model",
     "effort",
     "json mode",
-    "compress",
+    "strategy",
     "max_chars",
     "budget_tokens",
     "stop",
@@ -62,10 +62,14 @@ const SETTINGS_ROWS: &[&str] = &[
 /// Slash commands offered by the input popup, kept in alphabetical order
 /// since that's the order the popup lists them in.
 const COMMANDS: &[&str] = &[
-    "compress", "context", "effort", "help", "json", "login", "max-tokens", "model", "new",
-    "personas", "quit",
-    "rename", "sessions", "settings", "stop", "system", "temp", "top-k", "top-p", "verify",
+    "branch", "checkpoint", "compress", "context", "effort", "facts", "help", "json", "login",
+    "max-tokens", "model", "new", "personas", "quit",
+    "rename", "sessions", "settings", "stop", "strategy", "system", "temp", "top-k", "top-p",
+    "verify",
 ];
+/// Подсказка по переключателю — одна на `/strategy`, `/help` и ошибки.
+const STRATEGY_USAGE: &str =
+    "/strategy [show|off|summary|window|facts|branch|keep N|every N]";
 /// Status + key hints stay separate from the always-on token bar.
 const FOOTER_HEIGHT: u16 = 2;
 const STATS_SEP: &str = " \u{b7} ";
@@ -757,6 +761,11 @@ impl App {
             .map(|f| f.path.to_string_lossy().into_owned())
             .collect();
         s.compressor = self.agent.compressor().clone();
+        s.set_facts(self.agent.facts().clone());
+        // Память принадлежит ветке: кладём её в дерево тем же движением.
+        s.resync_tree();
+        s.tree_mut()
+            .store_memory(self.agent.compressor().clone(), self.agent.facts().clone());
         if let Err(e) = s.save(&self.sessions_dir) {
             eprintln!("warning: could not save session: {e}");
         }
@@ -806,7 +815,12 @@ impl App {
             "model" => self.cmd_model(rest),
             "system" => self.cmd_system(rest),
             "context" => self.cmd_context(rest),
-            "compress" => self.cmd_compress(rest),
+            // `/strategy` — новое имя переключателя (значения теперь не только
+            // про сжатие); `/compress` оставлен алиасом, чтобы не ломать руки.
+            "strategy" | "compress" => self.cmd_strategy(rest),
+            "facts" => self.cmd_facts(rest),
+            "branch" => self.cmd_branch(rest),
+            "checkpoint" => self.cmd_checkpoint(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
             "top-p" | "top_p" => self.cmd_top_p(rest),
             "top-k" | "top_k" => self.cmd_top_k(rest),
@@ -1472,9 +1486,10 @@ impl App {
         }
     }
 
-    /// `/compress [show|off|summary|keep N|every N]` — управление контекстом.
-    /// Та же переключалка, что и строка `compress` в настройках.
-    fn cmd_compress(&mut self, rest: &str) {
+    /// `/strategy [show|off|summary|window|facts|branch|keep N|every N]` —
+    /// переключатель управления контекстом. Та же переключалка, что и строка
+    /// `strategy` в настройках; `/compress` остался её алиасом.
+    fn cmd_strategy(&mut self, rest: &str) {
         let rest = rest.trim();
         let (head, tail) = match rest.split_once(char::is_whitespace) {
             Some((h, t)) => (h, t.trim()),
@@ -1482,7 +1497,7 @@ impl App {
         };
         match head {
             "" | "show" | "status" => {
-                self.entries.push(Entry::Info(self.compression_listing()));
+                self.entries.push(Entry::Info(self.strategy_listing()));
             }
             "keep" | "every" => {
                 match tail.parse::<usize>() {
@@ -1494,36 +1509,36 @@ impl App {
                         }
                         self.settings.clamp();
                         self.sync_agent_settings();
-                        self.status = self.compression_status();
+                        self.status = self.strategy_status();
                     }
-                    _ => self.status = format!("usage: /compress {head} <число ≥ 1>"),
+                    _ => self.status = format!("usage: /strategy {head} <число ≥ 1>"),
                 }
             }
             other => match config::ContextStrategy::parse(other) {
                 Ok(strategy) => {
                     self.settings.context_strategy = strategy;
                     self.agent.set_strategy(strategy);
-                    self.status = self.compression_status();
-                    self.entries.push(Entry::Info(self.compression_listing()));
+                    self.status = self.strategy_status();
+                    self.entries.push(Entry::Info(self.strategy_listing()));
                 }
-                Err(_) => {
-                    self.status = "usage: /compress [show|off|summary|keep N|every N]".into()
-                }
+                Err(_) => self.status = STRATEGY_USAGE.into(),
             },
         }
     }
 
-    fn compression_status(&self) -> String {
-        self.agent
-            .compressor()
-            .status(self.settings.context_strategy, self.session.history().len())
+    /// Строка состояния активной стратегии — одна на все пять.
+    fn strategy_status(&self) -> String {
+        let history = self.session.history();
+        let line = self.session.tree().line();
+        self.agent.strategy_status(&history, Some(line.as_str()))
     }
 
-    fn compression_listing(&self) -> String {
-        let c = self.agent.compressor();
+    fn strategy_listing(&self) -> String {
         let history = self.session.history();
+        let strategy = self.settings.context_strategy;
         let mut lines = vec![
-            self.compression_status(),
+            format!("{strategy}: {}", strategy.describe()),
+            self.strategy_status(),
             format!(
                 "keep_recent={}  summarize_every={}",
                 self.settings.keep_recent, self.settings.summarize_every
@@ -1534,13 +1549,208 @@ impl App {
                 history.len()
             ),
         ];
-        if c.is_empty() {
-            lines.push("summary ещё нет".into());
-        } else {
-            lines.push(String::new());
-            lines.push(c.summary().to_string());
+        match strategy {
+            config::ContextStrategy::Summary => {
+                let c = self.agent.compressor();
+                if c.is_empty() {
+                    lines.push("summary ещё нет".into());
+                } else {
+                    lines.push(String::new());
+                    lines.push(c.summary().to_string());
+                }
+            }
+            config::ContextStrategy::Facts => {
+                lines.push(String::new());
+                lines.push(self.agent.facts().listing());
+            }
+            config::ContextStrategy::Branch => {
+                lines.push(String::new());
+                lines.push(self.session.tree().listing());
+            }
+            _ => {}
         }
+        lines.push(format!("переключатель: {STRATEGY_USAGE}"));
         lines.join("\n")
+    }
+
+    /// `/facts [show|clear|set <key> <value>|del <key>]` — key-value память.
+    /// Ручная правка полезна и для отладки, и для демонстрации: видно, что
+    /// блок фактов — обычные данные, а не магия внутри модели.
+    fn cmd_facts(&mut self, rest: &str) {
+        let rest = rest.trim();
+        let (head, tail) = match rest.split_once(char::is_whitespace) {
+            Some((h, t)) => (h, t.trim()),
+            None => (rest, ""),
+        };
+        let mut facts = self.agent.facts().clone();
+        match head {
+            "" | "show" | "status" => {
+                self.entries.push(Entry::Info(facts.listing()));
+                return;
+            }
+            "clear" => {
+                facts.reset();
+                self.status = "память фактов очищена".into();
+            }
+            "set" => {
+                let Some((key, value)) = tail.split_once(char::is_whitespace) else {
+                    self.status = "usage: /facts set <ключ> <значение>".into();
+                    return;
+                };
+                let key = key.trim();
+                let was = facts.get(key).map(str::to_string);
+                facts.set(key, value.trim());
+                self.status = match was {
+                    Some(old) => format!("факт `{key}` обновлён (было: {old})"),
+                    None => format!("факт `{key}` добавлен"),
+                };
+            }
+            "del" | "delete" | "rm" => {
+                if tail.is_empty() {
+                    self.status = "usage: /facts del <ключ>".into();
+                    return;
+                }
+                self.status = if facts.remove(tail) {
+                    format!("факт `{tail}` удалён")
+                } else {
+                    format!("факта `{tail}` нет")
+                };
+            }
+            _ => {
+                self.status = "usage: /facts [show|clear|set <ключ> <значение>|del <ключ>]".into();
+                return;
+            }
+        }
+        self.agent.set_facts(facts);
+        self.save_session();
+    }
+
+    /// `/checkpoint [имя]` — отметить точку, от которой потом форкать ветки.
+    fn cmd_checkpoint(&mut self, rest: &str) {
+        let name = rest.trim();
+        match self.session.tree_mut().checkpoint((!name.is_empty()).then_some(name)) {
+            Ok(cp) => {
+                self.status = format!(
+                    "чекпойнт `{}` на глубине {}{}",
+                    cp.name,
+                    cp.depth,
+                    if cp.snapped {
+                        " (сдвинут к ближайшему ответу ассистента)"
+                    } else {
+                        ""
+                    }
+                );
+                self.status.push_str(&format!(
+                    "; чекпойнтов {}, веток {}",
+                    self.session.tree().checkpoints().len(),
+                    self.session.tree().len()
+                ));
+                self.save_session();
+            }
+            Err(e) => self.status = format!("чекпойнт не поставлен: {e}"),
+        }
+    }
+
+    /// `/branch [show|new <имя>|switch <имя|номер>|rename <имя> <новое>|delete <имя>]`.
+    fn cmd_branch(&mut self, rest: &str) {
+        let rest = rest.trim();
+        let (head, tail) = match rest.split_once(char::is_whitespace) {
+            Some((h, t)) => (h, t.trim()),
+            None => (rest, ""),
+        };
+        match head {
+            "" | "show" | "list" => {
+                self.entries.push(Entry::Info(self.session.tree().listing()));
+            }
+            "new" | "fork" => {
+                let (name, from) = match tail.split_once(char::is_whitespace) {
+                    Some((n, f)) => (n.trim(), Some(f.trim())),
+                    None => (tail, None),
+                };
+                if name.is_empty() {
+                    self.status = "usage: /branch new <имя> [чекпойнт]".into();
+                    return;
+                }
+                match self.session.tree_mut().fork(name, from.filter(|f| !f.is_empty())) {
+                    Ok(_) => {
+                        self.status = format!(
+                            "ветка `{name}` создана (всего {}) — /branch switch {name}",
+                            self.session.tree().len()
+                        );
+                        self.save_session();
+                    }
+                    Err(e) => self.status = format!("ветка не создана: {e}"),
+                }
+            }
+            "switch" | "go" | "checkout" => self.switch_branch(tail),
+            "rename" => {
+                let Some((sel, new_name)) = tail.split_once(char::is_whitespace) else {
+                    self.status = "usage: /branch rename <имя|номер> <новое имя>".into();
+                    return;
+                };
+                match self.session.tree_mut().rename(sel.trim(), new_name.trim()) {
+                    Ok(old) => {
+                        self.status = format!("`{old}` → `{}`", new_name.trim());
+                        self.save_session();
+                    }
+                    Err(e) => self.status = format!("переименование не удалось: {e}"),
+                }
+            }
+            "delete" | "del" | "rm" => {
+                let active = self.session.tree().active_name().to_string();
+                match self.session.tree_mut().delete(tail) {
+                    Ok(name) => {
+                        self.status = format!("ветка `{name}` удалена");
+                        // Удалили ту, в которой сидели — транскрипт теперь от
+                        // другой ветки, его надо пересобрать.
+                        if name == active {
+                            self.adopt_branch_path();
+                        }
+                        self.save_session();
+                    }
+                    Err(e) => self.status = format!("удаление не удалось: {e}"),
+                }
+            }
+            other => {
+                self.status =
+                    format!("unknown: /branch {other} — [show|new|switch|rename|delete]");
+            }
+        }
+    }
+
+    fn switch_branch(&mut self, selector: &str) {
+        if selector.trim().is_empty() {
+            self.status = "usage: /branch switch <имя|номер>".into();
+            return;
+        }
+        // Память активной ветки уезжает в дерево до переключения, иначе
+        // summary/факты ветки A протекут в ветку B.
+        self.session.compressor = self.agent.compressor().clone();
+        self.session.set_facts(self.agent.facts().clone());
+        match self.session.switch_branch(selector) {
+            Ok(name) => {
+                self.adopt_branch_path();
+                self.status = format!("ветка `{name}`: {}", self.session.tree().line());
+            }
+            Err(e) => self.status = format!("переключение не удалось: {e}"),
+        }
+    }
+
+    /// Перерисовать транскрипт под путь активной ветки.
+    ///
+    /// Скролл обязательно сбросить: `Paragraph::scroll` клипает, а не
+    /// клампит, и уход на более короткую ветку со старым offset оставил бы
+    /// пустую панель (см. AGENTS.md, «реальная бага дважды»). Обнуляем
+    /// прямо здесь, а `handle_command` в конце сам доводит вид до низа через
+    /// `scroll_to_bottom` — то есть до уже переклампленного значения.
+    fn adopt_branch_path(&mut self) {
+        self.agent.set_compressor(self.session.compressor.clone());
+        self.agent.set_facts(self.session.facts().clone());
+        self.agent.set_history(self.session.history());
+        self.entries = entries_from_session(&self.session);
+        self.follow = true;
+        self.scroll = 0;
+        self.tokens.reset_session();
     }
 
     /// Настройки живут в `App`, а сжатие считает `Agent` — то, что влияет на
@@ -1743,10 +1953,11 @@ impl App {
             }
             "effort" => self.settings.effort = self.settings.effort.cycle(delta),
             "json mode" => self.settings.json_mode.enabled = !self.settings.json_mode.enabled,
-            // Переключалка стратегий управления контекстом. Сейчас два
-            // варианта (off / summary); новая стратегия появится здесь сама,
-            // как только её добавят в `ContextStrategy::ALL`.
-            "compress" => {
+            // Переключалка стратегий управления контекстом. Пять значений
+            // (off / summary / window / facts / branch); следующая стратегия
+            // появится здесь сама, как только её добавят в
+            // `ContextStrategy::ALL`.
+            "strategy" => {
                 self.settings.context_strategy = self.settings.context_strategy.cycle(delta);
                 self.agent.set_strategy(self.settings.context_strategy);
             }
@@ -1814,6 +2025,38 @@ impl App {
         }
     }
 
+    /// Обновление key-value памяти перед ходом. Это настоящий запрос к
+    /// модели, поэтому он идёт под спиннером и отменяем (Esc) — при отмене
+    /// или ошибке ход всё равно уходит, просто со старыми фактами: терять
+    /// реплику из-за неудачной экстракции нельзя.
+    fn maintain_facts(&mut self, history: &[ChatMessage], terminal: &mut DefaultTerminal) {
+        self.sync_agent_settings();
+        if self.settings.context_strategy != config::ContextStrategy::Facts {
+            return;
+        }
+        let mut worker = self.prepared_agent();
+        let hist = history.to_vec();
+        let result = self.with_spinner(terminal, "обновляю факты", move || {
+            worker.update_facts(&hist).map(|delta| (worker, delta))
+        });
+        match result {
+            Some(Ok((updated, delta))) => {
+                // Экстракцию делал клон агента — забираем память обратно.
+                self.agent.set_facts(updated.facts().clone());
+                self.save_session();
+                if delta.touched() > 0 {
+                    self.status = format!(
+                        "факты обновлены: {} (всего {})",
+                        delta.line(),
+                        self.agent.facts().len()
+                    );
+                }
+            }
+            Some(Err(e)) => self.status = format!("факты не обновлены ({e}) — шлю со старыми"),
+            None => self.status = "обновление фактов отменено — шлю со старыми".into(),
+        }
+    }
+
     fn send_message(&mut self, question: String, terminal: &mut DefaultTerminal) {
         self.session.push_user(question.clone());
         self.entries.push(Entry::User(question));
@@ -1824,6 +2067,9 @@ impl App {
         // отправки хода. При `compress=off` это no-op без запроса; иначе на
         // провод пойдёт `wire_history` — summary в system плюс хвост.
         self.maintain_compression(&history, terminal);
+        // Факты обновляем ДО отправки хода: то, что пользователь только что
+        // сказал, должно участвовать уже в этом ответе.
+        self.maintain_facts(&history, terminal);
         // Size of exactly what goes out, captured before the reply lands:
         // dividing it by the provider's `prompt_tokens` is what calibrates
         // the footer's estimates (see `tokens.rs`).
@@ -1843,10 +2089,12 @@ impl App {
                 Some(Ok(outcome)) => self.finish_reply(outcome, terminal),
                 Some(Err(e)) => {
                     self.session.messages.pop();
+                    self.session.resync_tree();
                     self.status = format!("request failed: {e}");
                 }
                 None => {
                     self.session.messages.pop();
+                    self.session.resync_tree();
                     self.status = "generation cancelled (Esc)".into();
                 }
             }
@@ -1935,6 +2183,7 @@ impl App {
                         Ok(outcome) => self.finish_reply_at(idx, outcome, terminal),
                         Err(e) => {
                             self.session.messages.pop();
+                    self.session.resync_tree();
                             self.entries.remove(idx);
                             self.status = format!("request failed: {e}");
                         }
@@ -1945,6 +2194,7 @@ impl App {
                 Err(RecvTimeoutError::Disconnected) => {
                     self.spinner = None;
                     self.session.messages.pop();
+                    self.session.resync_tree();
                     self.entries.remove(idx);
                     self.status = "request failed: worker thread ended unexpectedly".into();
                     return;
@@ -1964,6 +2214,7 @@ impl App {
         };
         if partial.is_empty() {
             self.session.messages.pop();
+            self.session.resync_tree();
             self.entries.remove(idx);
             self.status = "generation stopped (Esc) — nothing was generated yet".into();
         } else {
@@ -2160,17 +2411,32 @@ impl App {
         // Сжатие показывается, только когда включено: «свёрнуто N/M» — самая
         // короткая честная форма ответа на «что вообще уходит на провод».
         if self.agent.strategy().enabled() {
-            let c = self.agent.compressor();
-            parts.push(if c.is_empty() {
-                format!("compress {}", self.agent.strategy())
-            } else {
-                format!(
-                    "compress {} {}/{} ({} свёрток)",
-                    self.agent.strategy(),
-                    c.covered(),
-                    self.session.history().len(),
-                    c.folds()
-                )
+            let st = self.agent.strategy();
+            let history_len = self.session.history().len();
+            parts.push(match st {
+                config::ContextStrategy::Summary => {
+                    let c = self.agent.compressor();
+                    if c.is_empty() {
+                        format!("{st}")
+                    } else {
+                        format!("{st} {}/{history_len} ({} свёрток)", c.covered(), c.folds())
+                    }
+                }
+                config::ContextStrategy::Window => format!(
+                    "{st} {}/{history_len}",
+                    crate::strategy::window(&self.session.history(), self.settings.keep_recent).len()
+                ),
+                config::ContextStrategy::Facts => format!(
+                    "{st} {}/{history_len} · фактов {}",
+                    crate::strategy::window(&self.session.history(), self.settings.keep_recent).len(),
+                    self.agent.facts().len()
+                ),
+                config::ContextStrategy::Branch => format!(
+                    "{st} {}·{}",
+                    self.session.tree().active_name(),
+                    self.session.tree().path_len()
+                ),
+                config::ContextStrategy::Off => format!("{st}"),
             });
         }
         if let Some(t) = s.temperature {
@@ -2350,16 +2616,29 @@ impl App {
             }
             "effort" => self.settings.effort.to_string(),
             "json mode" => if self.settings.json_mode.enabled { "on" } else { "off" }.into(),
-            "compress" => match self.settings.context_strategy {
-                config::ContextStrategy::Off => "off  (вся история уходит на провод)".into(),
-                other => format!(
-                    "{other}  (последние {} как есть, summary каждые {}; свёрнуто {}/{})",
-                    self.settings.keep_recent,
-                    self.settings.summarize_every,
-                    self.agent.compressor().covered(),
-                    self.session.history().len()
-                ),
-            },
+            "strategy" => {
+                let st = self.settings.context_strategy;
+                let detail = match st {
+                    config::ContextStrategy::Off => String::new(),
+                    config::ContextStrategy::Summary => format!(
+                        "; последние {} как есть, summary каждые {}, свёрнуто {}/{}",
+                        self.settings.keep_recent,
+                        self.settings.summarize_every,
+                        self.agent.compressor().covered(),
+                        self.session.history().len()
+                    ),
+                    config::ContextStrategy::Window => format!("; N={}", self.settings.keep_recent),
+                    config::ContextStrategy::Facts => format!(
+                        "; N={}, фактов {}",
+                        self.settings.keep_recent,
+                        self.agent.facts().len()
+                    ),
+                    config::ContextStrategy::Branch => {
+                        format!("; {}", self.session.tree().line())
+                    }
+                };
+                format!("{st}  ({}{detail})", st.describe())
+            }
             "max_chars" => self.settings.max_chars.map(|n| n.to_string()).unwrap_or_else(|| "off".into()),
             "budget_tokens" => {
                 self.settings.budget_tokens.map(|n| n.to_string()).unwrap_or_else(|| "off".into())
@@ -2668,8 +2947,11 @@ const HELP: &str = "\
 /personas <question>      ask physicist/philosopher/mathematician, one call each, in sequence
 /personas a,b,c: <question>   same, with your own cast instead of the default three
 /context [show|on|off|reload]  AGENTS.md files in the system prompt
-/compress [show|off|summary]  history compression: keep the last N, summarize the rest
-/compress keep N | every N    how many messages stay verbatim / how often we fold
+/strategy [show|off|summary|window|facts|branch]  context-management strategy
+/strategy keep N | every N    window size / how often summary folds (/compress is an alias)
+/facts [show|clear|set k v|del k]  key-value memory used by strategy `facts`
+/checkpoint [name]        mark the current point so branches can fork from it
+/branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
 /settings                 open the settings panel (Tab does the same)
 /quit                     exit
 Esc while generating      stop the current generation (partial reply is kept)
@@ -3107,39 +3389,127 @@ mod tests {
     }
 
     #[test]
-    fn compress_row_toggles_between_the_two_strategies() {
+    fn strategy_row_cycles_through_every_strategy() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
-        let row = SETTINGS_ROWS.iter().position(|r| *r == "compress").unwrap();
+        let row = SETTINGS_ROWS.iter().position(|r| *r == "strategy").unwrap();
         assert!(app.setting_value(row).starts_with("off"));
         app.settings_selected = row;
-        app.adjust_setting(1);
-        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Summary);
-        assert_eq!(app.agent.strategy(), config::ContextStrategy::Summary);
-        assert!(app.setting_value(row).starts_with("summary"));
-        // Два варианта — ещё шаг возвращает обратно в off.
+        // Стрелка вправо обходит ровно ContextStrategy::ALL и возвращается.
+        for expected in config::ContextStrategy::ALL.iter().skip(1) {
+            app.adjust_setting(1);
+            assert_eq!(app.settings.context_strategy, *expected);
+            assert_eq!(app.agent.strategy(), *expected);
+            assert!(app.setting_value(row).starts_with(expected.label()));
+        }
         app.adjust_setting(1);
         assert_eq!(app.settings.context_strategy, config::ContextStrategy::Off);
+        // И назад тем же кругом.
+        app.adjust_setting(-1);
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Branch);
     }
 
     #[test]
-    fn slash_compress_switches_strategy_and_reports_state() {
+    fn slash_strategy_switches_strategy_and_reports_state() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
-        app.cmd_compress("summary");
+        app.cmd_strategy("summary");
         assert_eq!(app.settings.context_strategy, config::ContextStrategy::Summary);
         assert!(app.agent.strategy().enabled());
         assert!(app.status.contains("compress=summary"));
-        app.cmd_compress("keep 3");
+        app.cmd_strategy("keep 3");
         assert_eq!(app.settings.keep_recent, 3);
         assert_eq!(app.agent.settings().keep_recent, 3);
-        app.cmd_compress("every 4");
+        app.cmd_strategy("every 4");
         assert_eq!(app.settings.summarize_every, 4);
-        app.cmd_compress("keep 0");
+        app.cmd_strategy("keep 0");
         assert!(app.status.starts_with("usage:"), "{}", app.status);
         assert_eq!(app.settings.keep_recent, 3, "битый аргумент ничего не меняет");
-        app.cmd_compress("off");
+        app.cmd_strategy("off");
         assert_eq!(app.settings.context_strategy, config::ContextStrategy::Off);
-        app.cmd_compress("nonsense");
-        assert!(app.status.starts_with("usage:"));
+        app.cmd_strategy("nonsense");
+        assert!(app.status.starts_with("/strategy"), "{}", app.status);
+        // Каждое значение доступно и по алиасу, и через старое имя команды.
+        app.cmd_strategy("window");
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Window);
+        app.cmd_strategy("kv");
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Facts);
+        app.cmd_strategy("tree");
+        assert_eq!(app.settings.context_strategy, config::ContextStrategy::Branch);
+    }
+
+    #[test]
+    fn window_strategy_shrinks_what_goes_on_the_wire() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        for i in 0..12 {
+            app.session.push_user(format!("вопрос {i}"));
+            app.session.push_assistant(format!("ответ {i}"));
+        }
+        app.cmd_strategy("window");
+        app.cmd_strategy("keep 4");
+        let history = app.session.history();
+        assert_eq!(app.agent.wire_history(&history).len(), 4);
+        assert!(app.strategy_status().contains("4/24"));
+        // Окно ничего не кладёт в system.
+        assert!(!app.agent.system_for_request().contains("Факты"));
+    }
+
+    #[test]
+    fn facts_command_edits_the_memory_and_the_block_reaches_system() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_strategy("facts");
+        app.cmd_facts("set цель нагрузочный стенд");
+        assert_eq!(app.agent.facts().get("цель"), Some("нагрузочный стенд"));
+        let system = app.agent.system_for_request();
+        assert!(system.contains("цель: нагрузочный стенд"));
+        assert_eq!(system.matches(crate::facts::FACTS_HEADER).count(), 1);
+        app.cmd_facts("del цель");
+        assert!(app.agent.facts().is_empty());
+        assert!(!app.agent.system_for_request().contains("цель:"));
+        app.cmd_facts("set a 1");
+        app.cmd_facts("clear");
+        assert!(app.agent.facts().is_empty());
+        app.cmd_facts("set сломано");
+        assert!(app.status.starts_with("usage:"), "{}", app.status);
+        // Со стратегией off блок фактов на провод не уходит.
+        app.cmd_facts("set цель стенд");
+        app.cmd_strategy("off");
+        assert!(!app.agent.system_for_request().contains("цель: стенд"));
+    }
+
+    #[test]
+    fn branches_fork_from_a_checkpoint_and_do_not_see_each_other() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_strategy("branch");
+        app.session.push_user("общий вопрос".into());
+        app.session.push_assistant("общий ответ".into());
+        app.cmd_checkpoint("");
+        assert!(app.status.contains("cp1"), "{}", app.status);
+        app.cmd_branch("new alpha");
+        app.cmd_branch("new beta");
+        assert_eq!(app.session.tree().branches().len(), 3);
+
+        app.switch_branch("alpha");
+        app.session.push_user("ALPHA?".into());
+        app.session.push_assistant("ALPHA!".into());
+        app.switch_branch("beta");
+        app.session.push_user("BETA?".into());
+        app.session.push_assistant("BETA!".into());
+
+        let history = app.session.history();
+        let wire: Vec<&str> = app
+            .agent
+            .wire_history(&history)
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(wire, ["общий вопрос", "общий ответ", "BETA?", "BETA!"]);
+        assert!(!wire.iter().any(|t| t.contains("ALPHA")), "ветки протекли");
+
+        app.switch_branch("alpha");
+        assert_eq!(app.session.history().len(), 4);
+        assert!(app.session.history()[2].content.contains("ALPHA"));
+        // Транскрипт пересобран под путь ветки, а не остался от beta.
+        assert_eq!(app.entries.len(), 4);
+        assert!(matches!(&app.entries[3], Entry::Assistant { text, .. } if text == "ALPHA!"));
     }
 
     /// Счётчик токенов должен мерить то, что уходит на провод: иначе футер
@@ -3157,7 +3527,7 @@ mod tests {
         app.agent.set_compressor(c);
         // Стратегия ещё off — меряем по-прежнему всю историю.
         assert_eq!(app.conversation_shape(), full);
-        app.cmd_compress("summary");
+        app.cmd_strategy("summary");
         let compressed = app.conversation_shape();
         assert!(
             compressed.chars < full.chars,
