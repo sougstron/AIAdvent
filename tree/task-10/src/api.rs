@@ -2,15 +2,13 @@
 //! `/chat/completions`, parse the response. Conversation policy lives in
 //! `agent.rs`. The coding-plan base (`/api/coding/paas/v4`) is never used.
 
-use serde_json::{json, Value};
 use crate::auth::{self, Provider};
 use crate::config::{self, Res, Settings, DEFAULT_MODEL};
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-
-
 
 /// Plain (non-coding-plan) OpenAI-compatible base.
 pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
@@ -76,14 +74,11 @@ impl Endpoint {
     }
 }
 
-
-
 /// The money guard as a predicate — same rule as [`guard_live_model`],
 /// usable where a `bool` is handier than a `Result`.
 pub fn is_live_model(provider: Provider, model: &str) -> bool {
     guard_live_model(provider, model).is_ok()
 }
-
 
 /// Per-provider money guard: glm and DeepSeek permit their flash tiers;
 /// OpenRouter permits `:free` ids. Everything else stays selectable but is
@@ -129,7 +124,6 @@ pub fn list_model_ids(ep: &Endpoint) -> Res<Vec<String>> {
         .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
         .collect())
 }
-
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -281,10 +275,7 @@ pub fn build_body(
     }
     if let Some(obj) = body.as_object_mut() {
         if settings.json_mode.enabled {
-            obj.insert(
-                "response_format".into(),
-                json!({ "type": "json_object" }),
-            );
+            obj.insert("response_format".into(), json!({ "type": "json_object" }));
         }
         if let Some(n) = settings.max_tokens() {
             obj.insert("max_tokens".into(), json!(n));
@@ -322,7 +313,14 @@ pub fn chat(
     schema: Option<&Value>,
 ) -> Res<Outcome> {
     guard_live_model(ep.provider, &settings.model)?;
-    let body = build_body(ep.provider, &settings.model, settings, system, history, schema);
+    let body = build_body(
+        ep.provider,
+        &settings.model,
+        settings,
+        system,
+        history,
+        schema,
+    );
     post_completion(ep, body)
 }
 
@@ -516,7 +514,14 @@ pub fn chat_stream(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Res<ChatStream> {
     guard_live_model(ep.provider, &settings.model)?;
-    let mut body = build_body(ep.provider, &settings.model, settings, system, history, schema);
+    let mut body = build_body(
+        ep.provider,
+        &settings.model,
+        settings,
+        system,
+        history,
+        schema,
+    );
     if let Some(obj) = body.as_object_mut() {
         obj.insert("stream".into(), json!(true));
         obj.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -715,7 +720,14 @@ mod tests {
             ChatMessage::assistant("reply"),
             ChatMessage::user("second"),
         ];
-        let body = build_body(Provider::Glm, "glm-5.3-flash", &settings, "", &history, None);
+        let body = build_body(
+            Provider::Glm,
+            "glm-5.3-flash",
+            &settings,
+            "",
+            &history,
+            None,
+        );
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "user");
@@ -761,7 +773,14 @@ mod tests {
     #[test]
     fn model_field_is_the_settings_model() {
         let settings = Settings::default();
-        let body = build_body(Provider::Glm, "glm-5.3-flash", &settings, "", &[ChatMessage::user("hi")], None);
+        let body = build_body(
+            Provider::Glm,
+            "glm-5.3-flash",
+            &settings,
+            "",
+            &[ChatMessage::user("hi")],
+            None,
+        );
         assert_eq!(body["model"], "glm-5.3-flash");
     }
 
@@ -839,7 +858,11 @@ mod tests {
         let err = guard_live_model(Provider::DeepSeek, "deepseek-v4-pro").unwrap_err();
         assert!(err.contains("deepseek-flash"));
         assert!(err.contains("expensive"));
-        assert!(guard_live_model(Provider::OpenRouter, "meta-llama/llama-3.3-70b-instruct:free").is_ok());
+        assert!(guard_live_model(
+            Provider::OpenRouter,
+            "meta-llama/llama-3.3-70b-instruct:free"
+        )
+        .is_ok());
         assert!(guard_live_model(Provider::OpenRouter, "openai/gpt-4o").is_err());
     }
 
@@ -860,7 +883,6 @@ mod tests {
         assert!(!is_live_model(Provider::OpenRouter, "z-ai/glm-5.3"));
         assert!(!is_live_model(Provider::OpenRouter, "openai/gpt-5"));
     }
-
 
     const SAMPLE_SSE: &str = concat!(
         "data: {\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",

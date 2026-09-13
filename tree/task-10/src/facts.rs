@@ -104,8 +104,13 @@ impl FactsDelta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
     /// add и update — одно действие: положить значение по ключу.
-    Upsert { key: String, value: String },
-    Delete { key: String },
+    Upsert {
+        key: String,
+        value: String,
+    },
+    Delete {
+        key: String,
+    },
 }
 
 /// Key-value память одного диалога (или одной ветки — см. `branch.rs`).
@@ -155,6 +160,11 @@ impl FactStore {
 
     pub fn reset(&mut self) {
         *self = FactStore::new();
+    }
+
+    /// Ключи памяти — живой источник автокомплита `/facts del`.
+    pub fn keys(&self) -> Vec<&str> {
+        self.facts.iter().map(|f| f.key.as_str()).collect()
     }
 
     fn position_of(&self, key: &str) -> Option<usize> {
@@ -239,7 +249,8 @@ impl FactStore {
     /// пока рендер блока не влезет в [`MAX_BLOCK_CHARS`].
     fn evict_overflow(&mut self) -> usize {
         let mut evicted = 0;
-        while self.facts.len() > MAX_FACTS || (!self.facts.is_empty() && self.body().chars().count() > MAX_BLOCK_CHARS)
+        while self.facts.len() > MAX_FACTS
+            || (!self.facts.is_empty() && self.body().chars().count() > MAX_BLOCK_CHARS)
         {
             let Some(oldest) = self
                 .facts
@@ -393,7 +404,11 @@ fn strip_fences(raw: &str) -> String {
         return t.to_string();
     };
     let rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
-    rest.rsplit_once("```").map(|(body, _)| body).unwrap_or(rest).trim().to_string()
+    rest.rsplit_once("```")
+        .map(|(body, _)| body)
+        .unwrap_or(rest)
+        .trim()
+        .to_string()
 }
 
 /// От первой `{`/`[` до парной закрывающей — так преамбула «Вот JSON:» не
@@ -425,7 +440,8 @@ mod tests {
 
     #[test]
     fn parses_clean_json() {
-        let ops = parse_ops(r#"{"ops":[{"op":"add","key":"цель","value":"нагрузочный стенд"}]}"#).unwrap();
+        let ops = parse_ops(r#"{"ops":[{"op":"add","key":"цель","value":"нагрузочный стенд"}]}"#)
+            .unwrap();
         assert_eq!(
             ops,
             vec![Op::Upsert {
@@ -437,8 +453,14 @@ mod tests {
 
     #[test]
     fn parses_json_inside_a_fence() {
-        let ops = parse_ops("```json\n{\"ops\":[{\"op\":\"delete\",\"key\":\"бюджет\"}]}\n```").unwrap();
-        assert_eq!(ops, vec![Op::Delete { key: "бюджет".into() }]);
+        let ops =
+            parse_ops("```json\n{\"ops\":[{\"op\":\"delete\",\"key\":\"бюджет\"}]}\n```").unwrap();
+        assert_eq!(
+            ops,
+            vec![Op::Delete {
+                key: "бюджет".into()
+            }]
+        );
     }
 
     #[test]
@@ -483,8 +505,14 @@ mod tests {
     fn add_update_delete_resolve_conflicts_instead_of_appending() {
         let mut store = FactStore::new();
         let d = store.apply_ops(&[
-            Op::Upsert { key: "бюджет".into(), value: "200 тысяч".into() },
-            Op::Upsert { key: "срок".into(), value: "две недели".into() },
+            Op::Upsert {
+                key: "бюджет".into(),
+                value: "200 тысяч".into(),
+            },
+            Op::Upsert {
+                key: "срок".into(),
+                value: "две недели".into(),
+            },
         ]);
         assert_eq!((d.added, d.updated, d.deleted), (2, 0, 0));
         // Новое значение того же ключа заменяет старое, а не ложится рядом.
@@ -495,22 +523,34 @@ mod tests {
         assert_eq!((d.added, d.updated), (0, 1));
         assert_eq!(store.len(), 2);
         assert_eq!(store.get("бюджет"), Some("150 тысяч"));
-        let d = store.apply_ops(&[Op::Delete { key: "срок".into() }]);
+        let d = store.apply_ops(&[Op::Delete {
+            key: "срок".into()
+        }]);
         assert_eq!(d.deleted, 1);
         assert_eq!(store.len(), 1);
         // Удаление несуществующего ключа — не ошибка и ничего не ломает.
-        let d = store.apply_ops(&[Op::Delete { key: "нет-такого".into() }]);
+        let d = store.apply_ops(&[Op::Delete {
+            key: "нет-такого".into(),
+        }]);
         assert_eq!(d.deleted, 0);
     }
 
     #[test]
     fn keys_are_case_insensitive_so_the_same_fact_does_not_split() {
         let mut store = FactStore::new();
-        store.apply_ops(&[Op::Upsert { key: "Цель".into(), value: "A".into() }]);
-        store.apply_ops(&[Op::Upsert { key: "цель".into(), value: "Б".into() }]);
+        store.apply_ops(&[Op::Upsert {
+            key: "Цель".into(),
+            value: "A".into(),
+        }]);
+        store.apply_ops(&[Op::Upsert {
+            key: "цель".into(),
+            value: "Б".into(),
+        }]);
         assert_eq!(store.len(), 1);
         assert_eq!(store.get("ЦЕЛЬ"), Some("Б"));
-        store.apply_ops(&[Op::Delete { key: "  ЦЕЛЬ  ".into() }]);
+        store.apply_ops(&[Op::Delete {
+            key: "  ЦЕЛЬ  ".into(),
+        }]);
         assert!(store.is_empty());
     }
 
@@ -519,7 +559,10 @@ mod tests {
         let mut store = FactStore::new();
         let long = "я".repeat(500);
         store.set("длинный", &long);
-        assert_eq!(store.get("длинный").unwrap().chars().count(), MAX_VALUE_CHARS);
+        assert_eq!(
+            store.get("длинный").unwrap().chars().count(),
+            MAX_VALUE_CHARS
+        );
     }
 
     #[test]
@@ -533,8 +576,14 @@ mod tests {
         }
         assert_eq!(store.len(), MAX_FACTS);
         // k0 самый старый, но мы его трогаем — вытесниться должен k1.
-        store.apply_ops(&[Op::Upsert { key: "k0".into(), value: "свежий".into() }]);
-        let d = store.apply_ops(&[Op::Upsert { key: "новый".into(), value: "v".into() }]);
+        store.apply_ops(&[Op::Upsert {
+            key: "k0".into(),
+            value: "свежий".into(),
+        }]);
+        let d = store.apply_ops(&[Op::Upsert {
+            key: "новый".into(),
+            value: "v".into(),
+        }]);
         assert_eq!(d.evicted, 1);
         assert_eq!(store.len(), MAX_FACTS);
         assert!(store.get("k1").is_none());
@@ -551,7 +600,11 @@ mod tests {
             }]);
         }
         let block = store.block().unwrap();
-        assert!(block.chars().count() < MAX_BLOCK_CHARS + 200, "{}", block.chars().count());
+        assert!(
+            block.chars().count() < MAX_BLOCK_CHARS + 200,
+            "{}",
+            block.chars().count()
+        );
         assert!(store.len() < MAX_FACTS);
     }
 
@@ -586,7 +639,10 @@ mod tests {
         let p = extract_prompt(&store, recent);
         assert!(p.contains("цель: стенд"));
         assert!(p.contains("новое"));
-        assert!(!p.contains("старое"), "вход экстрактора не растёт с историей");
+        assert!(
+            !p.contains("старое"),
+            "вход экстрактора не растёт с историей"
+        );
         // Пустая история не паникует.
         assert!(recent_slice(&[]).is_empty());
     }

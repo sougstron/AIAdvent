@@ -155,7 +155,11 @@ impl Compressor {
     /// уезжает отдельно, в system). Для любой другой стратегии summary ни при
     /// чём, и история возвращается как есть — что с ней делать дальше, решает
     /// `strategy::apply`.
-    pub fn wire<'a>(&self, history: &'a [ChatMessage], strategy: ContextStrategy) -> &'a [ChatMessage] {
+    pub fn wire<'a>(
+        &self,
+        history: &'a [ChatMessage],
+        strategy: ContextStrategy,
+    ) -> &'a [ChatMessage] {
         if strategy != ContextStrategy::Summary || self.is_empty() {
             return history;
         }
@@ -229,7 +233,10 @@ mod tests {
             .collect()
     }
 
-    const P: Policy = Policy { keep_recent: 6, every: 10 };
+    const P: Policy = Policy {
+        keep_recent: 6,
+        every: 10,
+    };
 
     #[test]
     fn nothing_to_fold_until_a_whole_chunk_is_old_enough() {
@@ -277,7 +284,10 @@ mod tests {
         let mut c = Compressor::new();
         assert!(c.block().is_none());
         c.apply("   ".into(), 10, 0);
-        assert!(c.block().is_none(), "пустое summary не должно подставляться");
+        assert!(
+            c.block().is_none(),
+            "пустое summary не должно подставляться"
+        );
         c.apply("факт: пароль QUINCE".into(), 10, 500);
         let block = c.block().unwrap();
         assert!(block.contains(SUMMARY_HEADER));
@@ -327,7 +337,9 @@ mod tests {
     fn status_reports_off_and_the_savings() {
         let mut c = Compressor::new();
         assert_eq!(c.status(ContextStrategy::Off, 40), "compress=off");
-        assert!(c.status(ContextStrategy::Summary, 4).contains("без свёртки"));
+        assert!(c
+            .status(ContextStrategy::Summary, 4)
+            .contains("без свёртки"));
         c.apply("короткая сводка".into(), 20, 4000);
         let s = c.status(ContextStrategy::Summary, 26);
         assert!(s.contains("20/26"));

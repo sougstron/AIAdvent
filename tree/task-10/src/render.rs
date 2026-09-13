@@ -9,7 +9,11 @@ pub fn strip_fences(s: &str) -> &str {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix("```") {
         let rest = rest.strip_prefix("json").unwrap_or(rest);
-        return rest.trim_start_matches('\n').trim_end().trim_end_matches("```").trim();
+        return rest
+            .trim_start_matches('\n')
+            .trim_end()
+            .trim_end_matches("```")
+            .trim();
     }
     t
 }

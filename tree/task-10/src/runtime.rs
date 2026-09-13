@@ -54,8 +54,6 @@ pub struct InputPolicy {
     pub prefix: Option<String>,
 }
 
-
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputVerdict {
     /// Prompt passed; the payload is what will actually be sent.
@@ -77,10 +75,7 @@ impl InputPolicy {
     pub fn apply(&self, prompt: &str) -> (InputVerdict, String) {
         let trimmed = prompt.trim();
         if trimmed.is_empty() && !self.allow_empty {
-            return (
-                InputVerdict::Reject("empty prompt".into()),
-                String::new(),
-            );
+            return (InputVerdict::Reject("empty prompt".into()), String::new());
         }
         let count = trimmed.chars().count();
         if let Some(max) = self.max_chars {
@@ -268,7 +263,10 @@ impl Judge for RuleJudge {
             return Ok(Judgement {
                 score: 2,
                 pass: false,
-                note: format!("answer is {len} chars, judge wants at least {}", self.min_chars),
+                note: format!(
+                    "answer is {len} chars, judge wants at least {}",
+                    self.min_chars
+                ),
             });
         }
         if !prompt.is_empty() && answer.eq_ignore_ascii_case(prompt) {
@@ -332,9 +330,8 @@ impl Judge for ModelJudge {
             .agent
             .complete_with_system(&self.system(), &[ChatMessage::user(ask)])?;
         let text = outcome.text().to_string();
-        let score = first_integer(&text).ok_or_else(|| {
-            format!("judge did not return a score (got `{}`)", clip(&text, 60))
-        })?;
+        let score = first_integer(&text)
+            .ok_or_else(|| format!("judge did not return a score (got `{}`)", clip(&text, 60)))?;
         let score = score.min(10) as u8;
         Ok(Judgement {
             score,
@@ -864,8 +861,7 @@ mod tests {
     use crate::config::DEFAULT_MODEL;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("ask6-runtime-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ask6-runtime-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -894,7 +890,9 @@ mod tests {
     #[test]
     fn a_hundred_boxes_live_in_one_runtime_with_distinct_ids() {
         let mut rt = runtime("hundred");
-        let ids: Vec<String> = (0..100).map(|i| rt.spawn(spec(&format!("box-{i}")))).collect();
+        let ids: Vec<String> = (0..100)
+            .map(|i| rt.spawn(spec(&format!("box-{i}"))))
+            .collect();
         assert_eq!(rt.len(), 100);
         let unique: BTreeSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), 100, "box ids collided");
@@ -905,7 +903,9 @@ mod tests {
     #[test]
     fn each_box_remembers_only_its_own_turns() {
         let mut rt = runtime("isolation");
-        let ids: Vec<String> = (0..100).map(|i| rt.spawn(spec(&format!("box-{i}")))).collect();
+        let ids: Vec<String> = (0..100)
+            .map(|i| rt.spawn(spec(&format!("box-{i}"))))
+            .collect();
         // The `#` terminator matters: without it `secret 1` is a substring of
         // `secret 10` and the leak check reports a leak that is not there.
         for (i, id) in ids.iter().enumerate() {
@@ -952,8 +952,12 @@ mod tests {
         let mut rt = Runtime::with_endpoint(Endpoint::dummy(), dir.clone());
         let a = rt.spawn(spec("a"));
         let b = rt.spawn(spec("b"));
-        rt.get_mut(&a).unwrap().seed("remember apricot", "apricot noted");
-        rt.get_mut(&b).unwrap().seed("remember basil", "basil noted");
+        rt.get_mut(&a)
+            .unwrap()
+            .seed("remember apricot", "apricot noted");
+        rt.get_mut(&b)
+            .unwrap()
+            .seed("remember basil", "basil noted");
         rt.close(&a).unwrap();
         rt.close(&b).unwrap();
         assert_eq!(rt.len(), 0);
@@ -1025,7 +1029,10 @@ mod tests {
         // A dummy endpoint would fail the request; these never get there.
         let empty = b.ask("   ").unwrap();
         assert!(!empty.accepted());
-        assert_eq!(empty.refusal().as_deref(), Some("input policy: empty prompt"));
+        assert_eq!(
+            empty.refusal().as_deref(),
+            Some("input policy: empty prompt")
+        );
 
         let long = b.ask("this prompt is far too long").unwrap();
         assert!(long.refusal().unwrap().contains("input policy allows 10"));
@@ -1148,9 +1155,7 @@ mod tests {
         let results = rt.ask_many(&requests);
         assert_eq!(results.len(), 100);
         assert!(results.iter().all(|(_, r)| r.is_ok()));
-        assert!(results
-            .iter()
-            .all(|(_, r)| !r.as_ref().unwrap().accepted()));
+        assert!(results.iter().all(|(_, r)| !r.as_ref().unwrap().accepted()));
         let _ = std::fs::remove_dir_all(rt.sessions_dir());
     }
 
@@ -1160,7 +1165,9 @@ mod tests {
         let mut rt = Runtime::with_endpoint(Endpoint::dummy(), dir.clone());
         for i in 0..25 {
             let id = rt.spawn(spec(&format!("s{i}")));
-            rt.get_mut(&id).unwrap().seed(&format!("q{i}"), &format!("a{i}"));
+            rt.get_mut(&id)
+                .unwrap()
+                .seed(&format!("q{i}"), &format!("a{i}"));
         }
         rt.save_all().unwrap();
         assert_eq!(rt.list_saved().len(), 25);

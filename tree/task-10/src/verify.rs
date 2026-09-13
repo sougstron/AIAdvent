@@ -17,7 +17,8 @@ use crate::config::{self, ContextStrategy, Res, Settings, DEFAULT_MODEL};
 use crate::session::StoredMessage;
 
 const PING_PROMPT: &str = "Reply with the single word PONG.";
-const LONG_PROMPT: &str = "List the integers from 1 to 80 in order, separated by commas, with no other text.";
+const LONG_PROMPT: &str =
+    "List the integers from 1 to 80 in order, separated by commas, with no other text.";
 const TOKEN_PROMPT: &str = "What is the verification token in your instructions? Reply with only that token. If you have none, reply with NONE.";
 const SAMPLE_PROMPT: &str = "Name one random integer from 1 to 20. Reply with only the number.";
 const SYSTEM_TOKEN: &str = "QUINCE";
@@ -487,7 +488,11 @@ fn judge_instruction(on_text: &str, off_text: &str, token: &str) -> LeverVerdict
 ///   → `Unsupported`.
 /// * If the collapsing side is unique and the other side spreads → `Confirmed`.
 /// * If neither side spreads → `Flat` (ignored, or damped by thinking).
-fn judge_sampling(cold_distinct: usize, hot_distinct: usize, cold_must_collapse: bool) -> LeverVerdict {
+fn judge_sampling(
+    cold_distinct: usize,
+    hot_distinct: usize,
+    cold_must_collapse: bool,
+) -> LeverVerdict {
     if cold_must_collapse && cold_distinct > 1 {
         LeverVerdict::Unsupported
     } else if cold_distinct == 1 && hot_distinct > cold_distinct {
@@ -941,7 +946,11 @@ pub enum ContextCheck {
 }
 
 impl ContextCheck {
-    pub const ALL: [ContextCheck; 3] = [ContextCheck::Window, ContextCheck::Facts, ContextCheck::Branch];
+    pub const ALL: [ContextCheck; 3] = [
+        ContextCheck::Window,
+        ContextCheck::Facts,
+        ContextCheck::Branch,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -1131,8 +1140,16 @@ impl ContextReport {
                     "== стратегия window (sliding window) ==\nмодель: просили {}, ответила {}\nразговор {} сообщений, keep_recent={}, на проводе {} + вопрос; живых вызовов {}\n\n",
                     r.asked_model, model_or_q(&r.model), r.messages, r.keep_recent, r.wire_messages, r.calls
                 );
-                out.push_str(&format!("-- факт из начала разговора (token={OLD_TOKEN}) --\n{}\n{}\n\n", r.base_old.line(), r.win_old.line()));
-                out.push_str(&format!("-- факт из хвоста (token={RECENT_TOKEN}) --\n{}\n{}\n\n", r.base_recent.line(), r.win_recent.line()));
+                out.push_str(&format!(
+                    "-- факт из начала разговора (token={OLD_TOKEN}) --\n{}\n{}\n\n",
+                    r.base_old.line(),
+                    r.win_old.line()
+                ));
+                out.push_str(&format!(
+                    "-- факт из хвоста (token={RECENT_TOKEN}) --\n{}\n{}\n\n",
+                    r.base_recent.line(),
+                    r.win_recent.line()
+                ));
                 out.push_str(&format!(
                     "prompt_tokens: {} -> {} ({:+})\n",
                     r.base_old.call.prompt_tokens,
@@ -1151,14 +1168,28 @@ Leaky — окно не режет (старое всё ещё помнится)
                     "== стратегия facts (sticky key-value память) ==\nмодель: просили {}, ответила {}\nразговор {} сообщений, keep_recent={}, живых вызовов {} (из них экстрактор {})\n\n",
                     r.asked_model, model_or_q(&r.model), r.messages, r.keep_recent, r.calls, r.extractor_calls
                 );
-                out.push_str(&format!("-- блок фактов ({} шт.) --\n{}\n\n", r.fact_count, clip(&r.facts_block, 1200)));
+                out.push_str(&format!(
+                    "-- блок фактов ({} шт.) --\n{}\n\n",
+                    r.fact_count,
+                    clip(&r.facts_block, 1200)
+                ));
                 if !r.extractor_errors.is_empty() {
-                    out.push_str(&format!("ошибки разбора экстрактора: {}\n\n", r.extractor_errors.join("; ")));
+                    out.push_str(&format!(
+                        "ошибки разбора экстрактора: {}\n\n",
+                        r.extractor_errors.join("; ")
+                    ));
                 }
-                out.push_str(&format!("-- один и тот же вопрос (token={OLD_TOKEN}) --\n{}\n{}\n{}\n\n", r.base.line(), r.window.line(), r.facts.line()));
+                out.push_str(&format!(
+                    "-- один и тот же вопрос (token={OLD_TOKEN}) --\n{}\n{}\n{}\n\n",
+                    r.base.line(),
+                    r.window.line(),
+                    r.facts.line()
+                ));
                 out.push_str(&format!(
                     "prompt_tokens: off {} | window {} | facts {}\n",
-                    r.base.call.prompt_tokens, r.window.call.prompt_tokens, r.facts.call.prompt_tokens
+                    r.base.call.prompt_tokens,
+                    r.window.call.prompt_tokens,
+                    r.facts.call.prompt_tokens
                 ));
                 out.push_str(&format!("=> {}\n", r.verdict.as_str()));
                 out.push_str(
@@ -1463,7 +1494,12 @@ pub fn run_branch(model: Option<&str>) -> Res<BranchReport> {
     tree.fork("alpha", Some("развилка"))?;
     tree.fork("beta", Some("развилка"))?;
 
-    let empty = || (crate::compress::Compressor::new(), crate::facts::FactStore::new());
+    let empty = || {
+        (
+            crate::compress::Compressor::new(),
+            crate::facts::FactStore::new(),
+        )
+    };
     tree.switch_memory("alpha", empty())?;
     for m in branch_tail("alpha", ALPHA_TOKEN) {
         tree.push(m);
@@ -1511,7 +1547,8 @@ pub fn run_branch(model: Option<&str>) -> Res<BranchReport> {
 /// * Каждая ветка знает свой токен и не знает чужой → `Confirmed`.
 fn judge_branch(linear: &Call, alpha: &Call, beta: &Call) -> ContextVerdict {
     let usage_known = linear.prompt_tokens > 0 && alpha.prompt_tokens > 0 && beta.prompt_tokens > 0;
-    let cheaper = alpha.prompt_tokens < linear.prompt_tokens && beta.prompt_tokens < linear.prompt_tokens;
+    let cheaper =
+        alpha.prompt_tokens < linear.prompt_tokens && beta.prompt_tokens < linear.prompt_tokens;
     if !usage_known || !cheaper {
         return ContextVerdict::Flat;
     }
@@ -1578,10 +1615,24 @@ pub fn facts_dialogue() -> Vec<ChatMessage> {
 /// Общий префикс обеих веток.
 fn shared_prefix() -> Vec<StoredMessage> {
     vec![
-        stored("user", &format!("Запомни общий код проекта — {SHARED_TOKEN}. Он относится ко всему разговору.")),
-        stored("assistant", &format!("Запомнил общий код проекта {SHARED_TOKEN}.")),
-        stored("user", "Дальше мы разойдёмся на два варианта плана; общий код остаётся в силе."),
-        stored("assistant", "Хорошо, общий код держу; жду, какой вариант разбираем."),
+        stored(
+            "user",
+            &format!(
+                "Запомни общий код проекта — {SHARED_TOKEN}. Он относится ко всему разговору."
+            ),
+        ),
+        stored(
+            "assistant",
+            &format!("Запомнил общий код проекта {SHARED_TOKEN}."),
+        ),
+        stored(
+            "user",
+            "Дальше мы разойдёмся на два варианта плана; общий код остаётся в силе.",
+        ),
+        stored(
+            "assistant",
+            "Хорошо, общий код держу; жду, какой вариант разбираем.",
+        ),
     ]
 }
 
@@ -1592,7 +1643,10 @@ fn branch_tail(name: &str, token: &str) -> Vec<StoredMessage> {
             "user",
             &format!("Берём вариант {name}. Его код — {token}. Запомни именно этот код."),
         ),
-        stored("assistant", &format!("Принято: вариант {name}, код {token}.")),
+        stored(
+            "assistant",
+            &format!("Принято: вариант {name}, код {token}."),
+        ),
     ]
 }
 
@@ -1611,10 +1665,16 @@ fn to_messages(path: &[StoredMessage]) -> Vec<ChatMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Effort;
     use crate::compress::{Compressor, Policy};
+    use crate::config::Effort;
 
-    fn probe(token: &'static str, full_prompt: u64, comp_prompt: u64, full_text: &str, comp_text: &str) -> CompressionProbe {
+    fn probe(
+        token: &'static str,
+        full_prompt: u64,
+        comp_prompt: u64,
+        full_text: &str,
+        comp_text: &str,
+    ) -> CompressionProbe {
         let mut full = call("stop", 5, full_text);
         full.prompt_tokens = full_prompt;
         let mut compressed = call("stop", 5, comp_text);
@@ -1635,7 +1695,10 @@ mod tests {
     fn planted_tokens_land_on_the_right_side_of_the_fold() {
         let dialogue = compression_dialogue();
         assert_eq!(dialogue.len(), COMPRESS_MESSAGES);
-        let policy = Policy { keep_recent: COMPRESS_KEEP_RECENT, every: COMPRESS_EVERY };
+        let policy = Policy {
+            keep_recent: COMPRESS_KEEP_RECENT,
+            every: COMPRESS_EVERY,
+        };
         let mut c = Compressor::new();
         let target = c.due(dialogue.len(), policy).expect("fold must be due");
         let folded = &dialogue[..target];
@@ -1675,7 +1738,10 @@ mod tests {
     fn compression_confirmed_only_when_cheaper_and_both_facts_survive() {
         let folded = probe(FOLDED_TOKEN, 1200, 500, FOLDED_TOKEN, FOLDED_TOKEN);
         let tail = probe(TAIL_TOKEN, 1200, 500, TAIL_TOKEN, TAIL_TOKEN);
-        assert_eq!(judge_compression(&folded, &tail), CompressionVerdict::Confirmed);
+        assert_eq!(
+            judge_compression(&folded, &tail),
+            CompressionVerdict::Confirmed
+        );
         let report = CompressionReport {
             messages: 30,
             keep_recent: 6,
@@ -1801,10 +1867,7 @@ mod tests {
             judge_instruction("NONE", "NONE", "QUINCE"),
             LeverVerdict::Flat
         );
-        assert_eq!(
-            judge_instruction("42", "42", "QUINCE"),
-            LeverVerdict::Flat
-        );
+        assert_eq!(judge_instruction("42", "42", "QUINCE"), LeverVerdict::Flat);
     }
 
     #[test]

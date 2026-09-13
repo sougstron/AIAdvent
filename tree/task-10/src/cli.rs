@@ -103,7 +103,12 @@ pub struct Cli {
     /// (running summary + last --keep-recent), `window` (last --keep-recent
     /// only), `facts` (key-value memory + last --keep-recent) or `branch`
     /// (the active conversation branch). `--compress` is the old name.
-    #[arg(long = "strategy", visible_alias = "compress", env = "ASK_COMPRESS", value_name = "STRATEGY")]
+    #[arg(
+        long = "strategy",
+        visible_alias = "compress",
+        env = "ASK_COMPRESS",
+        value_name = "STRATEGY"
+    )]
     pub compress: Option<String>,
 
     /// With summary/window/facts: how many recent messages stay verbatim.
@@ -235,8 +240,8 @@ impl Cli {
             s.effort = Effort::parse(e)?;
         }
         if let Some(path) = &self.json_schema_file {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| format!("cannot read {path}: {e}"))?;
+            let raw =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
             let schema: Value =
                 serde_json::from_str(&raw).map_err(|e| format!("cannot parse {path}: {e}"))?;
             s.json_mode = JsonMode {
@@ -286,7 +291,9 @@ impl Cli {
         }
         if let Some(k) = self.top_k {
             if k == 0 || k < -1 {
-                return Err(format!("top_k must be -1 (off) or a positive count (got {k})"));
+                return Err(format!(
+                    "top_k must be -1 (off) or a positive count (got {k})"
+                ));
             }
             s.top_k = Some(k);
         }
@@ -340,7 +347,11 @@ pub fn run() -> Res<()> {
         let checks = verify::ContextCheck::parse(which)?;
         println!(
             "проверяю стратегии: {}",
-            checks.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ")
+            checks
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let reports = verify::run_context(&checks, cli.verify_model.as_deref())?;
         let mut calls = 0;
@@ -354,7 +365,10 @@ pub fn run() -> Res<()> {
         }
         println!("живых вызовов всего: {calls}");
         if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
-            return Err(format!("context strategy not confirmed: {}", bad.status_line()));
+            return Err(format!(
+                "context strategy not confirmed: {}",
+                bad.status_line()
+            ));
         }
         return Ok(());
     }
@@ -421,7 +435,10 @@ fn one_shot(
     let reply = turn.reply.as_ref().ok_or("no reply on an accepted turn")?;
 
     if cli.raw {
-        println!("{}", serde_json::to_string_pretty(&reply.raw).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply.raw).unwrap_or_default()
+        );
     } else {
         let (display, parse_note) = if settings.json_mode.enabled {
             render::render_json_reply(&turn.text)
@@ -434,7 +451,10 @@ fn one_shot(
             println!("{display}");
         }
         if reply.truncated_by_max_chars {
-            eprintln!("! truncated to max_chars={}", settings.max_chars.unwrap_or(0));
+            eprintln!(
+                "! truncated to max_chars={}",
+                settings.max_chars.unwrap_or(0)
+            );
         }
         if let Some(e) = parse_note {
             eprintln!("! {e}");
@@ -509,10 +529,21 @@ fn print_keys() -> Res<()> {
             _ => ("—".to_string(), "—".to_string()),
         };
         let check = match &row.last_check {
-            Some(c) => format!("{} {} ({})", c.verdict, session::format_updated(c.at), c.evidence),
+            Some(c) => format!(
+                "{} {} ({})",
+                c.verdict,
+                session::format_updated(c.at),
+                c.evidence
+            ),
             None => "—".to_string(),
         };
-        println!("{:<12} {:<34} {:<24} {}", row.provider.id(), source, key, check);
+        println!(
+            "{:<12} {:<34} {:<24} {}",
+            row.provider.id(),
+            source,
+            key,
+            check
+        );
     }
     if rows.iter().all(|r| !r.connected()) {
         println!(
@@ -664,7 +695,9 @@ fn verify_login() -> Res<()> {
         }
     }
     if rejected > 0 {
-        return Err(format!("{rejected} configured key(s) were rejected by their provider"));
+        return Err(format!(
+            "{rejected} configured key(s) were rejected by their provider"
+        ));
     }
     Ok(())
 }
@@ -706,9 +739,7 @@ fn login(provider_arg: Option<&str>, key_stdin: bool) -> Res<()> {
             );
         }
         (CheckResult::Rejected { http, msg }, false) => {
-            return Err(format!(
-                "REJECTED (HTTP {http}): {msg} — key NOT saved"
-            ));
+            return Err(format!("REJECTED (HTTP {http}): {msg} — key NOT saved"));
         }
         _ => unreachable!("connect returns only the verdicts above"),
     }
