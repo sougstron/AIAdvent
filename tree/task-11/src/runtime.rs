@@ -34,7 +34,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{Agent, Reply};
 use crate::api::{ChatMessage, Endpoint};
-use crate::config::{Res, Settings};
+use crate::config::{ContextStrategy, Res, Settings};
+use crate::memory::{self, MemoryStore};
 use crate::session::{self, Session, SessionSummary};
 
 // ---------------------------------------------------------------- policies
@@ -442,6 +443,21 @@ impl Turn {
 
 /// One isolated conversation: an agent, the session that *is* its memory, and
 /// the policies that guard both ends of a turn.
+/// Подцепить трёхслойную память к диску. Коробка живёт вне TUI (one-shot,
+/// многоагентный прогон), но память общая с ним: краткосрочный слой — свой на
+/// сессию, рабочий и долговременный — те же файлы. В тестах память остаётся
+/// в оперативке, чтобы прогон не писал в домашний каталог.
+fn attach_memory(agent: &mut Agent, session: &Session) {
+    if cfg!(test) || agent.strategy() != ContextStrategy::Memory {
+        return;
+    }
+    agent.set_memory(MemoryStore::open(
+        memory::memory_root(),
+        &session.id,
+        session.memory_task(),
+    ));
+}
+
 pub struct AgentBox {
     id: String,
     label: String,
@@ -459,8 +475,9 @@ pub struct AgentBox {
 
 impl AgentBox {
     fn from_spec(endpoint: Endpoint, spec: BoxSpec) -> AgentBox {
-        let agent = Agent::with_endpoint(endpoint, spec.settings.clone());
+        let mut agent = Agent::with_endpoint(endpoint, spec.settings.clone());
         let mut session = Session::new(agent.settings().clone());
+        attach_memory(&mut agent, &session);
         if !spec.label.is_empty() {
             session.title = spec.label.clone();
         }
@@ -488,6 +505,7 @@ impl AgentBox {
         // ...but the running summary *is* session memory: `reset` drops it
         // along with the history, so it goes back in after the wipe.
         agent.set_compressor(session.compressor.clone());
+        attach_memory(&mut agent, &session);
         AgentBox {
             id: session.id.clone(),
             label: spec.label,
@@ -611,6 +629,12 @@ impl AgentBox {
             self.folds += 1;
             self.fold_tokens += fold.usage.total_tokens;
         }
+        // То же для трёхслойной памяти: сказанное сейчас раскладывается по
+        // слоям до ответа, чтобы участвовать уже в нём. Неудачная раскладка
+        // не должна ронять ход — ответ важнее записи в память.
+        if let Err(e) = self.agent.update_memory(&history) {
+            eprintln!("warning: память не обновлена: {e}");
+        }
         let reply = self.agent.complete(&history)?;
 
         let (out_verdict, text) = self.output.apply(&reply.text);
@@ -661,6 +685,7 @@ impl AgentBox {
             self.agent.compressor(),
             self.agent.facts(),
         );
+        self.session.set_memory_task(self.agent.memory().task());
         self.session.save(dir)
     }
 }

@@ -27,6 +27,7 @@ use crate::auth::{self, CheckResult, Provider};
 use crate::complete;
 use crate::compress;
 use crate::config::{self, Effort, Res, Settings};
+use crate::memory::{self, Layer, MemoryStore};
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
 use crate::tokens::{self, Shape, TokenMeter};
@@ -69,7 +70,10 @@ const SETTINGS_ROWS: &[&str] = &[
     "system_prompt",
 ];
 /// Подсказка по переключателю — одна на `/strategy`, `/help` и ошибки.
-const STRATEGY_USAGE: &str = "/strategy [show|off|summary|window|facts|branch|keep N|every N]";
+const STRATEGY_USAGE: &str =
+    "/strategy [show|off|summary|window|facts|branch|memory|keep N|every N]";
+const MEM_USAGE: &str =
+    "/mem [show [слой]|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
 const FOOTER_HEIGHT: u16 = 2;
 const STATS_SEP: &str = " \u{b7} ";
@@ -341,7 +345,7 @@ impl App {
             let a = config::available_ids(&c);
             (c, a)
         };
-        App {
+        let mut app = App {
             login_selected: 0,
             login_rows: Vec::new(),
             login_pending_delete: None,
@@ -374,7 +378,25 @@ impl App {
             tokens: TokenMeter::new(),
             sent_shape: Shape::default(),
             spinner: None,
+        };
+        app.attach_memory();
+        app
+    }
+
+    /// Привязать трёхслойную память к диску: краткосрочный слой — к файлу
+    /// текущей сессии, рабочий — к задаче, записанной в сессии,
+    /// долговременный — к общему профилю. В тестах память остаётся в
+    /// оперативке, чтобы `cargo test` не писал в домашний каталог.
+    fn attach_memory(&mut self) {
+        if cfg!(test) {
+            return;
         }
+        let store = MemoryStore::open(
+            memory::memory_root(),
+            &self.session.id,
+            self.session.memory_task(),
+        );
+        self.agent.set_memory(store);
     }
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Res<()> {
@@ -727,6 +749,7 @@ impl App {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            memory_keys: self.agent.memory().keys(),
         }
     }
 
@@ -926,7 +949,12 @@ impl App {
         self.agent.reset();
         *self.agent.settings_mut() = self.settings.clone();
         self.agent.reload_context();
+        let task = self.agent.memory().task().to_string();
         self.session = Session::new(self.settings.clone());
+        self.session.set_memory_task(&task);
+        // Новый чат — новый краткосрочный слой. Рабочий и долговременный
+        // остаются: они переживают смену разговора.
+        self.agent.memory_mut().set_session(&self.session.id);
         self.entries.clear();
         self.scroll = 0;
         self.follow = true;
@@ -949,6 +977,7 @@ impl App {
             .collect();
         s.compressor = self.agent.compressor().clone();
         s.set_facts(self.agent.facts().clone());
+        s.set_memory_task(self.agent.memory().task());
         // Память принадлежит ветке: кладём её в дерево тем же движением.
         s.resync_tree();
         s.tree_mut()
@@ -972,6 +1001,9 @@ impl App {
                 self.entries = entries_from_session(&s);
                 self.status = format!("Loaded '{}'", s.title);
                 self.session = s;
+                // У загруженного чата свой краткосрочный слой и своя задача
+                // рабочего слоя — перецепляем память на её файлы.
+                self.attach_memory();
                 self.retarget_endpoint();
                 self.warn_if_model_unavailable();
                 self.scroll_to_bottom(terminal);
@@ -1006,6 +1038,7 @@ impl App {
             // про сжатие); `/compress` оставлен алиасом, чтобы не ломать руки.
             "strategy" | "compress" => self.cmd_strategy(rest),
             "facts" => self.cmd_facts(rest),
+            "mem" | "memory" => self.cmd_mem(rest),
             "branch" => self.cmd_branch(rest),
             "checkpoint" => self.cmd_checkpoint(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
@@ -1723,7 +1756,16 @@ impl App {
                 Ok(strategy) => {
                     self.settings.context_strategy = strategy;
                     self.agent.set_strategy(strategy);
-                    self.status = self.strategy_status();
+                    self.status = if strategy == config::ContextStrategy::Memory
+                        && self.agent.memory().is_empty()
+                    {
+                        format!(
+                            "{} — память пуста, заполнится экстрактором или вручную: /mem long set <ключ> <значение>",
+                            self.strategy_status()
+                        )
+                    } else {
+                        self.strategy_status()
+                    };
                     self.entries.push(Entry::Info(self.strategy_listing()));
                 }
                 Err(_) => self.status = STRATEGY_USAGE.into(),
@@ -1767,6 +1809,10 @@ impl App {
             config::ContextStrategy::Facts => {
                 lines.push(String::new());
                 lines.push(self.agent.facts().listing());
+            }
+            config::ContextStrategy::Memory => {
+                lines.push(String::new());
+                lines.push(self.agent.memory().listing());
             }
             config::ContextStrategy::Branch => {
                 lines.push(String::new());
@@ -1828,6 +1874,165 @@ impl App {
         }
         self.agent.set_facts(facts);
         self.save_session();
+    }
+
+
+    /// `/mem [show|<слой> set k v|del k|clear <слой>|task <имя>|where k|routes]`
+    /// — ручное управление трёхслойной памятью.
+    ///
+    /// Ручная правка и есть «явный выбор, что и куда сохраняется»: слой
+    /// называет человек, и маршрутизатор с ним не спорит. Всё, что здесь
+    /// меняется, немедленно оказывается в файле своего слоя — видно через
+    /// `/mem show` и обычным `cat`.
+    fn cmd_mem(&mut self, rest: &str) {
+        let rest = rest.trim();
+        let (head, tail) = match rest.split_once(char::is_whitespace) {
+            Some((h, t)) => (h, t.trim()),
+            None => (rest, ""),
+        };
+        match head {
+            "" | "show" | "status" => {
+                let listing = match tail {
+                    "" => self.agent.memory().listing(),
+                    name => match Layer::parse(name) {
+                        Ok(layer) => self.layer_listing(layer),
+                        Err(e) => {
+                            self.status = e;
+                            return;
+                        }
+                    },
+                };
+                self.entries.push(Entry::Info(listing));
+            }
+            "routes" => {
+                let routes = self.agent.memory().routes();
+                let text = if routes.is_empty() {
+                    "маршрутизатор ещё ничего не раскладывал".to_string()
+                } else {
+                    routes
+                        .iter()
+                        .map(|(layer, key, reason)| format!("[{layer}] {key} — {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.entries.push(Entry::Info(text));
+            }
+            "where" => {
+                if tail.is_empty() {
+                    self.status = "usage: /mem where <ключ>".into();
+                    return;
+                }
+                self.status = match self.agent.memory().find(tail) {
+                    Some((layer, r)) => format!("`{}` лежит в слое {layer}: {}", r.key, r.value),
+                    None => format!("ключа `{tail}` нет ни в одном слое"),
+                };
+            }
+            "task" => {
+                if tail.is_empty() {
+                    self.status = format!(
+                        "рабочая память задачи `{}`, краткосрочная — диалога `{}`",
+                        self.agent.memory().task(),
+                        self.agent.memory().session_scope()
+                    );
+                    return;
+                }
+                self.agent.memory_mut().set_task(tail);
+                let task = self.agent.memory().task().to_string();
+                self.session.set_memory_task(&task);
+                self.status = format!(
+                    "задача `{task}`: рабочая память {} записей (долговременная не тронута)",
+                    self.agent.memory().len(Layer::Working)
+                );
+                self.save_session();
+            }
+            "clear" => match Layer::parse(tail) {
+                Ok(layer) => {
+                    let n = self.agent.memory_mut().clear(layer);
+                    self.status = format!("слой {layer} очищен ({n} записей)");
+                }
+                Err(e) => self.status = format!("{e}; usage: /mem clear <short|working|long>"),
+            },
+            "del" | "delete" | "rm" => {
+                if tail.is_empty() {
+                    self.status = "usage: /mem del <ключ>".into();
+                    return;
+                }
+                let found = self.agent.memory().find(tail).map(|(l, _)| l);
+                self.status = match found {
+                    Some(layer) => {
+                        self.agent.memory_mut().remove(layer, tail);
+                        format!("`{tail}` удалён из слоя {layer}")
+                    }
+                    None => format!("ключа `{tail}` нет ни в одном слое"),
+                };
+            }
+            // `/mem <слой> ...` — правка конкретного слоя.
+            other => match Layer::parse(other) {
+                Ok(layer) => self.cmd_mem_layer(layer, tail),
+                Err(_) => self.status = MEM_USAGE.into(),
+            },
+        }
+    }
+
+    /// Вторая половина `/mem`: операции внутри названного слоя.
+    fn cmd_mem_layer(&mut self, layer: Layer, rest: &str) {
+        let (op, tail) = match rest.split_once(char::is_whitespace) {
+            Some((o, t)) => (o, t.trim()),
+            None => (rest, ""),
+        };
+        match op {
+            "" | "show" => self
+                .entries
+                .push(Entry::Info(self.layer_listing(layer))),
+            "set" => {
+                let Some((key, value)) = tail.split_once(char::is_whitespace) else {
+                    self.status = format!("usage: /mem {layer} set <ключ> <значение>");
+                    return;
+                };
+                let key = key.trim();
+                let was = self.agent.memory().get(layer, key).map(str::to_string);
+                self.agent.memory_mut().set(layer, key, value.trim());
+                self.status = match was {
+                    Some(old) => format!("[{layer}] `{key}` обновлён (было: {old})"),
+                    None => format!("[{layer}] `{key}` добавлен"),
+                };
+            }
+            "del" | "delete" | "rm" => {
+                if tail.is_empty() {
+                    self.status = format!("usage: /mem {layer} del <ключ>");
+                    return;
+                }
+                self.status = if self.agent.memory_mut().remove(layer, tail) {
+                    format!("[{layer}] `{tail}` удалён")
+                } else {
+                    format!("[{layer}] ключа `{tail}` нет")
+                };
+            }
+            "clear" => {
+                let n = self.agent.memory_mut().clear(layer);
+                self.status = format!("слой {layer} очищен ({n} записей)");
+            }
+            _ => self.status = MEM_USAGE.into(),
+        }
+    }
+
+    /// Один слой глазами `/mem show <слой>`: путь файла, записи и причины,
+    /// по которым они туда попали.
+    fn layer_listing(&self, layer: Layer) -> String {
+        let m = self.agent.memory();
+        let mut lines = vec![
+            format!("[{}] {} — {}", layer.label(), layer.title(), layer.describe()),
+            format!("файл: {}", m.path(layer).display()),
+            format!("в слое {} из {} записей всей памяти", m.len(layer), m.total()),
+        ];
+        if m.records(layer).is_empty() {
+            lines.push("пусто".into());
+        } else {
+            for r in m.records(layer) {
+                lines.push(format!("- {}: {}  ({}, {})", r.key, r.value, r.source, r.reason));
+            }
+        }
+        lines.join("\n")
     }
 
     /// `/checkpoint [имя]` — отметить точку, от которой потом форкать ветки.
@@ -2318,6 +2523,38 @@ impl App {
         }
     }
 
+    /// Раскладка последних реплик по слоям памяти перед ходом. Как и
+    /// `maintain_facts`: настоящий запрос, под спиннером, отменяем, и ни
+    /// отмена, ни ошибка не теряют реплику — ход уйдёт со старой памятью.
+    fn maintain_memory(&mut self, history: &[ChatMessage], terminal: &mut DefaultTerminal) {
+        self.sync_agent_settings();
+        if self.settings.context_strategy != config::ContextStrategy::Memory {
+            return;
+        }
+        let mut worker = self.prepared_agent();
+        worker.set_memory(self.agent.memory().clone());
+        let hist = history.to_vec();
+        let result = self.with_spinner(terminal, "раскладываю память", move || {
+            worker.update_memory(&hist).map(|delta| (worker, delta))
+        });
+        match result {
+            Some(Ok((updated, delta))) => {
+                // Экстракцию делал клон агента — забираем память обратно.
+                self.agent.set_memory(updated.memory().clone());
+                self.save_session();
+                if delta.touched() > 0 {
+                    self.status = format!(
+                        "память обновлена: {} (слои: {})",
+                        delta.line(),
+                        self.agent.memory().status_line()
+                    );
+                }
+            }
+            Some(Err(e)) => self.status = format!("память не обновлена ({e}) — шлю со старой"),
+            None => self.status = "раскладка памяти отменена — шлю со старой".into(),
+        }
+    }
+
     fn send_message(&mut self, question: String, terminal: &mut DefaultTerminal) {
         self.session.push_user(question.clone());
         self.entries.push(Entry::User(question));
@@ -2331,6 +2568,9 @@ impl App {
         // Факты обновляем ДО отправки хода: то, что пользователь только что
         // сказал, должно участвовать уже в этом ответе.
         self.maintain_facts(&history, terminal);
+        // То же и для слоёв памяти: сказанное сейчас должно успеть попасть в
+        // свой слой и повлиять уже на этот ответ.
+        self.maintain_memory(&history, terminal);
         // Size of exactly what goes out, captured before the reply lands:
         // dividing it by the provider's `prompt_tokens` is what calibrates
         // the footer's estimates (see `tokens.rs`).
@@ -2736,6 +2976,12 @@ impl App {
                         .len(),
                     self.agent.facts().len()
                 ),
+                config::ContextStrategy::Memory => format!(
+                    "{st} {}/{history_len} · {}",
+                    crate::strategy::window(&self.session.history(), self.settings.keep_recent)
+                        .len(),
+                    self.agent.memory().status_line()
+                ),
                 config::ContextStrategy::Branch => format!(
                     "{st} {}·{}",
                     self.session.tree().active_name(),
@@ -2957,6 +3203,11 @@ impl App {
                         "; N={}, фактов {}",
                         self.settings.keep_recent,
                         self.agent.facts().len()
+                    ),
+                    config::ContextStrategy::Memory => format!(
+                        "; N={}, {}",
+                        self.settings.keep_recent,
+                        self.agent.memory().status_line()
                     ),
                     config::ContextStrategy::Branch => {
                         format!("; {}", self.session.tree().line())
@@ -3330,6 +3581,9 @@ const HELP: &str = "\
 /strategy [show|off|summary|window|facts|branch]  context-management strategy
 /strategy keep N | every N    window size / how often summary folds (/compress is an alias)
 /facts [show|clear|set k v|del k]  key-value memory used by strategy `facts`
+/mem [show [layer]|routes|where k]  three memory layers: short / working / long
+/mem <layer> set k v | del k      write to a layer by hand (layer = short|working|long)
+/mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /checkpoint [name]        mark the current point so branches can fork from it
 /branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
 /settings                 open the settings panel (Tab on an empty input)
@@ -3822,7 +4076,7 @@ mod tests {
         app.adjust_setting(-1);
         assert_eq!(
             app.settings.context_strategy,
-            config::ContextStrategy::Branch
+            *config::ContextStrategy::ALL.last().unwrap()
         );
     }
 
@@ -3906,6 +4160,106 @@ mod tests {
         app.cmd_facts("set цель стенд");
         app.cmd_strategy("off");
         assert!(!app.agent.system_for_request().contains("цель: стенд"));
+    }
+
+    #[test]
+    fn mem_command_writes_layers_and_each_block_reaches_system_separately() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_strategy("memory");
+        app.cmd_mem("long set профиль.язык русский");
+        app.cmd_mem("working set задача.срок две недели");
+        app.cmd_mem("short set тема.сейчас память");
+        assert_eq!(
+            app.agent.memory().get(Layer::Long, "профиль.язык"),
+            Some("русский")
+        );
+
+        // Три отдельных блока в system, по одному на слой.
+        let system = app.agent.system_for_request();
+        for layer in Layer::ALL {
+            assert!(
+                system.contains(layer.title()),
+                "нет блока слоя {layer}: {system}"
+            );
+        }
+        assert!(system.contains("профиль.язык: русский"));
+
+        // Слой снимается по одному — это и есть рычаг проверки влияния.
+        app.cmd_mem("clear long");
+        let system = app.agent.system_for_request();
+        assert!(!system.contains("профиль.язык"));
+        assert!(system.contains("задача.срок: две недели"));
+
+        // `/mem del` находит ключ сам и говорит, из какого слоя удалил.
+        app.cmd_mem("del задача.срок");
+        assert!(app.status.contains("working"), "{}", app.status);
+        assert!(app.agent.memory().find("задача.срок").is_none());
+
+        // Со стратегией off слои на провод не уходят вовсе.
+        app.cmd_strategy("off");
+        assert!(!app.agent.system_for_request().contains("тема.сейчас"));
+        app.cmd_mem("непонятно что");
+        assert!(app.status.starts_with("/mem"), "{}", app.status);
+    }
+
+    #[test]
+    fn mem_routes_records_by_key_prefix_not_by_the_layer_asked_for() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        // Человек назвал слой явно — маршрутизатор не спорит.
+        app.cmd_mem("short set профиль.язык русский");
+        assert_eq!(
+            app.agent.memory().find("профиль.язык").map(|(l, _)| l),
+            Some(Layer::Short),
+            "ручная правка сильнее префикса"
+        );
+        // А вот экстрактора префикс поправляет.
+        let ops =
+            crate::memory::parse_ops(r#"{"ops":[{"op":"add","layer":"short","key":"профиль.код","value":"X1"}]}"#)
+                .unwrap();
+        let delta = app.agent.memory_mut().apply_ops(&ops);
+        assert_eq!(delta.overrides.len(), 1);
+        assert_eq!(
+            app.agent.memory().find("профиль.код").map(|(l, _)| l),
+            Some(Layer::Long)
+        );
+    }
+
+    #[test]
+    fn switching_the_task_swaps_the_working_layer_only() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_strategy("memory");
+        app.cmd_mem("long set профиль.язык русский");
+        app.cmd_mem("working set задача.код ALPHA1");
+        app.cmd_mem("task отчёт");
+        assert_eq!(app.agent.memory().task(), "отчёт");
+        assert!(
+            app.agent.memory().get(Layer::Working, "задача.код").is_none(),
+            "рабочий слой новой задачи пуст"
+        );
+        assert_eq!(
+            app.agent.memory().get(Layer::Long, "профиль.язык"),
+            Some("русский"),
+            "долговременный слой переживает смену задачи"
+        );
+        // Сессия запоминает задачу, чтобы следующий запуск поднял тот же файл.
+        assert_eq!(app.session.memory_task(), "отчёт");
+        let system = app.agent.system_for_request();
+        assert!(system.contains("профиль.язык") && !system.contains("задача.код"));
+    }
+
+    #[test]
+    fn a_new_chat_drops_the_short_layer_and_keeps_the_rest() {
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_strategy("memory");
+        app.cmd_mem("short set тема.сейчас память");
+        app.cmd_mem("long set профиль.язык русский");
+        app.session.push_user("вопрос".into());
+        app.new_chat();
+        assert_eq!(app.agent.memory().len(Layer::Short), 0);
+        assert_eq!(
+            app.agent.memory().get(Layer::Long, "профиль.язык"),
+            Some("русский")
+        );
     }
 
     #[test]

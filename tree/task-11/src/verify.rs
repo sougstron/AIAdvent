@@ -8,12 +8,13 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{Agent, Reply};
 use crate::api::{self, ChatMessage, DEFAULT_BASE_URL, LIVE_COMPLETION_MODEL};
 use crate::branch::BranchStore;
 use crate::config::{self, ContextStrategy, Res, Settings, DEFAULT_MODEL};
+use crate::memory::{self, Layer, MemoryStore};
 use crate::session::StoredMessage;
 
 const PING_PROMPT: &str = "Reply with the single word PONG.";
@@ -1662,11 +1663,970 @@ fn to_messages(path: &[StoredMessage]) -> Vec<ChatMessage> {
     path.iter().map(StoredMessage::to_chat_message).collect()
 }
 
+
+// ------------------------------------------------ модель памяти (задача 11)
+
+/// Токены проверок памяти. Каждый посажен ровно в один слой, и вопрос про
+/// него отвечается только из этого слоя.
+pub const PROFILE_TOKEN: &str = "PELICAN3288";
+pub const TASK_TOKEN: &str = "OTTER5514";
+
+const MEMORY_KEEP: usize = 4;
+const PROFILE_KEY: &str = "профиль.код";
+const TASK_KEY: &str = "задача.код";
+const PROFILE_QUESTION: &str = "Какой мой личный код я просил запомнить навсегда? Ответь одним словом — только кодом. Если не знаешь, ответь NONE.";
+const TASK_QUESTION: &str = "Какой код текущей задачи я называл? Ответь одним словом — только кодом. Если не знаешь, ответь NONE.";
+
+/// Что именно проверяем в модели памяти.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemoryCheck {
+    /// Маршрутизация: что в какой слой попадает и что от этого на диске.
+    Routing,
+    /// Влияние слоя на ответ: по блоку за раз.
+    Influence,
+    /// Разделение слоёв: смена задачи уносит рабочую память и не трогает
+    /// долговременную.
+    Isolation,
+}
+
+impl MemoryCheck {
+    pub const ALL: [MemoryCheck; 3] = [
+        MemoryCheck::Routing,
+        MemoryCheck::Influence,
+        MemoryCheck::Isolation,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MemoryCheck::Routing => "routing",
+            MemoryCheck::Influence => "influence",
+            MemoryCheck::Isolation => "isolation",
+        }
+    }
+
+    /// `routing|influence|isolation|all`.
+    pub fn parse(s: &str) -> Res<Vec<MemoryCheck>> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Ok(MemoryCheck::ALL.to_vec()),
+            "routing" | "route" | "layers" => Ok(vec![MemoryCheck::Routing]),
+            "influence" | "answers" => Ok(vec![MemoryCheck::Influence]),
+            "isolation" | "separation" => Ok(vec![MemoryCheck::Isolation]),
+            other => Err(format!(
+                "unknown memory check `{other}`; expected routing, influence, isolation or all"
+            )),
+        }
+    }
+}
+
+/// Одна запись, прошедшая через маршрутизатор.
+#[derive(Clone, Debug)]
+pub struct RouteCase {
+    pub key: String,
+    /// Слой, который назвал экстрактор (или `-`, если не называл).
+    pub asked: String,
+    pub landed: Layer,
+    pub expected: Layer,
+    pub reason: String,
+}
+
+impl RouteCase {
+    fn ok(&self) -> bool {
+        self.landed == self.expected
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "{:<20} просили {:<8} → лёг в {:<8} ({}) {}",
+            self.key,
+            self.asked,
+            self.landed.label(),
+            self.reason,
+            if self.ok() { "OK" } else { "НЕ ТУДА" }
+        )
+    }
+}
+
+/// Что реально лежит в файле слоя после раскладки.
+#[derive(Clone, Debug)]
+pub struct LayerFileView {
+    pub layer: Layer,
+    pub path: String,
+    pub keys: Vec<String>,
+}
+
+impl RoutingReport {
+    /// Сколько живых вызовов сделала проверка: с `--offline` — ноль.
+    pub fn calls_live(&self) -> usize {
+        self.live.as_ref().map(|l| l.calls).unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoutingReport {
+    /// Чистый маршрутизатор: фиксированный набор записей, ноль запросов.
+    pub cases: Vec<RouteCase>,
+    /// Файлы трёх слоёв, перечитанные с диска после раскладки.
+    pub files: Vec<LayerFileView>,
+    /// Живая часть: настоящий экстрактор на коротком разговоре.
+    pub live: Option<LiveRouting>,
+    pub verdict: ContextVerdict,
+}
+
+/// Живая половина проверки маршрутизации.
+#[derive(Clone, Debug)]
+pub struct LiveRouting {
+    /// Модель, у которой спрашивали. Какая ответила, здесь не видно: вызов
+    /// экстрактора живёт внутри `Agent::update_memory` и наружу отдаёт
+    /// только раскладку — врать про «ответила X» ради красивой строки не
+    /// станем.
+    pub asked_model: String,
+    pub calls: usize,
+    pub errors: Vec<String>,
+    /// Куда экстрактор разложил записи: (слой, ключ, причина).
+    pub routes: Vec<(Layer, String, String)>,
+    /// В каком слое оказался посаженный токен профиля / задачи.
+    pub profile_layer: Option<Layer>,
+    pub task_layer: Option<Layer>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InfluenceReport {
+    pub model: String,
+    pub asked_model: String,
+    pub calls: usize,
+    pub messages: usize,
+    pub keep_recent: usize,
+    pub layers: String,
+    /// Окно без блоков памяти — контроль: оба токена должны быть забыты.
+    pub window_profile: ContextProbe,
+    pub window_task: ContextProbe,
+    /// То же окно плюс три блока памяти.
+    pub memory_profile: ContextProbe,
+    pub memory_task: ContextProbe,
+    /// То же самое, но долговременный слой снят. Разница с предыдущим
+    /// прогоном — ровно один блок.
+    pub without_long_profile: ContextProbe,
+    pub without_long_task: ContextProbe,
+    pub verdict: ContextVerdict,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemIsolationReport {
+    pub model: String,
+    pub asked_model: String,
+    pub calls: usize,
+    pub task_a: String,
+    pub task_b: String,
+    /// Задача A: знает оба кода.
+    pub a_profile: ContextProbe,
+    pub a_task: ContextProbe,
+    /// Задача B: долговременный слой при ней, рабочий — чужой, пустой.
+    pub b_profile: ContextProbe,
+    pub b_task: ContextProbe,
+    /// Файл рабочего слоя задачи A после переключения: данные не потеряны,
+    /// они просто не на проводе.
+    pub a_file: String,
+    pub a_file_keeps_token: bool,
+    pub verdict: ContextVerdict,
+}
+
+/// Отчёт одной проверки памяти.
+#[derive(Clone, Debug)]
+pub enum MemoryReport {
+    Routing(RoutingReport),
+    // Отчёты живых проверок толще офлайновой раскладки (шесть и четыре
+    // вызова против нуля) — держим их за боксом, чтобы перечисление не
+    // раздувалось до размера самого большого варианта.
+    Influence(Box<InfluenceReport>),
+    Isolation(Box<MemIsolationReport>),
+}
+
+impl MemoryReport {
+    pub fn verdict(&self) -> ContextVerdict {
+        match self {
+            MemoryReport::Routing(r) => r.verdict,
+            MemoryReport::Influence(r) => r.verdict,
+            MemoryReport::Isolation(r) => r.verdict,
+        }
+    }
+
+    pub fn confirmed(&self) -> bool {
+        self.verdict() == ContextVerdict::Confirmed
+    }
+
+    pub fn calls(&self) -> usize {
+        match self {
+            MemoryReport::Routing(r) => r.calls_live(),
+            MemoryReport::Influence(r) => r.calls,
+            MemoryReport::Isolation(r) => r.calls,
+        }
+    }
+
+    pub fn status_line(&self) -> String {
+        match self {
+            MemoryReport::Routing(r) => format!(
+                "routing: verdict={} правильно разложено {}/{}{}",
+                r.verdict.as_str(),
+                r.cases.iter().filter(|c| c.ok()).count(),
+                r.cases.len(),
+                match &r.live {
+                    Some(l) => format!(
+                        ", живьём профиль→{} задача→{}",
+                        l.profile_layer.map(|x| x.label()).unwrap_or("нигде"),
+                        l.task_layer.map(|x| x.label()).unwrap_or("нигде")
+                    ),
+                    None => ", живая часть пропущена (--offline)".into(),
+                }
+            ),
+            MemoryReport::Influence(r) => format!(
+                "influence: verdict={} окно забыло={} память вернула={} без long-слоя профиль={} задача={}",
+                r.verdict.as_str(),
+                !r.window_profile.recalled() && !r.window_task.recalled(),
+                r.memory_profile.recalled() && r.memory_task.recalled(),
+                r.without_long_profile.recalled(),
+                r.without_long_task.recalled()
+            ),
+            MemoryReport::Isolation(r) => format!(
+                "isolation: verdict={} задача A (профиль={} задача={}) → задача B (профиль={} задача={}), файл A хранит код={}",
+                r.verdict.as_str(),
+                r.a_profile.recalled(),
+                r.a_task.recalled(),
+                r.b_profile.recalled(),
+                r.b_task.recalled(),
+                r.a_file_keeps_token
+            ),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            MemoryReport::Routing(r) => {
+                let mut out = String::from(
+                    "== модель памяти: маршрутизация (что и куда сохраняется) ==\n\n-- чистый маршрутизатор, без сети --\n",
+                );
+                for c in &r.cases {
+                    out.push_str(&format!("{}\n", c.line()));
+                }
+                out.push_str("\n-- файлы слоёв после раскладки --\n");
+                for f in &r.files {
+                    out.push_str(&format!(
+                        "[{}] {}\n  ключи: {}\n",
+                        f.layer.label(),
+                        f.path,
+                        if f.keys.is_empty() {
+                            "(пусто)".to_string()
+                        } else {
+                            f.keys.join(", ")
+                        }
+                    ));
+                }
+                match &r.live {
+                    Some(l) => {
+                        out.push_str(&format!(
+                            "\n-- живой экстрактор на модели {}: вызовов {} --\n",
+                            l.asked_model, l.calls
+                        ));
+                        for (layer, key, reason) in &l.routes {
+                            out.push_str(&format!("[{}] {key} — {reason}\n", layer.label()));
+                        }
+                        if !l.errors.is_empty() {
+                            out.push_str(&format!("ошибки разбора: {}\n", l.errors.join("; ")));
+                        }
+                        out.push_str(&format!(
+                            "код профиля ({PROFILE_TOKEN}) оказался в слое {}, код задачи ({TASK_TOKEN}) — в слое {}\n",
+                            l.profile_layer.map(|x| x.label()).unwrap_or("нигде"),
+                            l.task_layer.map(|x| x.label()).unwrap_or("нигде")
+                        ));
+                    }
+                    None => out.push_str("\n-- живая часть пропущена (--offline) --\n"),
+                }
+                out.push_str(&format!("=> {}\n", r.verdict.as_str()));
+                out.push_str(
+                    "Confirmed требует, чтобы каждая запись легла в ожидаемый слой И чтобы это было видно в файле именно этого слоя, \
+а живой экстрактор посадил код профиля в long, а код задачи — в working. Leaky — запись оказалась не в своём слое.\n",
+                );
+                out
+            }
+            MemoryReport::Influence(r) => {
+                let mut out = format!(
+                    "== модель памяти: влияние слоёв на ответ ==\nмодель: просили {}, ответила {}\nразговор {} сообщений, keep_recent={}, живых вызовов {}\nслои: {}\n\n",
+                    r.asked_model,
+                    model_or_q(&r.model),
+                    r.messages,
+                    r.keep_recent,
+                    r.calls,
+                    r.layers
+                );
+                out.push_str(&format!(
+                    "-- код профиля (token={PROFILE_TOKEN}, лежит в слое long) --\n{}\n{}\n{}\n\n",
+                    r.window_profile.line(),
+                    r.memory_profile.line(),
+                    r.without_long_profile.line()
+                ));
+                out.push_str(&format!(
+                    "-- код задачи (token={TASK_TOKEN}, лежит в слое working) --\n{}\n{}\n{}\n\n",
+                    r.window_task.line(),
+                    r.memory_task.line(),
+                    r.without_long_task.line()
+                ));
+                out.push_str(&format!(
+                    "prompt_tokens: окно {} | память {} | память без long {}\n",
+                    r.window_profile.call.prompt_tokens,
+                    r.memory_profile.call.prompt_tokens,
+                    r.without_long_profile.call.prompt_tokens
+                ));
+                out.push_str(&format!("=> {}\n", r.verdict.as_str()));
+                out.push_str(
+                    "Confirmed требует адресной подписи: окно без памяти потеряло ОБА кода, память вернула ОБА, \
+а снятие одного только долговременного блока убирает код профиля и оставляет код задачи. Между вторым и третьим прогоном \
+отличается ровно один блок в system, поэтому приписать разницу больше нечему. Leaky — окно не резало.\n",
+                );
+                out
+            }
+            MemoryReport::Isolation(r) => {
+                let mut out = format!(
+                    "== модель памяти: разделение слоёв (смена задачи) ==\nмодель: просили {}, ответила {}\nживых вызовов {}\nзадача A = `{}`, задача B = `{}`\n\n",
+                    r.asked_model,
+                    model_or_q(&r.model),
+                    r.calls,
+                    r.task_a,
+                    r.task_b
+                );
+                out.push_str(&format!(
+                    "-- задача A (рабочий слой A + долговременный) --\n{}\n{}\n\n",
+                    r.a_profile.line(),
+                    r.a_task.line()
+                ));
+                out.push_str(&format!(
+                    "-- задача B (рабочий слой B, пустой + тот же долговременный) --\n{}\n{}\n\n",
+                    r.b_profile.line(),
+                    r.b_task.line()
+                ));
+                out.push_str(&format!(
+                    "файл рабочего слоя A: {}\n  код задачи всё ещё в файле: {}\n",
+                    r.a_file, r.a_file_keeps_token
+                ));
+                out.push_str(&format!("=> {}\n", r.verdict.as_str()));
+                out.push_str(
+                    "Confirmed требует асимметрии: после смены задачи долговременный код всё ещё помнится, рабочий — честно ЗАБЫТ, \
+и при этом он не потерян, а лежит в файле своей задачи. Leaky — рабочая память чужой задачи доехала до провода.\n",
+                );
+                out
+            }
+        }
+    }
+}
+
+/// `--verify-memory`: запускает выбранные проверки последовательно.
+pub fn run_memory(
+    checks: &[MemoryCheck],
+    model: Option<&str>,
+    offline: bool,
+) -> Res<Vec<MemoryReport>> {
+    let mut out = Vec::new();
+    for check in checks {
+        out.push(match check {
+            MemoryCheck::Routing => MemoryReport::Routing(run_routing(model, offline)?),
+            MemoryCheck::Influence => MemoryReport::Influence(Box::new(run_influence(model)?)),
+            MemoryCheck::Isolation => MemoryReport::Isolation(Box::new(run_mem_isolation(model)?)),
+        });
+    }
+    Ok(out)
+}
+
+/// Настройки проверок памяти: как у проверок стратегий, но с
+/// `temperature=0`.
+///
+/// Здесь шесть-семь живых вопросов подряд, и каждый — «назови код или
+/// NONE». Свободная сэмплировка добавляет к этому шум, который к памяти
+/// отношения не имеет: модель иногда выдаёт единственный оставшийся код на
+/// любой вопрос. Ноль не смягчает критерий (подпись всё та же), он убирает
+/// разброс, который иначе выдаёт честный, но случайный `Flat`.
+fn memory_settings(model: Option<&str>) -> Res<Settings> {
+    let mut settings = context_settings(model)?;
+    settings.temperature = Some(0.0);
+    Ok(settings)
+}
+
+/// Временный корень памяти: три папки, которые никому больше не мешают.
+fn memory_scratch(label: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "ask-verify-mem-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&path);
+    path
+}
+
+/// Проверка маршрутизации.
+///
+/// Первая половина — без сети: фиксированный набор записей (включая одну с
+/// нарочно неверной подсказкой слоя и одну вообще без подсказки) проходит
+/// через тот же `MemoryStore`, что и приложение, после чего файлы слоёв
+/// перечитываются с диска. Проверяется не намерение, а то, что лежит в
+/// файле.
+///
+/// Вторая половина — живая: настоящий экстрактор на коротком разговоре, где
+/// посажены личный код и код задачи. Confirmed требует, чтобы он положил их
+/// в разные слои, и именно в те.
+pub fn run_routing(model: Option<&str>, offline: bool) -> Res<RoutingReport> {
+    let root = memory_scratch("routing");
+    let mut store = MemoryStore::open(&root, "verify-session", "verify-task");
+
+    // Первая запись приходит с подсказкой `long`, но ключ размечен как
+    // рабочий: детерминированное правило обязано победить модель.
+    let ops = vec![
+        memory::Op::Upsert {
+            key: "профиль.язык".into(),
+            value: "русский".into(),
+            layer: Some(Layer::Long),
+        },
+        memory::Op::Upsert {
+            key: "задача.срок".into(),
+            value: "две недели".into(),
+            layer: Some(Layer::Long),
+        },
+        memory::Op::Upsert {
+            key: "тема.сейчас".into(),
+            value: "обсуждаем модель памяти".into(),
+            layer: Some(Layer::Short),
+        },
+        memory::Op::Upsert {
+            key: "решение.хранилище".into(),
+            value: "три папки, по файлу на слой".into(),
+            layer: None,
+        },
+        memory::Op::Upsert {
+            key: "бюджет".into(),
+            value: "не обсуждали".into(),
+            layer: None,
+        },
+    ];
+    let expected = [
+        ("профиль.язык", Layer::Long),
+        ("задача.срок", Layer::Working),
+        ("тема.сейчас", Layer::Short),
+        ("решение.хранилище", Layer::Long),
+        // Ни префикса, ни подсказки — по умолчанию рабочий слой, а не
+        // долговременный профиль.
+        ("бюджет", Layer::Working),
+    ];
+    let delta = store.apply_ops(&ops);
+    let mut cases = Vec::new();
+    for (key, want) in expected {
+        let (landed, reason) = delta
+            .routes
+            .iter()
+            .find(|(_, k, _)| k == key)
+            .map(|(l, _, r)| (*l, r.clone()))
+            .unwrap_or((Layer::Working, "не размечено".into()));
+        let asked = ops
+            .iter()
+            .find_map(|op| match op {
+                memory::Op::Upsert { key: k, layer, .. } if k == key => {
+                    Some(layer.map(|l| l.label().to_string()).unwrap_or("-".into()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "-".into());
+        cases.push(RouteCase {
+            key: key.to_string(),
+            asked,
+            landed,
+            expected: want,
+            reason,
+        });
+    }
+
+    // Перечитываем файлы с диска новым стором: проверяем хранилище, а не
+    // оперативку.
+    let reread = MemoryStore::open(&root, "verify-session", "verify-task");
+    let files: Vec<LayerFileView> = Layer::ALL
+        .iter()
+        .map(|layer| LayerFileView {
+            layer: *layer,
+            path: reread.path(*layer).display().to_string(),
+            keys: reread
+                .records(*layer)
+                .iter()
+                .map(|r| r.key.clone())
+                .collect(),
+        })
+        .collect();
+    let on_disk_ok = expected.iter().all(|(key, want)| {
+        Layer::ALL.iter().all(|layer| {
+            let here = reread.get(*layer, key).is_some();
+            here == (*layer == *want)
+        })
+    });
+
+    let live = if offline {
+        None
+    } else {
+        Some(live_routing(model, &root)?)
+    };
+    let verdict = judge_routing(&cases, on_disk_ok, live.as_ref());
+    let _ = fs::remove_dir_all(&root);
+    Ok(RoutingReport {
+        cases,
+        files,
+        live,
+        verdict,
+    })
+}
+
+/// Живая половина маршрутизации: экстрактор гоняется ровно так, как это
+/// делает TUI, — после каждой реплики пользователя.
+fn live_routing(model: Option<&str>, root: &Path) -> Res<LiveRouting> {
+    let mut settings = memory_settings(model)?;
+    settings.keep_recent = MEMORY_KEEP;
+    settings.context_strategy = ContextStrategy::Memory;
+    let asked_model = settings.model.clone();
+    let mut agent = Agent::new(settings)?;
+    agent.set_context_enabled(false);
+    agent.set_memory(MemoryStore::open(root, "verify-live", "verify-live"));
+
+    let dialogue = memory_dialogue();
+    let mut calls = 0usize;
+    let mut errors = Vec::new();
+    let mut routes: Vec<(Layer, String, String)> = Vec::new();
+    for i in 0..dialogue.len() {
+        if dialogue[i].role != crate::api::Role::User {
+            continue;
+        }
+        calls += 1;
+        match agent.update_memory(&dialogue[..=i]) {
+            Ok(delta) => routes.extend(delta.routes),
+            Err(e) => errors.push(e),
+        }
+    }
+    let profile_layer = layer_holding(agent.memory(), PROFILE_TOKEN);
+    let task_layer = layer_holding(agent.memory(), TASK_TOKEN);
+    Ok(LiveRouting {
+        asked_model,
+        calls,
+        errors,
+        routes,
+        profile_layer,
+        task_layer,
+    })
+}
+
+/// В каком слое лежит значение с этим токеном.
+fn layer_holding(store: &MemoryStore, token: &str) -> Option<Layer> {
+    Layer::ALL.iter().copied().find(|layer| {
+        store
+            .records(*layer)
+            .iter()
+            .any(|r| has_token(&r.value, token))
+    })
+}
+
+/// Причинная подпись маршрутизации: файл, а не намерение.
+///
+/// * Хоть одна запись легла не в свой слой → `Leaky`.
+/// * На диске запись видна не в том файле (или видна в двух) → `Leaky`.
+/// * Живой экстрактор не положил посаженные коды в разные ожидаемые слои →
+///   `Inconclusive`: маршрутизатор-то прав, а вот доказать живой путь нечем.
+fn judge_routing(
+    cases: &[RouteCase],
+    on_disk_ok: bool,
+    live: Option<&LiveRouting>,
+) -> ContextVerdict {
+    if !cases.iter().all(RouteCase::ok) || !on_disk_ok {
+        return ContextVerdict::Leaky;
+    }
+    match live {
+        None => ContextVerdict::Confirmed,
+        Some(l) => {
+            if l.profile_layer == Some(Layer::Long) && l.task_layer == Some(Layer::Working) {
+                ContextVerdict::Confirmed
+            } else {
+                ContextVerdict::Inconclusive
+            }
+        }
+    }
+}
+
+/// Проверка влияния слоёв на ответ.
+///
+/// Память набивается вручную — ровно так, как её набивает человек через
+/// `/mem long set ...`: проверка про влияние слоя на ответ не должна падать
+/// из-за того, что экстрактор в этот раз выбрал другой ключ (за него
+/// отвечает `routing`). Дальше один и тот же разговор и одни и те же два
+/// вопроса задаются трижды, и между вторым и третьим прогоном отличается
+/// ровно один блок в system.
+pub fn run_influence(model: Option<&str>) -> Res<InfluenceReport> {
+    let root = memory_scratch("influence");
+    let mut settings = memory_settings(model)?;
+    settings.keep_recent = MEMORY_KEEP;
+    settings.context_strategy = ContextStrategy::Window;
+    let asked_model = settings.model.clone();
+    let mut agent = Agent::new(settings)?;
+    agent.set_context_enabled(false);
+
+    let mut store = MemoryStore::open(&root, "influence", "стенд");
+    store.set(Layer::Long, PROFILE_KEY, PROFILE_TOKEN);
+    store.set(Layer::Working, TASK_KEY, TASK_TOKEN);
+    store.set(Layer::Short, "тема.сейчас", "проверяем модель памяти");
+    let layers = store.status_line();
+    agent.set_memory(store);
+
+    let dialogue = memory_dialogue();
+    // 1. Окно без блоков памяти: оба кода уехали за границу окна.
+    let window_profile = ContextProbe {
+        label: "window (без памяти)".into(),
+        token: PROFILE_TOKEN,
+        call: ask_call(&agent, &dialogue, PROFILE_QUESTION)?,
+    };
+    let window_task = ContextProbe {
+        label: "window (без памяти)".into(),
+        token: TASK_TOKEN,
+        call: ask_call(&agent, &dialogue, TASK_QUESTION)?,
+    };
+
+    // 2. То же окно плюс три блока памяти в system.
+    agent.set_strategy(ContextStrategy::Memory);
+    let memory_profile = ContextProbe {
+        label: "memory (три слоя)".into(),
+        token: PROFILE_TOKEN,
+        call: ask_call(&agent, &dialogue, PROFILE_QUESTION)?,
+    };
+    let memory_task = ContextProbe {
+        label: "memory (три слоя)".into(),
+        token: TASK_TOKEN,
+        call: ask_call(&agent, &dialogue, TASK_QUESTION)?,
+    };
+
+    // 3. Снимаем ровно один блок — долговременный.
+    agent.memory_mut().clear(Layer::Long);
+    let without_long_profile = ContextProbe {
+        label: "memory без long".into(),
+        token: PROFILE_TOKEN,
+        call: ask_call(&agent, &dialogue, PROFILE_QUESTION)?,
+    };
+    let without_long_task = ContextProbe {
+        label: "memory без long".into(),
+        token: TASK_TOKEN,
+        call: ask_call(&agent, &dialogue, TASK_QUESTION)?,
+    };
+
+    let verdict = judge_influence(
+        &window_profile,
+        &window_task,
+        &memory_profile,
+        &memory_task,
+        &without_long_profile,
+        &without_long_task,
+    );
+    let _ = fs::remove_dir_all(&root);
+    Ok(InfluenceReport {
+        model: memory_profile.call.model.clone(),
+        asked_model,
+        calls: 6,
+        messages: dialogue.len(),
+        keep_recent: MEMORY_KEEP,
+        layers,
+        window_profile,
+        window_task,
+        memory_profile,
+        memory_task,
+        without_long_profile,
+        without_long_task,
+        verdict,
+    })
+}
+
+/// Причинная подпись влияния слоёв.
+///
+/// * Окно само помнит хоть один код → `Leaky`: оно не резало, и дальше
+///   доказывать нечего.
+/// * Память не вернула оба кода → `Inconclusive`.
+/// * Снятие долговременного блока не убрало код профиля → `Leaky`: ответ
+///   брался не из этого слоя.
+/// * Снятие долговременного блока убило и код задачи → `Flat`: слои не
+///   различимы по влиянию, а значит «разделены» — только на словах.
+fn judge_influence(
+    window_profile: &ContextProbe,
+    window_task: &ContextProbe,
+    memory_profile: &ContextProbe,
+    memory_task: &ContextProbe,
+    without_long_profile: &ContextProbe,
+    without_long_task: &ContextProbe,
+) -> ContextVerdict {
+    if window_profile.recalled() || window_task.recalled() {
+        return ContextVerdict::Leaky;
+    }
+    if !memory_profile.recalled() || !memory_task.recalled() {
+        return ContextVerdict::Inconclusive;
+    }
+    if without_long_profile.recalled() {
+        return ContextVerdict::Leaky;
+    }
+    if !without_long_task.recalled() {
+        return ContextVerdict::Flat;
+    }
+    ContextVerdict::Confirmed
+}
+
+/// Проверка разделения слоёв на смене задачи.
+///
+/// Вопросы задаются без истории вообще: на проводе только блоки памяти,
+/// поэтому ответ может прийти только из них. Сначала задача A (рабочая
+/// память с кодом), потом та же память при задаче B.
+pub fn run_mem_isolation(model: Option<&str>) -> Res<MemIsolationReport> {
+    let root = memory_scratch("isolation");
+    let mut settings = memory_settings(model)?;
+    settings.keep_recent = MEMORY_KEEP;
+    settings.context_strategy = ContextStrategy::Memory;
+    let asked_model = settings.model.clone();
+    let mut agent = Agent::new(settings)?;
+    agent.set_context_enabled(false);
+
+    let task_a = "стенд-альфа";
+    let task_b = "отчёт-бета";
+    let mut store = MemoryStore::open(&root, "isolation", task_a);
+    store.set(Layer::Long, PROFILE_KEY, PROFILE_TOKEN);
+    store.set(Layer::Working, TASK_KEY, TASK_TOKEN);
+    let a_file = store.path(Layer::Working).display().to_string();
+    agent.set_memory(store);
+
+    let empty: Vec<ChatMessage> = Vec::new();
+    let a_profile = ContextProbe {
+        label: format!("задача `{task_a}`"),
+        token: PROFILE_TOKEN,
+        call: ask_call(&agent, &empty, PROFILE_QUESTION)?,
+    };
+    let a_task = ContextProbe {
+        label: format!("задача `{task_a}`"),
+        token: TASK_TOKEN,
+        call: ask_call(&agent, &empty, TASK_QUESTION)?,
+    };
+
+    // Смена задачи: рабочий слой уезжает в свой файл, на его место встаёт
+    // пустой слой задачи B. Долговременный слой не трогается.
+    agent.memory_mut().set_task(task_b);
+    let b_profile = ContextProbe {
+        label: format!("задача `{task_b}`"),
+        token: PROFILE_TOKEN,
+        call: ask_call(&agent, &empty, PROFILE_QUESTION)?,
+    };
+    let b_task = ContextProbe {
+        label: format!("задача `{task_b}`"),
+        token: TASK_TOKEN,
+        call: ask_call(&agent, &empty, TASK_QUESTION)?,
+    };
+
+    let a_file_keeps_token = fs::read_to_string(&a_file)
+        .map(|s| s.contains(TASK_TOKEN))
+        .unwrap_or(false);
+    let verdict = judge_mem_isolation(&a_profile, &a_task, &b_profile, &b_task, a_file_keeps_token);
+    let report = MemIsolationReport {
+        model: a_profile.call.model.clone(),
+        asked_model,
+        calls: 4,
+        task_a: task_a.into(),
+        task_b: task_b.into(),
+        a_profile,
+        a_task,
+        b_profile,
+        b_task,
+        a_file,
+        a_file_keeps_token,
+        verdict,
+    };
+    let _ = fs::remove_dir_all(&root);
+    Ok(report)
+}
+
+/// Причинная подпись разделения слоёв.
+///
+/// * Задача A не знала своих кодов → `Inconclusive`: сравнивать не с чем.
+/// * После смены задачи рабочий код всё ещё помнится → `Leaky`: рабочие
+///   слои не разделены.
+/// * Долговременный код после смены задачи потерялся → `Flat`: слои живут
+///   одной жизнью, значит слоёв на самом деле нет.
+/// * Рабочий код исчез с провода, но пропал и из файла своей задачи →
+///   `Inconclusive`: это уже не разделение, а потеря данных.
+fn judge_mem_isolation(
+    a_profile: &ContextProbe,
+    a_task: &ContextProbe,
+    b_profile: &ContextProbe,
+    b_task: &ContextProbe,
+    a_file_keeps_token: bool,
+) -> ContextVerdict {
+    if !a_profile.recalled() || !a_task.recalled() {
+        return ContextVerdict::Inconclusive;
+    }
+    if b_task.recalled() {
+        return ContextVerdict::Leaky;
+    }
+    if !b_profile.recalled() {
+        return ContextVerdict::Flat;
+    }
+    if !a_file_keeps_token {
+        return ContextVerdict::Inconclusive;
+    }
+    ContextVerdict::Confirmed
+}
+
+/// Разговор для проверок памяти: 12 сообщений, два кода посажены в самом
+/// начале — при `keep_recent=4` оба уезжают за границу окна, и ответить на
+/// вопрос о них можно только из памяти.
+pub fn memory_dialogue() -> Vec<ChatMessage> {
+    let topics = [
+        (
+            "Задача: собрать нагрузочный стенд сервиса заказов за две недели.",
+            "Понял: стенд для сервиса заказов, срок две недели.",
+        ),
+        (
+            "Стек: Rust, PostgreSQL 16, очередь NATS, всё в Kubernetes.",
+            "Записал стек: Rust, PostgreSQL 16, NATS, Kubernetes.",
+        ),
+        (
+            "Целевая нагрузка 4000 запросов в секунду, 85 процентов чтение.",
+            "Цель 4000 rps с перекосом 85/15 зафиксирована.",
+        ),
+        (
+            "Отчёт нужен в понедельник утром: таблица сценариев и вывод.",
+            "Отчёт к понедельнику: таблица по сценариям и приоритет починки.",
+        ),
+    ];
+    let mut history = vec![
+        ChatMessage::user(format!(
+            "Запомни про меня навсегда: мой личный код — {PROFILE_TOKEN}. Он не про текущую задачу, он про меня."
+        )),
+        ChatMessage::assistant(format!("Запомнил: ваш личный код {PROFILE_TOKEN}.")),
+        ChatMessage::user(format!(
+            "А код текущей задачи — {TASK_TOKEN}. Он живёт только пока мы делаем эту задачу."
+        )),
+        ChatMessage::assistant(format!("Записал код задачи {TASK_TOKEN}.")),
+    ];
+    for (q, a) in topics {
+        history.push(ChatMessage::user(q.to_string()));
+        history.push(ChatMessage::assistant(a.to_string()));
+    }
+    history
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::compress::{Compressor, Policy};
     use crate::config::Effort;
+
+    /// Офлайн-половина проверки памяти — настоящая: она гоняет тот же
+    /// `MemoryStore`, что и приложение, и читает файлы слоёв с диска.
+    #[test]
+    fn routing_check_runs_without_a_network_and_confirms() {
+        let report = run_routing(None, true).expect("офлайн-маршрутизация не должна ходить в сеть");
+        assert_eq!(report.verdict, ContextVerdict::Confirmed);
+        assert_eq!(report.calls_live(), 0);
+        assert!(report.live.is_none());
+        // Каждый ключ виден ровно в файле своего слоя.
+        let long = report
+            .files
+            .iter()
+            .find(|f| f.layer == Layer::Long)
+            .unwrap();
+        assert!(long.keys.contains(&"профиль.язык".to_string()));
+        assert!(!long.keys.contains(&"задача.срок".to_string()));
+        let rendered = MemoryReport::Routing(report).render();
+        assert!(!rendered.contains("НЕ ТУДА"), "{rendered}");
+    }
+
+    /// Токены проверок памяти обязаны уезжать за границу окна — иначе
+    /// «память вернула факт» ничего не доказывает.
+    #[test]
+    fn memory_tokens_land_outside_the_window() {
+        let dialogue = memory_dialogue();
+        let wire = crate::strategy::window(&dialogue, MEMORY_KEEP);
+        let tail: String = wire.iter().map(|m| m.content.clone()).collect();
+        assert!(!tail.contains(PROFILE_TOKEN), "код профиля остался в окне");
+        assert!(!tail.contains(TASK_TOKEN), "код задачи остался в окне");
+    }
+
+    fn mem_probe(token: &'static str, text: &str) -> ContextProbe {
+        ContextProbe {
+            label: "t".into(),
+            token,
+            call: call("stop", 5, text),
+        }
+    }
+
+    #[test]
+    fn influence_is_confirmed_only_when_one_block_explains_the_difference() {
+        let forgot_p = mem_probe(PROFILE_TOKEN, "NONE");
+        let forgot_t = mem_probe(TASK_TOKEN, "NONE");
+        let knows_p = mem_probe(PROFILE_TOKEN, PROFILE_TOKEN);
+        let knows_t = mem_probe(TASK_TOKEN, TASK_TOKEN);
+        // Снятие long убрало код профиля и оставило код задачи — подпись.
+        assert_eq!(
+            judge_influence(&forgot_p, &forgot_t, &knows_p, &knows_t, &forgot_p, &knows_t),
+            ContextVerdict::Confirmed
+        );
+        // Окно само всё помнит — доказывать нечего.
+        assert_eq!(
+            judge_influence(&knows_p, &forgot_t, &knows_p, &knows_t, &forgot_p, &knows_t),
+            ContextVerdict::Leaky
+        );
+        // Слой сняли, а ответ не изменился — ответ брался не из него.
+        assert_eq!(
+            judge_influence(&forgot_p, &forgot_t, &knows_p, &knows_t, &knows_p, &knows_t),
+            ContextVerdict::Leaky
+        );
+        // Снятие одного слоя убило и чужой код — слои неразличимы.
+        assert_eq!(
+            judge_influence(&forgot_p, &forgot_t, &knows_p, &knows_t, &forgot_p, &forgot_t),
+            ContextVerdict::Flat
+        );
+        // Память ничего не вернула.
+        assert_eq!(
+            judge_influence(&forgot_p, &forgot_t, &forgot_p, &knows_t, &forgot_p, &knows_t),
+            ContextVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn isolation_is_confirmed_only_when_the_working_layer_is_forgotten_but_not_lost() {
+        let knows_p = mem_probe(PROFILE_TOKEN, PROFILE_TOKEN);
+        let knows_t = mem_probe(TASK_TOKEN, TASK_TOKEN);
+        let forgot_p = mem_probe(PROFILE_TOKEN, "NONE");
+        let forgot_t = mem_probe(TASK_TOKEN, "NONE");
+        assert_eq!(
+            judge_mem_isolation(&knows_p, &knows_t, &knows_p, &forgot_t, true),
+            ContextVerdict::Confirmed
+        );
+        // Рабочая память чужой задачи доехала до провода.
+        assert_eq!(
+            judge_mem_isolation(&knows_p, &knows_t, &knows_p, &knows_t, true),
+            ContextVerdict::Leaky
+        );
+        // Смена задачи снесла и долговременный слой — слоёв нет.
+        assert_eq!(
+            judge_mem_isolation(&knows_p, &knows_t, &forgot_p, &forgot_t, true),
+            ContextVerdict::Flat
+        );
+        // Забыли и потеряли — это не разделение.
+        assert_eq!(
+            judge_mem_isolation(&knows_p, &knows_t, &knows_p, &forgot_t, false),
+            ContextVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn memory_checks_parse_their_names() {
+        assert_eq!(MemoryCheck::parse("all").unwrap(), MemoryCheck::ALL.to_vec());
+        assert_eq!(
+            MemoryCheck::parse("routing").unwrap(),
+            vec![MemoryCheck::Routing]
+        );
+        assert!(MemoryCheck::parse("что-то").is_err());
+    }
 
     fn probe(
         token: &'static str,

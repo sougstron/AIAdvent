@@ -11,6 +11,7 @@ use crate::compress::{self, Compressor, Policy};
 use crate::config::{ContextStrategy, Res, Settings};
 use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
 use crate::facts::{self, FactStore, FactsDelta};
+use crate::memory::{self, MemoryStore};
 use crate::session::Session;
 use crate::strategy;
 
@@ -83,6 +84,10 @@ pub struct Agent {
     /// Key-value память диалога (см. `facts.rs`). Пустая, пока стратегия не
     /// `facts`.
     facts: FactStore,
+    /// Трёхслойная память агента (см. `memory.rs`): краткосрочная, рабочая,
+    /// долговременная. В отличие от фактов, живёт на диске и переживает
+    /// перезапуск — поэтому её не сбрасывает `reset`.
+    memory: MemoryStore,
 }
 
 impl Agent {
@@ -116,6 +121,7 @@ impl Agent {
             context: ContextBundle::empty(PathBuf::from(".")),
             compressor: Compressor::new(),
             facts: FactStore::new(),
+            memory: MemoryStore::in_memory(),
         };
         agent.refresh_context();
         agent
@@ -176,6 +182,9 @@ impl Agent {
         self.history.clear();
         self.compressor.reset();
         self.facts.reset();
+        // Память слоёв НЕ чистим: краткосрочный слой снимет владелец через
+        // `memory_mut().set_session(...)`, а рабочий и долговременный
+        // переживают новый чат — в этом их смысл.
     }
 
     /// Restore a saved chat: settings snapshot, message history, and the
@@ -208,6 +217,18 @@ impl Agent {
         self.facts = facts;
     }
 
+    pub fn memory(&self) -> &MemoryStore {
+        &self.memory
+    }
+
+    pub fn memory_mut(&mut self) -> &mut MemoryStore {
+        &mut self.memory
+    }
+
+    pub fn set_memory(&mut self, memory: MemoryStore) {
+        self.memory = memory;
+    }
+
     /// Текущая стратегия управления контекстом.
     pub fn strategy(&self) -> ContextStrategy {
         self.settings.context_strategy
@@ -237,6 +258,7 @@ impl Agent {
             history,
             &self.compressor,
             &self.facts,
+            &self.memory,
             self.settings.keep_recent,
             branch_line,
         )
@@ -277,6 +299,44 @@ impl Agent {
             Err(e) => {
                 self.facts.note_error(e.clone());
                 Err(format!("ответ экстрактора не разобран: {e}"))
+            }
+        }
+    }
+
+    /// Разложить последние реплики по трём слоям памяти.
+    ///
+    /// Устроено как `update_facts`, с одной разницей: экстрактор называет
+    /// слой, а окончательное решение принимает маршрутизатор
+    /// (`memory::route`). Ошибка разбора оставляет память как была и не
+    /// роняет ход.
+    pub fn update_memory(&mut self, history: &[ChatMessage]) -> Res<memory::Delta> {
+        if self.settings.context_strategy != ContextStrategy::Memory {
+            return Ok(memory::Delta::default());
+        }
+        let recent = memory::recent_slice(history);
+        if recent.is_empty() {
+            return Ok(memory::Delta::default());
+        }
+        let prompt = memory::extract_prompt(&self.memory, recent);
+        let mut settings = self.settings.clone();
+        settings.clamp();
+        settings.json_mode.enabled = false;
+        settings.max_chars = None;
+        settings.budget_tokens = None;
+        settings.stop.clear();
+        let outcome = api::chat(
+            &self.endpoint,
+            &settings,
+            memory::MEMORY_SYSTEM,
+            &[ChatMessage::user(prompt)],
+            None,
+        )?;
+        self.memory.note_extraction();
+        match memory::parse_ops(outcome.text()) {
+            Ok(ops) => Ok(self.memory.apply_ops(&ops)),
+            Err(e) => {
+                self.memory.note_error(e.clone());
+                Err(format!("ответ экстрактора памяти не разобран: {e}"))
             }
         }
     }
@@ -413,6 +473,7 @@ impl Agent {
             self.settings.context_strategy,
             &self.compressor,
             &self.facts,
+            &self.memory,
         );
         if blocks.is_empty() {
             return base;

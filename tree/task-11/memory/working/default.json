@@ -1,0 +1,20 @@
+{
+  "layer": "working",
+  "scope": "default",
+  "records": [
+    {
+      "key": "задача.срок",
+      "value": "две недели",
+      "turn": 2,
+      "source": "user",
+      "reason": "явный выбор пользователя"
+    },
+    {
+      "key": "задача.кодовое_слово",
+      "value": "KOALA77",
+      "turn": 3,
+      "source": "extractor",
+      "reason": "префикс ключа `задача.`"
+    }
+  ]
+}
