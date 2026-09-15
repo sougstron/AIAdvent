@@ -15,6 +15,8 @@ pub enum Source {
     Models,
     /// Ключи факт-памяти (`/facts del`).
     FactKeys,
+    /// Ключи трёхслойной памяти (`/mem del`, `/mem where`).
+    MemoryKeys,
 }
 
 /// Узел дерева команд.
@@ -67,6 +69,7 @@ const STRATEGY_VALUES: &[Node] = &[
     leaf("window"),
     leaf("facts"),
     leaf("branch"),
+    leaf("memory"),
     lit("keep", "N", &[free("")]),
     lit("every", "N", &[free("")]),
 ];
@@ -147,6 +150,13 @@ pub const ROOT: &[Node] = &[
         ],
     ),
     leaf("help"),
+    Node {
+        token: "mem",
+        hint: "command",
+        alts: &["memory"],
+        next: MEM_NEXT,
+        sources: &[],
+    },
     lit(
         "json",
         "command",
@@ -197,6 +207,48 @@ pub const ROOT: &[Node] = &[
 
 const CONTEXT_NEXT: &[Node] = &[leaf("show"), leaf("on"), leaf("off"), leaf("reload")];
 
+/// Операции внутри одного слоя (`/mem long set ...`).
+const MEM_LAYER_OPS: &[Node] = &[
+    leaf("show"),
+    leaf("clear"),
+    lit("set", "key", &[free("value")]),
+    Node {
+        token: "del",
+        hint: "key",
+        alts: &["rm"],
+        next: &[],
+        sources: &[Source::MemoryKeys],
+    },
+];
+
+const MEM_NEXT: &[Node] = &[
+    lit("show", "layer", &[leaf("short"), leaf("working"), leaf("long")]),
+    leaf("routes"),
+    Node {
+        token: "where",
+        hint: "key",
+        alts: &[],
+        next: &[],
+        sources: &[Source::MemoryKeys],
+    },
+    lit("task", "name", &[free("")]),
+    lit(
+        "clear",
+        "layer",
+        &[leaf("short"), leaf("working"), leaf("long")],
+    ),
+    Node {
+        token: "del",
+        hint: "key",
+        alts: &["rm"],
+        next: &[],
+        sources: &[Source::MemoryKeys],
+    },
+    lit("short", "command", MEM_LAYER_OPS),
+    lit("working", "command", MEM_LAYER_OPS),
+    lit("long", "command", MEM_LAYER_OPS),
+];
+
 /// Снимок живых списков; `tui.rs` собирает его из состояния приложения.
 #[derive(Default, Clone, Debug)]
 pub struct Values {
@@ -204,6 +256,7 @@ pub struct Values {
     pub checkpoints: Vec<String>,
     pub models: Vec<String>,
     pub fact_keys: Vec<String>,
+    pub memory_keys: Vec<String>,
 }
 
 impl Values {
@@ -213,6 +266,7 @@ impl Values {
             Source::Checkpoints => &self.checkpoints,
             Source::Models => &self.models,
             Source::FactKeys => &self.fact_keys,
+            Source::MemoryKeys => &self.memory_keys,
         }
     }
 }
@@ -410,6 +464,7 @@ mod tests {
             checkpoints: vec!["cp1".into()],
             models: vec!["glm-5.3-flash".into()],
             fact_keys: vec!["user.name".into()],
+            memory_keys: vec!["профиль.язык".into()],
         }
     }
 
@@ -482,6 +537,16 @@ mod tests {
     #[test]
     fn model_uses_connected_catalog() {
         assert_eq!(candidates("/model ", &values()), vec!["glm-5.3-flash"]);
+    }
+
+    #[test]
+    fn mem_del_uses_memory_keys() {
+        assert_eq!(candidates("/mem del ", &values()), vec!["профиль.язык"]);
+        // Слои — фиксированные литералы, а не живой список.
+        assert_eq!(
+            candidates("/mem clear ", &values()),
+            vec!["short", "working", "long"]
+        );
     }
 
     #[test]

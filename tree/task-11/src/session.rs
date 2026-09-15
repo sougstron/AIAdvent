@@ -80,6 +80,12 @@ pub struct Session {
     /// `messages`, продолжают работать без изменений.
     #[serde(default)]
     tree: BranchStore,
+    /// Имя рабочего слоя памяти (`memory/working/<задача>.json`) на момент
+    /// последнего сохранения. Сами записи лежат в файлах памяти, а не в
+    /// сессии: слои переживают удаление чата — в этом их смысл. Сессии до
+    /// задачи 11 читаются как «задача по умолчанию».
+    #[serde(default)]
+    memory_task: String,
 }
 
 /// Per-process counter that makes ids unique when many sessions are created
@@ -102,7 +108,21 @@ impl Session {
             compressor: Compressor::default(),
             facts: FactStore::default(),
             tree: BranchStore::new(),
+            memory_task: crate::memory::DEFAULT_TASK.to_string(),
         }
+    }
+
+    /// Какую задачу рабочего слоя памяти использовал этот чат.
+    pub fn memory_task(&self) -> &str {
+        if self.memory_task.trim().is_empty() {
+            crate::memory::DEFAULT_TASK
+        } else {
+            &self.memory_task
+        }
+    }
+
+    pub fn set_memory_task(&mut self, task: &str) {
+        self.memory_task = task.to_string();
     }
 
     pub fn facts(&self) -> &FactStore {

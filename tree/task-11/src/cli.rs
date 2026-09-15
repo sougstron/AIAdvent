@@ -36,6 +36,8 @@ use crate::verify;
         ask --strategy summary                history compression: keep the last N, summarize the rest\n  \
         ask --verify-compress                 prove compression saves tokens without losing facts\n  \
         ask --verify-context all              prove window / facts / branch strategies live\n  \
+        ask --strategy memory                 three memory layers: short / working / long\n  \
+        ask --verify-memory all               prove the memory layers are separate and load-bearing\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -101,8 +103,9 @@ pub struct Cli {
 
     /// Context-management strategy: `off` (whole history), `summary`
     /// (running summary + last --keep-recent), `window` (last --keep-recent
-    /// only), `facts` (key-value memory + last --keep-recent) or `branch`
-    /// (the active conversation branch). `--compress` is the old name.
+    /// only), `facts` (key-value memory + last --keep-recent), `branch`
+    /// (the active conversation branch) or `memory` (three memory layers in
+    /// the system prompt + last --keep-recent). `--compress` is the old name.
     #[arg(
         long = "strategy",
         visible_alias = "compress",
@@ -129,6 +132,20 @@ pub struct Cli {
     /// diff. Exits after printing.
     #[arg(long, value_name = "WHICH")]
     pub verify_context: Option<String>,
+
+    /// Live proof for the three-layer memory model: `routing` (what goes
+    /// into which layer, and what that leaves on disk), `influence` (one
+    /// layer at a time, on the answers), `isolation` (switching tasks) or
+    /// `all`. With --offline, `routing` skips its live half. Exits after
+    /// printing.
+    #[arg(long, value_name = "WHICH")]
+    pub verify_memory: Option<String>,
+
+    /// Where the memory layers live: `<dir>/short`, `<dir>/working`,
+    /// `<dir>/long`. Default: the snapshot's own `memory/` next to the
+    /// binary, else `~/.ask6/memory`. Same as ASK_MEMORY_DIR.
+    #[arg(long, value_name = "DIR", env = "ASK_MEMORY_DIR")]
+    pub memory_dir: Option<String>,
 
     /// Model to run --verify-context / --verify-compress against. Any id the
     /// money guard allows live (glm-5.3-flash, deepseek-flash, OpenRouter
@@ -326,6 +343,12 @@ pub fn run() -> Res<()> {
         return Err("--live is only meaningful together with --models".into());
     }
 
+    // `--memory-dir` доезжает до памяти через ту же переменную, что и
+    // `ASK_MEMORY_DIR`: у `memory_root()` остаётся один источник правды.
+    if let Some(dir) = cli.memory_dir.as_deref().filter(|d| !d.is_empty()) {
+        std::env::set_var("ASK_MEMORY_DIR", dir);
+    }
+
     let settings = cli.to_settings()?;
 
     if cli.verify_billing {
@@ -369,6 +392,33 @@ pub fn run() -> Res<()> {
                 "context strategy not confirmed: {}",
                 bad.status_line()
             ));
+        }
+        return Ok(());
+    }
+
+    if let Some(which) = cli.verify_memory.as_deref() {
+        let checks = verify::MemoryCheck::parse(which)?;
+        println!(
+            "проверяю модель памяти: {}",
+            checks
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let reports = verify::run_memory(&checks, cli.verify_model.as_deref(), cli.offline)?;
+        let mut calls = 0;
+        for report in &reports {
+            print!("{}", report.render());
+            println!();
+            calls += report.calls();
+        }
+        for report in &reports {
+            println!("{}", report.status_line());
+        }
+        println!("живых вызовов всего: {calls}");
+        if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
+            return Err(format!("memory model not confirmed: {}", bad.status_line()));
         }
         return Ok(());
     }

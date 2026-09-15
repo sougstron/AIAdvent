@@ -398,7 +398,8 @@ pub fn parse_ops(raw: &str) -> Result<Vec<Op>, String> {
 }
 
 /// Снять markdown-забор вокруг JSON, если модель его поставила.
-fn strip_fences(raw: &str) -> String {
+/// `memory.rs` разбирает ответ своего экстрактора теми же двумя шагами.
+pub(crate) fn strip_fences(raw: &str) -> String {
     let t = raw.trim();
     let Some(rest) = t.strip_prefix("```") else {
         return t.to_string();
@@ -413,7 +414,7 @@ fn strip_fences(raw: &str) -> String {
 
 /// От первой `{`/`[` до парной закрывающей — так преамбула «Вот JSON:» не
 /// мешает.
-fn json_slice(text: &str) -> Option<String> {
+pub(crate) fn json_slice(text: &str) -> Option<String> {
     let open = text.find(['{', '['])?;
     let close = text.rfind(['}', ']'])?;
     if close <= open {

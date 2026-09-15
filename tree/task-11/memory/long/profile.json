@@ -1,0 +1,27 @@
+{
+  "layer": "long",
+  "scope": "profile",
+  "records": [
+    {
+      "key": "профиль.язык",
+      "value": "русский",
+      "turn": 1,
+      "source": "user",
+      "reason": "явный выбор пользователя"
+    },
+    {
+      "key": "профиль.имя",
+      "value": "Евгений",
+      "turn": 3,
+      "source": "extractor",
+      "reason": "префикс ключа `профиль.`"
+    },
+    {
+      "key": "профиль.роль",
+      "value": "тимлид",
+      "turn": 3,
+      "source": "extractor",
+      "reason": "префикс ключа `профиль.`"
+    }
+  ]
+}

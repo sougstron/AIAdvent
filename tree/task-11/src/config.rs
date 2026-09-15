@@ -188,16 +188,22 @@ pub enum ContextStrategy {
     /// Ветки диалога: на провод уходит путь активной ветки от корня к листу,
     /// соседние ветки не видны (`branch.rs`).
     Branch,
+    /// Трёхслойная память агента: краткосрочная (текущий диалог), рабочая
+    /// (данные текущей задачи) и долговременная (профиль, решения, знания).
+    /// Слои лежат в отдельных папках и уезжают в system тремя блоками, на
+    /// проводе — последние N сообщений (`memory.rs`).
+    Memory,
 }
 
 impl ContextStrategy {
     /// Порядок в переключателе настроек.
-    pub const ALL: [ContextStrategy; 5] = [
+    pub const ALL: [ContextStrategy; 6] = [
         ContextStrategy::Off,
         ContextStrategy::Summary,
         ContextStrategy::Window,
         ContextStrategy::Facts,
         ContextStrategy::Branch,
+        ContextStrategy::Memory,
     ];
 
     pub fn label(self) -> &'static str {
@@ -207,6 +213,7 @@ impl ContextStrategy {
             ContextStrategy::Window => "window",
             ContextStrategy::Facts => "facts",
             ContextStrategy::Branch => "branch",
+            ContextStrategy::Memory => "memory",
         }
     }
 
@@ -218,6 +225,9 @@ impl ContextStrategy {
             ContextStrategy::Window => "только последние N сообщений, остальное отброшено",
             ContextStrategy::Facts => "блок фактов (key-value) в system + последние N сообщений",
             ContextStrategy::Branch => "путь активной ветки диалога; соседние ветки не видны",
+            ContextStrategy::Memory => {
+                "три слоя памяти (краткосрочный/рабочий/долговременный) в system + последние N"
+            }
         }
     }
 
@@ -229,7 +239,10 @@ impl ContextStrategy {
     pub fn uses_keep_recent(self) -> bool {
         matches!(
             self,
-            ContextStrategy::Summary | ContextStrategy::Window | ContextStrategy::Facts
+            ContextStrategy::Summary
+                | ContextStrategy::Window
+                | ContextStrategy::Facts
+                | ContextStrategy::Memory
         )
     }
 
@@ -238,8 +251,11 @@ impl ContextStrategy {
             "off" | "none" | "full" => Ok(ContextStrategy::Off),
             "summary" | "on" | "compress" => Ok(ContextStrategy::Summary),
             "window" | "sliding" | "last-n" | "last_n" => Ok(ContextStrategy::Window),
-            "facts" | "kv" | "memory" => Ok(ContextStrategy::Facts),
+            "facts" | "kv" => Ok(ContextStrategy::Facts),
             "branch" | "branching" | "tree" => Ok(ContextStrategy::Branch),
+            // `memory` с задачи 11 — отдельная стратегия слоёв памяти, а не
+            // второе имя `facts`: у них разное хранилище и разные блоки.
+            "memory" | "mem" | "layers" => Ok(ContextStrategy::Memory),
             other => Err(format!(
                 "unknown context strategy `{other}`; expected one of: {}",
                 ContextStrategy::ALL
@@ -732,9 +748,15 @@ mod tests {
             ContextStrategy::parse(" KV ").unwrap(),
             ContextStrategy::Facts
         );
+        // С задачи 11 `memory` — отдельная стратегия слоёв памяти, а не
+        // второе имя `facts`.
         assert_eq!(
             ContextStrategy::parse("memory").unwrap(),
-            ContextStrategy::Facts
+            ContextStrategy::Memory
+        );
+        assert_eq!(
+            ContextStrategy::parse("layers").unwrap(),
+            ContextStrategy::Memory
         );
         assert_eq!(
             ContextStrategy::parse("branching").unwrap(),

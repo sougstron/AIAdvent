@@ -10,6 +10,7 @@ mod config;
 mod context;
 mod facts;
 mod isolation;
+mod memory;
 mod render;
 mod runtime;
 mod session;

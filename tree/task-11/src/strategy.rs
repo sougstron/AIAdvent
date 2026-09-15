@@ -23,6 +23,7 @@ use crate::api::{ChatMessage, Role};
 use crate::compress::Compressor;
 use crate::config::ContextStrategy;
 use crate::facts::FactStore;
+use crate::memory::MemoryStore;
 
 /// Sliding window: последние `n` сообщений, со сдвигом границы вправо до
 /// ближайшего сообщения пользователя.
@@ -74,9 +75,12 @@ pub fn apply<'a>(
         ContextStrategy::Summary => compressor.wire(history, strategy),
         // Окно ничего не помнит: что уехало за границу — потеряно. Это не
         // недоделка, а смысл стратегии, и проверка (`--verify-context
-        // window`) требует, чтобы старый факт честно НЕ вспомнился. Факты
-        // ездят тем же окном, только с блоком памяти в system.
-        ContextStrategy::Window | ContextStrategy::Facts => window(history, keep_recent),
+        // window`) требует, чтобы старый факт честно НЕ вспомнился. Факты и
+        // трёхслойная память ездят тем же окном — разница только в блоках,
+        // которые они кладут в system.
+        ContextStrategy::Window | ContextStrategy::Facts | ContextStrategy::Memory => {
+            window(history, keep_recent)
+        }
         // Путь активной ветки уже пришёл сюда как `history`.
         ContextStrategy::Branch => history,
     }
@@ -91,10 +95,14 @@ pub fn blocks(
     strategy: ContextStrategy,
     compressor: &Compressor,
     facts: &FactStore,
+    memory: &MemoryStore,
 ) -> Vec<String> {
     match strategy {
         ContextStrategy::Summary => compressor.block().into_iter().collect(),
         ContextStrategy::Facts => facts.block().into_iter().collect(),
+        // По блоку на непустой слой, а не один общий: слои разделены и на
+        // проводе тоже, иначе «какой слой повлиял на ответ» не проверить.
+        ContextStrategy::Memory => memory.blocks(),
         ContextStrategy::Off | ContextStrategy::Window | ContextStrategy::Branch => Vec::new(),
     }
 }
@@ -107,6 +115,7 @@ pub fn status(
     history: &[ChatMessage],
     compressor: &Compressor,
     facts: &FactStore,
+    memory: &MemoryStore,
     keep_recent: usize,
     branch_line: Option<&str>,
 ) -> String {
@@ -124,6 +133,11 @@ pub fn status(
             facts.len(),
             facts.updates()
         ),
+        ContextStrategy::Memory => format!(
+            "strategy=memory keep={keep_recent}: на проводе {}/{len} сообщений, память {}",
+            window(history, keep_recent).len(),
+            memory.status_line()
+        ),
         ContextStrategy::Branch => match branch_line {
             Some(line) => format!("strategy=branch {line}"),
             None => format!("strategy=branch: на проводе {len} сообщений активной ветки"),
@@ -134,6 +148,13 @@ pub fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{Layer, MemoryStore};
+
+    /// Пустая память без диска: большинству тестов диспетчера она нужна
+    /// только как аргумент.
+    fn mem() -> MemoryStore {
+        MemoryStore::in_memory()
+    }
 
     /// Чередование user/assistant, как в настоящем диалоге.
     fn hist(n: usize) -> Vec<ChatMessage> {
@@ -209,7 +230,7 @@ mod tests {
         let mut f = FactStore::new();
         f.set("цель", "стенд");
         assert_eq!(apply(ContextStrategy::Off, &h, &c, 4).len(), 12);
-        assert!(blocks(ContextStrategy::Off, &c, &f).is_empty());
+        assert!(blocks(ContextStrategy::Off, &c, &f, &mem()).is_empty());
     }
 
     #[test]
@@ -219,7 +240,7 @@ mod tests {
         c.apply("СВОДКА".into(), 6, 100);
         let wire = apply(ContextStrategy::Summary, &h, &c, 4);
         assert_eq!(wire.len(), 6);
-        let b = blocks(ContextStrategy::Summary, &c, &FactStore::new());
+        let b = blocks(ContextStrategy::Summary, &c, &FactStore::new(), &mem());
         assert_eq!(b.len(), 1);
         assert!(b[0].contains("СВОДКА"));
     }
@@ -235,7 +256,7 @@ mod tests {
         assert_eq!(wire.len(), 4);
         assert_eq!(wire[0].content, "u8");
         // Ни summary, ни фактов: окно — это именно «остальное отбрасываем».
-        assert!(blocks(ContextStrategy::Window, &c, &f).is_empty());
+        assert!(blocks(ContextStrategy::Window, &c, &f, &mem()).is_empty());
     }
 
     #[test]
@@ -247,11 +268,32 @@ mod tests {
         let plain = apply(ContextStrategy::Window, &h, &c, 4);
         let with_facts = apply(ContextStrategy::Facts, &h, &c, 4);
         assert_eq!(plain.len(), with_facts.len());
-        let b = blocks(ContextStrategy::Facts, &c, &f);
+        let b = blocks(ContextStrategy::Facts, &c, &f, &mem());
         assert_eq!(b.len(), 1);
         assert!(b[0].contains("цель: стенд"));
         // Пустая память — и блока нет, разница с window исчезает.
-        assert!(blocks(ContextStrategy::Facts, &c, &FactStore::new()).is_empty());
+        assert!(blocks(ContextStrategy::Facts, &c, &FactStore::new(), &mem()).is_empty());
+    }
+
+    #[test]
+    fn memory_is_the_same_window_plus_one_block_per_non_empty_layer() {
+        let h = hist(12);
+        let c = Compressor::new();
+        let f = FactStore::new();
+        let mut m = MemoryStore::in_memory();
+        m.set(Layer::Long, "профиль.язык", "русский");
+        m.set(Layer::Working, "задача.срок", "две недели");
+        // История режется ровно тем же окном, что и у `window`.
+        assert_eq!(
+            apply(ContextStrategy::Memory, &h, &c, 4).len(),
+            apply(ContextStrategy::Window, &h, &c, 4).len()
+        );
+        let b = blocks(ContextStrategy::Memory, &c, &f, &m);
+        assert_eq!(b.len(), 2, "пустой краткосрочный слой блока не даёт");
+        assert!(b[0].contains("[long]") && b[1].contains("[working]"));
+        // Пустая память — и блоков нет, разница с window исчезает.
+        assert!(blocks(ContextStrategy::Memory, &c, &f, &mem()).is_empty());
+        assert!(status(ContextStrategy::Memory, &h, &c, &f, &m, 4, None).contains("long 1"));
     }
 
     #[test]
@@ -263,7 +305,7 @@ mod tests {
             7,
             "путь ветки не режется окном"
         );
-        assert!(blocks(ContextStrategy::Branch, &c, &FactStore::new()).is_empty());
+        assert!(blocks(ContextStrategy::Branch, &c, &FactStore::new(), &mem()).is_empty());
     }
 
     #[test]
@@ -272,15 +314,16 @@ mod tests {
         let c = Compressor::new();
         let mut f = FactStore::new();
         f.set("цель", "стенд");
-        assert!(status(ContextStrategy::Off, &h, &c, &f, 4, None).contains("все 12"));
-        assert!(status(ContextStrategy::Window, &h, &c, &f, 4, None).contains("4/12"));
-        let facts_line = status(ContextStrategy::Facts, &h, &c, &f, 4, None);
+        assert!(status(ContextStrategy::Off, &h, &c, &f, &mem(), 4, None).contains("все 12"));
+        assert!(status(ContextStrategy::Window, &h, &c, &f, &mem(), 4, None).contains("4/12"));
+        let facts_line = status(ContextStrategy::Facts, &h, &c, &f, &mem(), 4, None);
         assert!(facts_line.contains("фактов 1"));
         let branch_line = status(
             ContextStrategy::Branch,
             &h,
             &c,
             &f,
+            &mem(),
             4,
             Some("ветка B, 3 сообщения"),
         );

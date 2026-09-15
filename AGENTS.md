@@ -57,34 +57,40 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-10/`.** It is a working agent: a ratatui
+**The active snapshot is `tree/task-11/`.** It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
 rest of the catalog is selectable but refused at send time because those
-ids cost money. Task 9 added **context management** and task 10 grew it into
-**five strategies behind one switch** (`/strategy`, the `strategy` row in
-settings, `--strategy`; `/compress` and `--compress` remain aliases):
-`off` (whole history), `summary` (running summary + last N), `window`
-(sliding window: last N only, the rest discarded), `facts` (key-value memory
-in the system message + last N, refreshed by an extractor call after every
-user turn) and `branch` (a conversation tree: checkpoints, forks, per-branch
-memory, only the active path on the wire). One dispatcher — `strategy::apply`
-/ `strategy::blocks` — turns the selected value into what goes on the wire.
-The proofs are load-bearing and causal, never "the texts differ":
-`ask --verify-compress` for summary and `ask --verify-context
-window|facts|branch|all` for the rest (`--verify-model` runs them on any id
-the money guard allows live, including OpenRouter `:free`). `window` is only
-Confirmed when the old fact is honestly **forgotten**, `facts` only when the
-control window lost the fact and memory brought it back cheaper than the full
-history, `branch` only when neither branch sees the other's token. Its
-`README.md` covers the Agent shape, key resolution, runtime settings, all five
-strategies with their corner cases and real verify output, and the
-live lever self-test (temperature confirmed; top_p flat; top_k unsupported). It started as a verbatim copy of
-`tree/task-9/`, which itself was a verbatim copy of `tree/task-8/`
-(a verbatim copy of `tree/task-7/` — task 7 already met the requirements,
-so it stayed frozen); `tree/task-5/` before that was the *Model Ladder*
-state. Everything below in this file describes the older TUI that still
+ids cost money. Tasks 9–10 built **five context strategies behind one switch**
+(`off` / `summary` / `window` / `facts` / `branch`; `/strategy`, the
+`strategy` row in settings, `--strategy`, with `/compress` and `--compress`
+as aliases), proved by `ask --verify-compress` and `ask --verify-context
+window|facts|branch|all`. Task 11 added a sixth value, `memory`, and with it
+an **explicit three-layer memory model** (`memory.rs`): short (current
+dialogue), working (current task) and long (profile, decisions, knowledge).
+The layers are physically separate — one folder and one file each under
+`tree/task-11/memory/{short,working,long}/` — and every record carries who
+wrote it and *why it landed in that layer*. Nothing is saved "to memory": the
+layer is chosen explicitly, either by hand (`/mem <layer> set k v`) or by
+`memory::route`, where a key prefix (`профиль.` / `задача.` / `тема.`) beats
+the extractor's own suggestion and the disagreement is surfaced, not
+swallowed. On the wire the layers are three separate `system` blocks plus the
+last N messages, which is what makes one-layer-at-a-time attribution
+possible. The proof is `ask --verify-memory routing|influence|isolation|all`
+(`--offline` runs the half that needs no network) and it is causal, never
+"the texts differ": `routing` reads the layer files back from disk, `influence`
+is Confirmed only when removing **one** block (long) kills the profile answer
+and leaves the task answer, and `isolation` only when switching tasks forgets
+the working code while the long-term one survives and the old task's file
+still holds it. All three came back Confirmed live on `glm-5.3-flash`. Its
+`README.md` covers the Agent shape, key resolution, runtime settings, all six
+strategies plus the memory model with their corner cases and real verify
+output, and the live lever self-test (temperature confirmed; top_p flat;
+top_k unsupported). It started as a verbatim copy of `tree/task-10/`, which
+came from `tree/task-9/` and, before that, `tree/task-8/` / `tree/task-7/`
+(task 7 already met the requirements, so it stayed frozen); `tree/task-5/`
+before that was the *Model Ladder* state. Everything below in this file describes the older TUI that still
 lives in the repo root `src/`.
 
 ## Layout

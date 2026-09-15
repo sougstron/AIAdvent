@@ -1,0 +1,20 @@
+{
+  "layer": "working",
+  "scope": "отчёт",
+  "records": [
+    {
+      "key": "задача.кодовое_слово",
+      "value": "KOALA77",
+      "turn": 4,
+      "source": "extractor",
+      "reason": "префикс ключа `задача.`"
+    },
+    {
+      "key": "задача.срок",
+      "value": "две недели",
+      "turn": 4,
+      "source": "extractor",
+      "reason": "префикс ключа `задача.`"
+    }
+  ]
+}
