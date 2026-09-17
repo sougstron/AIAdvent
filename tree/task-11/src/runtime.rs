@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{Agent, Reply};
 use crate::api::{ChatMessage, Endpoint};
-use crate::config::{ContextStrategy, Res, Settings};
+use crate::config::{Res, Settings};
 use crate::memory::{self, MemoryStore};
 use crate::session::{self, Session, SessionSummary};
 
@@ -448,7 +448,7 @@ impl Turn {
 /// сессию, рабочий и долговременный — те же файлы. В тестах память остаётся
 /// в оперативке, чтобы прогон не писал в домашний каталог.
 fn attach_memory(agent: &mut Agent, session: &Session) {
-    if cfg!(test) || agent.strategy() != ContextStrategy::Memory {
+    if cfg!(test) {
         return;
     }
     agent.set_memory(MemoryStore::open(
@@ -655,6 +655,10 @@ impl AgentBox {
         if turn.accepted() {
             self.session.push_user(sent);
             self.session.push_assistant(turn.text.clone());
+            // Дословная копия диалога в короткий слой — как в TUI, на каждом
+            // ходе и независимо от стратегии.
+            let dialog = self.session.history();
+            self.agent.memory_mut().sync_dialog(&dialog);
             self.session.settings = self.agent.settings().clone();
             self.pin_title();
             self.turns += 1;

@@ -8,6 +8,11 @@
 //! | [`Layer::Working`] | данные текущей задачи: вводные, ограничения, промежуточные результаты | до смены задачи (`/mem task <имя>`) | `memory/working/<задача>.json` |
 //! | [`Layer::Long`] | профиль, решения, знания | не истекает, переживает перезапуск | `memory/long/<профиль>.json` |
 //!
+//! Краткосрочный слой кроме записей хранит ещё и **дословную копию диалога**
+//! (`dialog` в том же файле): экстрактор мог не позваться или ничего не
+//! выделить, но «текущий разговор» обязан лежать в короткой памяти целиком.
+//! Копия пишется на каждом ходе, независимо от стратегии.
+//!
 //! Слои **физически разделены**: каждый — свой файл в своей папке. Это не
 //! украшение, а то, что делает проверку возможной: «какие данные попали в
 //! слой» — это `cat` файла, а не догадка про то, что модель себе думает.
@@ -175,6 +180,20 @@ pub struct Record {
     pub reason: String,
 }
 
+/// Одна реплика диалога в дословной копии сессии.
+///
+/// Записи (`Record`) — это выжимка, которую сделал экстрактор; `DialogTurn` —
+/// сырая реплика как она была. Краткосрочный слой хранит и то, и другое:
+/// «что агент помнит про этот разговор» и «что в этом разговоре вообще было».
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogTurn {
+    /// Номер реплики в сессии, с единицы.
+    pub n: usize,
+    /// `user` или `assistant` (system в историю сессии не попадает).
+    pub role: String,
+    pub text: String,
+}
+
 /// Содержимое одного файла слоя.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct LayerFile {
@@ -184,6 +203,10 @@ struct LayerFile {
     scope: String,
     #[serde(default)]
     records: Vec<Record>,
+    /// Дословная копия диалога. Есть только у краткосрочного слоя: у рабочего
+    /// и долговременного разговора нет, у них есть задача и профиль.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dialog: Vec<DialogTurn>,
 }
 
 /// Решение маршрутизатора по одной записи.
@@ -286,6 +309,8 @@ pub struct MemoryStore {
     short: Vec<Record>,
     working: Vec<Record>,
     long: Vec<Record>,
+    /// Дословная копия текущего диалога — она же лежит в файле короткого слоя.
+    dialog: Vec<DialogTurn>,
     updates: usize,
     extractions: usize,
     last_error: Option<String>,
@@ -313,6 +338,7 @@ impl MemoryStore {
             short: Vec::new(),
             working: Vec::new(),
             long: Vec::new(),
+            dialog: Vec::new(),
             updates: 0,
             extractions: 0,
             last_error: None,
@@ -331,8 +357,17 @@ impl MemoryStore {
         };
         store.ensure_dirs();
         for layer in Layer::ALL {
-            let records = read_layer(&store.path(layer));
-            *store.slot_mut(layer) = records;
+            let file = read_layer(&store.path(layer));
+            *store.slot_mut(layer) = file.records;
+            if layer == Layer::Short {
+                store.dialog = file.dialog;
+            }
+            // Файл слоя создаётся сразу, ещё пустым. Иначе «в working ничего
+            // нет» невозможно отличить от «working ещё не открывали», а
+            // проверять надо первое.
+            if !store.path(layer).exists() {
+                store.persist(layer);
+            }
         }
         store
     }
@@ -493,10 +528,13 @@ impl MemoryStore {
         self.persist(Layer::Working);
         self.work_scope = task;
         self.working = if self.on_disk() {
-            read_layer(&self.path(Layer::Working))
+            read_layer(&self.path(Layer::Working)).records
         } else {
             Vec::new()
         };
+        if self.on_disk() && !self.path(Layer::Working).exists() {
+            self.persist(Layer::Working);
+        }
     }
 
     /// Сменить диалог: краткосрочный слой всегда начинается пустым — он
@@ -508,11 +546,50 @@ impl MemoryStore {
         }
         self.persist(Layer::Short);
         self.short_scope = scope;
-        self.short = if self.on_disk() {
+        let file = if self.on_disk() {
             read_layer(&self.path(Layer::Short))
         } else {
-            Vec::new()
+            LayerFile::default()
         };
+        self.short = file.records;
+        self.dialog = file.dialog;
+        if self.on_disk() && !self.path(Layer::Short).exists() {
+            self.persist(Layer::Short);
+        }
+    }
+
+    /// Дословная копия диалога, как она лежит в файле короткого слоя.
+    pub fn dialog(&self) -> &[DialogTurn] {
+        &self.dialog
+    }
+
+    /// Переписать краткосрочный слой текущей историей сессии.
+    ///
+    /// Это намеренный дубликат: та же история есть в `~/.ask6/sessions/`, но
+    /// краткосрочная память — «текущий диалог», и проверяться она должна там,
+    /// где живёт, а не по чужому файлу. В отличие от записей, диалог кладётся
+    /// **всегда** — независимо от стратегии и от того, звали ли экстрактора;
+    /// поэтому `memory/short/<сессия>.json` перестаёт быть пустой коробкой с
+    /// одним только именем сессии.
+    ///
+    /// Возвращает `true`, если файл переписан.
+    pub fn sync_dialog(&mut self, history: &[ChatMessage]) -> bool {
+        let next: Vec<DialogTurn> = history
+            .iter()
+            .filter(|m| m.role != crate::api::Role::System)
+            .enumerate()
+            .map(|(i, m)| DialogTurn {
+                n: i + 1,
+                role: m.role.as_str().to_string(),
+                text: m.content.clone(),
+            })
+            .collect();
+        if next == self.dialog {
+            return false;
+        }
+        self.dialog = next;
+        self.persist(Layer::Short);
+        true
     }
 
     /// Применить пачку операций экстрактора через маршрутизатор.
@@ -660,6 +737,11 @@ impl MemoryStore {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             records: self.slot(layer).clone(),
+            dialog: if layer == Layer::Short {
+                self.dialog.clone()
+            } else {
+                Vec::new()
+            },
         };
         let Ok(data) = serde_json::to_string_pretty(&file) else {
             return;
@@ -723,6 +805,10 @@ impl MemoryStore {
                 }
             ),
             format!("задача: {} · диалог: {}", self.work_scope, self.short_scope),
+            format!(
+                "дословная копия диалога в коротком слое: {} реплик",
+                self.dialog.len()
+            ),
         ];
         if let Some(err) = self.last_error() {
             lines.push(format!("последняя ошибка разбора: {err}"));
@@ -742,6 +828,13 @@ impl MemoryStore {
             if !self.slot(layer).is_empty() {
                 lines.push(self.body(layer));
             }
+            if layer == Layer::Short && !self.dialog.is_empty() {
+                lines.push(format!(
+                    "  + дословный диалог: {} реплик ({} символов)",
+                    self.dialog.len(),
+                    self.dialog.iter().map(|t| t.text.chars().count()).sum::<usize>()
+                ));
+            }
         }
         lines.join("\n")
     }
@@ -749,10 +842,11 @@ impl MemoryStore {
     /// Строка для футера и `/strategy show`.
     pub fn status_line(&self) -> String {
         format!(
-            "long {} · work {} · short {}",
+            "long {} · work {} · short {} (диалог {})",
             self.len(Layer::Long),
             self.len(Layer::Working),
-            self.len(Layer::Short)
+            self.len(Layer::Short),
+            self.dialog.len()
         )
     }
 }
@@ -872,15 +966,15 @@ fn snapshot_root() -> Option<PathBuf> {
         .then(|| snapshot.join("memory"))
 }
 
-fn read_layer(path: &Path) -> Vec<Record> {
+fn read_layer(path: &Path) -> LayerFile {
     let Ok(data) = fs::read_to_string(path) else {
-        return Vec::new();
+        return LayerFile::default();
     };
     match serde_json::from_str::<LayerFile>(&data) {
-        Ok(file) => file.records,
+        Ok(file) => file,
         Err(e) => {
             eprintln!("warning: битый файл памяти {}: {e}", path.display());
-            Vec::new()
+            LayerFile::default()
         }
     }
 }
@@ -1012,6 +1106,54 @@ mod tests {
         m.set_session("ses2");
         assert_eq!(m.len(Layer::Short), 0);
         assert_eq!(m.get(Layer::Long, "нет"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn short_layer_keeps_the_whole_dialog_verbatim_and_survives_reopen() {
+        let root = scratch("dialog");
+        let mut m = MemoryStore::open(&root, "ses1", "alpha");
+        let history = vec![
+            ChatMessage {
+                role: crate::api::Role::System,
+                content: "не должно попасть в диалог".into(),
+            },
+            ChatMessage::user("привет, меня зовут Евгений"),
+            ChatMessage::assistant("привет, Евгений"),
+        ];
+        assert!(m.sync_dialog(&history), "первая синхронизация переписывает файл");
+        assert!(!m.sync_dialog(&history), "повтор без изменений файл не трогает");
+
+        // Слой пуст по записям — экстрактора не звали — но диалог на диске.
+        assert_eq!(m.len(Layer::Short), 0);
+        let raw = fs::read_to_string(m.path(Layer::Short)).unwrap();
+        assert!(raw.contains("привет, меня зовут Евгений"), "{raw}");
+        assert!(!raw.contains("не должно попасть"), "system в диалог не идёт");
+
+        let reopened = MemoryStore::open(&root, "ses1", "alpha");
+        assert_eq!(reopened.dialog().len(), 2);
+        assert_eq!(reopened.dialog()[0].role, "user");
+        assert_eq!(reopened.dialog()[1].n, 2);
+        assert_eq!(reopened.dialog()[1].text, "привет, Евгений");
+
+        // Новый диалог — новая копия: короткая память принадлежит разговору.
+        let mut m = reopened;
+        m.set_session("ses2");
+        assert!(m.dialog().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opening_memory_materialises_all_three_layer_files() {
+        let root = scratch("files");
+        let m = MemoryStore::open(&root, "ses1", "alpha");
+        for layer in Layer::ALL {
+            assert!(
+                m.path(layer).is_file(),
+                "{} должен существовать сразу после открытия",
+                m.path(layer).display()
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

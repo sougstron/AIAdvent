@@ -73,7 +73,7 @@ const SETTINGS_ROWS: &[&str] = &[
 const STRATEGY_USAGE: &str =
     "/strategy [show|off|summary|window|facts|branch|memory|keep N|every N]";
 const MEM_USAGE: &str =
-    "/mem [show [слой]|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
+    "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
 const FOOTER_HEIGHT: u16 = 2;
 const STATS_SEP: &str = " \u{b7} ";
@@ -963,10 +963,15 @@ impl App {
         self.status = "New chat".into();
     }
 
-    fn save_session(&self) {
+    fn save_session(&mut self) {
         if self.session.messages.is_empty() {
             return;
         }
+        // Краткосрочная память = текущий диалог, поэтому она получает его
+        // дословно и на каждом сохранении — без экстрактора и независимо от
+        // стратегии. Да, это дубликат файла сессии; он тут и нужен, чтобы
+        // `memory/short/<сессия>.json` можно было проверять сам по себе.
+        self.agent.memory_mut().sync_dialog(&self.session.history());
         let mut s = self.session.clone();
         s.settings = self.settings.clone();
         s.context_files = self
@@ -1877,7 +1882,7 @@ impl App {
     }
 
 
-    /// `/mem [show|<слой> set k v|del k|clear <слой>|task <имя>|where k|routes]`
+    /// `/mem [show|dialog|<слой> set k v|del k|clear <слой>|task <имя>|where k|routes]`
     /// — ручное управление трёхслойной памятью.
     ///
     /// Ручная правка и есть «явный выбор, что и куда сохраняется»: слой
@@ -1903,6 +1908,32 @@ impl App {
                     },
                 };
                 self.entries.push(Entry::Info(listing));
+            }
+            // Дословная копия диалога в коротком слое — то, что лежит в
+            // `memory/short/<сессия>.json` рядом с записями.
+            "dialog" | "диалог" => {
+                let turns = self.agent.memory().dialog();
+                let text = if turns.is_empty() {
+                    format!(
+                        "короткая память пуста: {}",
+                        self.agent.memory().path(Layer::Short).display()
+                    )
+                } else {
+                    let head = format!(
+                        "{} ({} реплик)",
+                        self.agent.memory().path(Layer::Short).display(),
+                        turns.len()
+                    );
+                    std::iter::once(head)
+                        .chain(
+                            turns
+                                .iter()
+                                .map(|t| format!("{}. {}: {}", t.n, t.role, t.text.trim())),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.entries.push(Entry::Info(text));
             }
             "routes" => {
                 let routes = self.agent.memory().routes();
@@ -3581,7 +3612,7 @@ const HELP: &str = "\
 /strategy [show|off|summary|window|facts|branch]  context-management strategy
 /strategy keep N | every N    window size / how often summary folds (/compress is an alias)
 /facts [show|clear|set k v|del k]  key-value memory used by strategy `facts`
-/mem [show [layer]|routes|where k]  three memory layers: short / working / long
+/mem [show [layer]|dialog|routes|where k]  three memory layers: short / working / long
 /mem <layer> set k v | del k      write to a layer by hand (layer = short|working|long)
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /checkpoint [name]        mark the current point so branches can fork from it
