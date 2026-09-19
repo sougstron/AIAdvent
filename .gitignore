@@ -57,3 +57,8 @@ PLAN.md
 # tauri-build генерирует их при каждой сборке
 tree/task-4/gen/schemas/
 tree/task-5/gen/schemas/
+!tree/task-12/target/
+tree/task-12/target/*
+!tree/task-12/target/release/
+tree/task-12/target/release/*
+!tree/task-12/target/release/ask
