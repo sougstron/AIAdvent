@@ -3,12 +3,25 @@
 # current work, then verify against the remote ref. See SKILL.md for why this
 # exists: pushing a branch is not enough, the human reads main.
 #
-# usage: push_all.sh <path-that-must-appear-on-main>   e.g. tree/task-11
+# usage: push_all.sh [--prune-merged] <path-that-must-appear-on-main>
+#        e.g. push_all.sh tree/task-11
+#
+# --prune-merged additionally deletes remote kanban/* branches that are fully
+# contained in origin/main (they carry no unique commit, so nothing is lost).
+# Without it, such branches are only listed.
 set -uo pipefail
 
-want="${1:-}"
+prune=0
+want=""
+for a in "$@"; do
+  case "$a" in
+    --prune-merged) prune=1 ;;
+    -*) echo "unknown option: $a" >&2; exit 2 ;;
+    *)  want="$a" ;;
+  esac
+done
 if [ -z "$want" ]; then
-  echo "usage: $0 <path-that-must-appear-on-origin/main>   e.g. tree/task-11" >&2
+  echo "usage: $0 [--prune-merged] <path-that-must-appear-on-origin/main>   e.g. tree/task-11" >&2
   exit 2
 fi
 
@@ -90,6 +103,29 @@ git ls-tree "refs/remotes/origin/main" "$want" --name-only | grep -q . \
 git ls-tree "refs/remotes/origin/main" "$want/" --name-only | sed 's/^/  /' | head -20
 echo "  ok: '$want' is present on origin/main"
 git log --oneline -3 refs/remotes/origin/main | sed 's/^/  /'
+
+echo
+echo "== stale remote branches =="
+git fetch origin --prune --quiet
+stale=""
+for r in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/kanban); do
+  b=${r#origin/}
+  [ "$b" = "$head_branch" ] && continue
+  if git merge-base --is-ancestor "$r" refs/remotes/origin/main 2>/dev/null; then
+    echo "  merged into main, carries nothing unique: $b"
+    stale="$stale $b"
+  fi
+done
+if [ -z "$stale" ]; then
+  echo "  (none)"
+elif [ "$prune" = 1 ]; then
+  echo "  deleting:$stale"
+  # shellcheck disable=SC2086
+  git push origin --delete $stale || fail "deleting stale branches failed"
+  git fetch origin --prune --quiet
+else
+  echo "  not deleted (re-run with --prune-merged to delete them)"
+fi
 
 url=$(git remote get-url origin | sed -e 's#^git@github.com:#https://github.com/#' -e 's#\.git$##')
 echo
