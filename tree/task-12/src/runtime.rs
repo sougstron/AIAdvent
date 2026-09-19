@@ -456,6 +456,9 @@ fn attach_memory(agent: &mut Agent, session: &Session) {
         &session.id,
         session.memory_task(),
     ));
+    // Каталог профилей лежит рядом со слоями памяти: персонализация — это
+    // надстройка над долговременным слоем, а не отдельное хозяйство.
+    agent.set_profiles(crate::profile::ProfileSet::open(memory::memory_root()));
 }
 
 pub struct AgentBox {
@@ -546,6 +549,13 @@ impl AgentBox {
 
     pub fn settings(&self) -> &Settings {
         self.agent.settings()
+    }
+
+    /// Настройки этого хода вместе с тем, что подставил профиль (потолок
+    /// ответа). Печатается в статус one-shot, чтобы «обрезано до N» и
+    /// «max_chars=off» не спорили друг с другом.
+    pub fn effective_settings(&self) -> Settings {
+        self.agent.effective_settings()
     }
 
     pub fn settings_mut(&mut self) -> &mut Settings {

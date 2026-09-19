@@ -15,6 +15,7 @@ use crate::api::{self, ChatMessage, DEFAULT_BASE_URL, LIVE_COMPLETION_MODEL};
 use crate::branch::BranchStore;
 use crate::config::{self, ContextStrategy, Res, Settings, DEFAULT_MODEL};
 use crate::memory::{self, Layer, MemoryStore};
+use crate::profile;
 use crate::session::StoredMessage;
 
 const PING_PROMPT: &str = "Reply with the single word PONG.";
@@ -507,6 +508,16 @@ fn has_token(text: &str, token: &str) -> bool {
     let needle = token.to_ascii_uppercase();
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|w| !w.is_empty() && w.eq_ignore_ascii_case(&needle))
+}
+
+/// То же, что [`has_token`], но по словам Unicode: посаженные слова проверок
+/// персонализации — русские («Евгений»), а `has_token` режет строку только по
+/// ASCII-символам и на кириллице сравнивает не то.
+fn has_word(text: &str, token: &str) -> bool {
+    let needle = token.to_lowercase();
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == needle)
 }
 
 fn normalize_answer(s: &str) -> String {
@@ -2967,9 +2978,614 @@ mod tests {
     }
 
     #[test]
+    fn has_word_is_word_bounded_on_cyrillic() {
+        assert!(has_word("Евгений, здравствуй!", "Евгений"));
+        assert!(has_word("привет, евгений", "Евгений"));
+        assert!(!has_word("Евгения нет", "Евгений"));
+        assert!(!has_word("Коротко: 144", "Евгений"));
+    }
+
+    #[test]
+    fn profile_checks_parse_their_names() {
+        assert_eq!(ProfileCheck::parse("all").unwrap(), ProfileCheck::ALL.to_vec());
+        assert_eq!(
+            ProfileCheck::parse("voice").unwrap(),
+            vec![ProfileCheck::Voice]
+        );
+        assert!(ProfileCheck::parse("голос").is_err());
+    }
+
+    /// Проводная половина проверки персонализации — офлайновая, поэтому она
+    /// же и тест: блок ровно один, пункты профиля доехали, при смене
+    /// профиля всё остальное в `system` не шелохнулось.
+    #[test]
+    fn wire_check_confirms_without_a_network() {
+        let report = run_profile_wire().unwrap();
+        let status = ProfileReport::Wire(report.clone()).status_line();
+        assert_eq!(report.verdict, ContextVerdict::Confirmed, "{status}");
+        assert!(report.rest_identical && report.blocks_differ && report.memory_block_kept);
+        assert!(report.cases.iter().all(|c| c.missing.is_empty() && c.blocks <= 1));
+        // Первый случай — профиль выключен: блока нет, дефолтный промпт цел.
+        assert!(report.cases[0].block.is_none() && report.cases[0].default_prompt);
+    }
+
+    /// Матрица подписей: «тексты разные» — не подтверждение. Confirmed
+    /// только когда каждый ответ несёт свою подпись и не несёт чужую.
+    #[test]
+    fn voice_verdict_needs_the_cross_matrix_not_a_text_diff() {
+        let chem = profile::builtins()
+            .into_iter()
+            .find(|p| p.id == "chemist")
+            .unwrap()
+            .marker
+            .unwrap();
+        let gop = profile::builtins()
+            .into_iter()
+            .find(|p| p.id == "gopnik")
+            .unwrap()
+            .marker
+            .unwrap();
+        // Два разных, но одинаково безликих ответа — ни одной подписи.
+        let flat_a = "Свет рассеивается на молекулах воздуха.";
+        let flat_b = "Молекулы воздуха рассеивают короткие волны сильнее.";
+        assert_ne!(flat_a, flat_b);
+        assert!(!chem.matches(flat_a) && !gop.matches(flat_b));
+        // А так — сошлось: своя подпись есть, чужой нет.
+        assert!(chem.matches("Гипотеза: рэлеевское рассеяние. Вывод: да."));
+        assert!(gop.matches("Братан, короче, воздух свет раскидывает."));
+    }
+
+    #[test]
     fn endpoint_is_the_plain_z_ai_completions_url() {
         let url = completions_url();
         assert_eq!(url, format!("{DEFAULT_BASE_URL}/chat/completions"));
         assert!(!url.contains("/coding/"));
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Персонализация: профиль пользователя (`profile.rs`)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Какую половину персонализации проверяем.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProfileCheck {
+    /// Что именно уезжает в `system`: блок профиля есть, он один, и при
+    /// смене профиля меняется **только** он. Без сети.
+    Wire,
+    /// Живьём: один и тот же вопрос в двух профилях. Confirmed только когда
+    /// каждый ответ несёт подпись своего профиля и не несёт чужую.
+    Voice,
+    /// Живьём: то, что агент учитывает автоматически — записи `профиль.*`
+    /// из долговременной памяти внутри блока профиля.
+    Auto,
+}
+
+impl ProfileCheck {
+    pub const ALL: [ProfileCheck; 3] = [ProfileCheck::Wire, ProfileCheck::Voice, ProfileCheck::Auto];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProfileCheck::Wire => "wire",
+            ProfileCheck::Voice => "voice",
+            ProfileCheck::Auto => "auto",
+        }
+    }
+
+    /// `wire|voice|auto|all`.
+    pub fn parse(s: &str) -> Res<Vec<ProfileCheck>> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Ok(ProfileCheck::ALL.to_vec()),
+            "wire" | "prompt" | "system" => Ok(vec![ProfileCheck::Wire]),
+            "voice" | "answers" | "style" => Ok(vec![ProfileCheck::Voice]),
+            "auto" | "memory" | "known" => Ok(vec![ProfileCheck::Auto]),
+            other => Err(format!(
+                "unknown profile check `{other}`; expected wire, voice, auto or all"
+            )),
+        }
+    }
+}
+
+/// Один собранный `system`: что в нём от профиля и что осталось вокруг.
+#[derive(Clone, Debug)]
+pub struct WireCase {
+    pub label: String,
+    pub profile: String,
+    /// Блок профиля, если он есть.
+    pub block: Option<String>,
+    /// Сколько раз встретился заголовок блока: два блока — это баг.
+    pub blocks: usize,
+    /// Всё, что не блок профиля.
+    pub rest: String,
+    /// Остался ли в `system` дефолтный «ты — полезный ассистент».
+    pub default_prompt: bool,
+    /// Пункты профиля, не доехавшие до блока (должен быть пуст).
+    pub missing: Vec<String>,
+}
+
+impl WireCase {
+    fn line(&self) -> String {
+        format!(
+            "[{}] профиль={} блоков={} дефолтный промпт={} потеряно пунктов={} остальное={} симв.",
+            self.label,
+            self.profile,
+            self.blocks,
+            self.default_prompt,
+            self.missing.len(),
+            self.rest.chars().count()
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfileWireReport {
+    pub cases: Vec<WireCase>,
+    /// Совпало ли «остальное» у двух разных профилей поверх своего промпта.
+    pub rest_identical: bool,
+    /// Отличаются ли сами блоки.
+    pub blocks_differ: bool,
+    /// Уцелел ли блок долговременной памяти при смене профиля.
+    pub memory_block_kept: bool,
+    pub verdict: ContextVerdict,
+}
+
+/// Ответ одного профиля на общий вопрос плюс матрица подписей.
+#[derive(Clone, Debug)]
+pub struct VoiceCase {
+    pub profile: String,
+    pub title: String,
+    pub call: Call,
+    /// Своя подпись сошлась.
+    pub own: bool,
+    /// Чужая подпись сошлась (должна не сходиться).
+    pub other: bool,
+}
+
+impl VoiceCase {
+    fn line(&self) -> String {
+        format!(
+            "[{}] {} — {}\n  {}\n  своя подпись: {} · чужая подпись: {}",
+            self.profile,
+            self.title,
+            self.call.line(),
+            clip(&self.call.text, 200),
+            self.own,
+            self.other
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfileVoiceReport {
+    /// Какую модель просили. Какая ответила — в `model` каждого вызова.
+    pub asked_model: String,
+    pub calls: usize,
+    pub question: String,
+    pub a: VoiceCase,
+    pub b: VoiceCase,
+    /// Контроль без профиля: тот же вопрос, обычный ассистент.
+    pub control: Call,
+    pub control_hits_a: bool,
+    pub control_hits_b: bool,
+    pub verdict: ContextVerdict,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfileAutoReport {
+    /// Какую модель просили. Какая ответила — в `model` каждого вызова.
+    pub asked_model: String,
+    pub calls: usize,
+    pub profile: String,
+    pub question: String,
+    pub token: String,
+    /// Профиль плюс записи `профиль.*` в долговременной памяти.
+    pub with_memory: Call,
+    /// Тот же профиль, память про пользователя пуста.
+    pub without_memory: Call,
+    pub with_recalled: bool,
+    pub without_recalled: bool,
+    pub verdict: ContextVerdict,
+}
+
+#[derive(Clone, Debug)]
+pub enum ProfileReport {
+    Wire(ProfileWireReport),
+    Voice(Box<ProfileVoiceReport>),
+    Auto(Box<ProfileAutoReport>),
+}
+
+impl ProfileReport {
+    pub fn verdict(&self) -> ContextVerdict {
+        match self {
+            ProfileReport::Wire(r) => r.verdict,
+            ProfileReport::Voice(r) => r.verdict,
+            ProfileReport::Auto(r) => r.verdict,
+        }
+    }
+
+    pub fn confirmed(&self) -> bool {
+        self.verdict() == ContextVerdict::Confirmed
+    }
+
+    pub fn calls(&self) -> usize {
+        match self {
+            ProfileReport::Wire(_) => 0,
+            ProfileReport::Voice(r) => r.calls,
+            ProfileReport::Auto(r) => r.calls,
+        }
+    }
+
+    pub fn status_line(&self) -> String {
+        match self {
+            ProfileReport::Wire(r) => format!(
+                "wire: verdict={} случаев={} остальное не тронуто={} блоки различаются={} блок памяти цел={}",
+                r.verdict.as_str(),
+                r.cases.len(),
+                r.rest_identical,
+                r.blocks_differ,
+                r.memory_block_kept
+            ),
+            ProfileReport::Voice(r) => format!(
+                "voice: verdict={} {}(своя={} чужая={}) {}(своя={} чужая={})",
+                r.verdict.as_str(),
+                r.a.profile,
+                r.a.own,
+                r.a.other,
+                r.b.profile,
+                r.b.own,
+                r.b.other
+            ),
+            ProfileReport::Auto(r) => format!(
+                "auto: verdict={} профиль={} с памятью помнит {}={} без памяти={} prompt_tokens {}→{}",
+                r.verdict.as_str(),
+                r.profile,
+                r.token,
+                r.with_recalled,
+                r.without_recalled,
+                r.without_memory.prompt_tokens,
+                r.with_memory.prompt_tokens
+            ),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            ProfileReport::Wire(r) => {
+                let mut out = String::from(
+                    "=== профиль на проводе (без сети) ===\n\
+                     один и тот же запрос, меняется только настройка `profile`\n\n",
+                );
+                for c in &r.cases {
+                    out.push_str(&c.line());
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "\nодин профиль — один блок: {}\n\
+                     профиль заменяет дефолтный промпт: {}\n\
+                     свой системный промпт цел: {}\n\
+                     при смене профиля остальное в system не изменилось: {}\n\
+                     блоки двух профилей различаются: {}\n\
+                     блок долговременной памяти на месте: {}\n\
+                     verdict={}\n",
+                    r.cases.iter().all(|c| c.blocks <= 1),
+                    r.cases
+                        .iter()
+                        .filter(|c| c.profile != profile::OFF)
+                        .all(|c| !c.default_prompt),
+                    r.cases
+                        .iter()
+                        .filter(|c| c.label.starts_with("свой промпт"))
+                        .all(|c| c.rest.contains(CUSTOM_PROMPT)),
+                    r.rest_identical,
+                    r.blocks_differ,
+                    r.memory_block_kept,
+                    r.verdict.as_str()
+                ));
+                out
+            }
+            ProfileReport::Voice(r) => {
+                let mut out = format!(
+                    "=== голоса двух профилей (живьём) ===\nмодель: просили {} \n\
+                     вопрос (один и тот же): {}\n\n",
+                    r.asked_model, r.question
+                );
+                out.push_str(&r.a.line());
+                out.push_str("\n\n");
+                out.push_str(&r.b.line());
+                out.push_str(&format!(
+                    "\n\n[контроль без профиля] {}\n  {}\n  подпись {}: {} · подпись {}: {}\n",
+                    r.control.line(),
+                    clip(&r.control.text, 200),
+                    r.a.profile,
+                    r.control_hits_a,
+                    r.b.profile,
+                    r.control_hits_b
+                ));
+                out.push_str(&format!(
+                    "\nкаждый ответ несёт свою подпись и не несёт чужую → verdict={}\n",
+                    r.verdict.as_str()
+                ));
+                out
+            }
+            ProfileReport::Auto(r) => {
+                let mut out = format!(
+                    "=== что профиль учитывает автоматически (живьём) ===\n\
+                     модель: просили {}\nпрофиль: {}\n\
+                     вопрос (про имя не спрашиваем): {}\n\n",
+                    r.asked_model, r.profile, r.question
+                );
+                out.push_str(&format!(
+                    "[профиль + записи профиль.* в долговременной памяти] {}\n  {}\n  помнит {}: {}\n\n",
+                    r.with_memory.line(),
+                    clip(&r.with_memory.text, 200),
+                    r.token,
+                    r.with_recalled
+                ));
+                out.push_str(&format!(
+                    "[тот же профиль, память про пользователя пуста] {}\n  {}\n  помнит {}: {}\n\n",
+                    r.without_memory.line(),
+                    clip(&r.without_memory.text, 200),
+                    r.token,
+                    r.without_recalled
+                ));
+                out.push_str(&format!(
+                    "разница ровно в двух строках блока профиля: prompt_tokens {} → {}\nverdict={}\n",
+                    r.without_memory.prompt_tokens,
+                    r.with_memory.prompt_tokens,
+                    r.verdict.as_str()
+                ));
+                out
+            }
+        }
+    }
+}
+
+/// Свой системный промпт для `wire`-случая: он не должен пострадать от
+/// профиля.
+const CUSTOM_PROMPT: &str = "Отвечай только проверяемыми фактами.";
+
+pub fn run_profile(checks: &[ProfileCheck], model: Option<&str>) -> Res<Vec<ProfileReport>> {
+    let mut out = Vec::new();
+    for check in checks {
+        out.push(match check {
+            ProfileCheck::Wire => ProfileReport::Wire(run_profile_wire()?),
+            ProfileCheck::Voice => ProfileReport::Voice(Box::new(run_profile_voice(model)?)),
+            ProfileCheck::Auto => ProfileReport::Auto(Box::new(run_profile_auto(model)?)),
+        });
+    }
+    Ok(out)
+}
+
+/// Агент без сети: эндпойнт заведомо нерабочий, но `system_for_request`
+/// собирается тем же кодом, что и в настоящем запросе.
+fn wire_agent(system_prompt: &str, profile_id: &str) -> Res<Agent> {
+    let settings = Settings {
+        system_prompt: system_prompt.to_string(),
+        context_enabled: false,
+        ..Settings::default()
+    };
+    let mut agent = Agent::with_endpoint(api::Endpoint::unusable(), settings);
+    agent.set_profile(profile_id)?;
+    Ok(agent)
+}
+
+/// Разобрать собранный `system` на блок профиля и всё остальное, заодно
+/// пересчитав, что из профиля до блока не доехало.
+fn wire_case(label: &str, agent: &Agent) -> WireCase {
+    let system = agent.system_for_request();
+    let (block, rest) = profile::split_block(&system);
+    let blocks = system.matches(profile::BLOCK_HEAD).count();
+    let missing = match agent.profile() {
+        Some(p) => {
+            let body = block.clone().unwrap_or_default();
+            let mut want: Vec<String> = vec![p.style.clone(), p.format.clone()];
+            want.extend(p.limits.iter().cloned());
+            want.into_iter()
+                .filter(|w| !w.trim().is_empty() && !body.contains(w.trim()))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    WireCase {
+        label: label.to_string(),
+        profile: agent.settings().profile.clone(),
+        block,
+        blocks,
+        default_prompt: system.contains(config::DEFAULT_SYSTEM_PROMPT),
+        rest,
+        missing,
+    }
+}
+
+/// Что реально уезжает в `system`. Ноль запросов: проверяется сборка, а
+/// сборку видно целиком.
+pub fn run_profile_wire() -> Res<ProfileWireReport> {
+    let mut cases = Vec::new();
+
+    // 1. Дефолтный системный промпт: профиль его заменяет.
+    let off = wire_agent(config::DEFAULT_SYSTEM_PROMPT, profile::OFF)?;
+    cases.push(wire_case("дефолтный промпт", &off));
+    let chem = wire_agent(config::DEFAULT_SYSTEM_PROMPT, "chemist")?;
+    cases.push(wire_case("дефолтный промпт", &chem));
+
+    // 2. Свой системный промпт: профиль его не трогает, они складываются.
+    let a = wire_agent(CUSTOM_PROMPT, "chemist")?;
+    cases.push(wire_case("свой промпт", &a));
+    let b = wire_agent(CUSTOM_PROMPT, "gopnik")?;
+    cases.push(wire_case("свой промпт", &b));
+    let rest_identical = cases[2].rest == cases[3].rest && cases[2].rest.contains(CUSTOM_PROMPT);
+    let blocks_differ = cases[2].block != cases[3].block;
+
+    // 3. Профиль поверх памяти: блок долговременного слоя не должен
+    //    пострадать от смены голоса.
+    let mut mem_agent = wire_agent(CUSTOM_PROMPT, "gopnik")?;
+    mem_agent.set_strategy(ContextStrategy::Memory);
+    let mut store = MemoryStore::in_memory();
+    store.apply_ops(&[memory::Op::Upsert {
+        key: "профиль.имя".into(),
+        value: "Евгений".into(),
+        layer: Some(Layer::Long),
+    }]);
+    mem_agent.set_memory(store);
+    cases.push(wire_case("память + профиль", &mem_agent));
+    let with_memory = &cases[4];
+    let memory_block_kept =
+        with_memory.rest.contains(Layer::Long.title()) && with_memory.rest.contains("Евгений");
+
+    let verdict = if cases.iter().any(|c| c.blocks > 1 || !c.missing.is_empty())
+        || cases[0].block.is_some()
+        || !cases[0].default_prompt
+        || cases[1].block.is_none()
+        || cases[1].default_prompt
+        || cases[2].block.is_none()
+        || !rest_identical
+        || !blocks_differ
+        || !memory_block_kept
+    {
+        ContextVerdict::Inconclusive
+    } else {
+        ContextVerdict::Confirmed
+    };
+
+    Ok(ProfileWireReport {
+        cases,
+        rest_identical,
+        blocks_differ,
+        memory_block_kept,
+        verdict,
+    })
+}
+
+/// Настройки живых проверок профиля: та же изоляция, что у проверок памяти,
+/// плюс `temperature=0` — разброс сэмплировки к персонализации отношения не
+/// имеет.
+fn profile_settings(model: Option<&str>) -> Res<Settings> {
+    let mut settings = context_settings(model)?;
+    settings.temperature = Some(0.0);
+    Ok(settings)
+}
+
+/// Один вопрос — два голоса. Confirmed только по матрице подписей: свой
+/// маркер есть, чужого нет, у обоих. «Тексты разные» здесь не аргумент —
+/// два вызова одной модели разойдутся и без всякого профиля.
+pub fn run_profile_voice(model: Option<&str>) -> Res<ProfileVoiceReport> {
+    let settings = profile_settings(model)?;
+    let asked_model = settings.model.clone();
+    let question = "Почему небо голубое?";
+
+    let catalog = profile::ProfileSet::in_memory();
+    let pa = catalog
+        .get("chemist")
+        .ok_or("во встроенном каталоге нет профиля chemist")?
+        .clone();
+    let pb = catalog
+        .get("gopnik")
+        .ok_or("во встроенном каталоге нет профиля gopnik")?
+        .clone();
+    let ma = pa.marker.clone().ok_or("у профиля chemist нет подписи")?;
+    let mb = pb.marker.clone().ok_or("у профиля gopnik нет подписи")?;
+
+    let mut agent = Agent::new(settings.clone())?;
+    agent.set_profile("chemist")?;
+    let call_a = probe(&agent, question)?;
+    agent.set_profile("gopnik")?;
+    let call_b = probe(&agent, question)?;
+    agent.set_profile(profile::OFF)?;
+    let control = probe(&agent, question)?;
+
+    let a = VoiceCase {
+        profile: pa.id.clone(),
+        title: pa.title.clone(),
+        own: ma.matches(&call_a.text),
+        other: mb.hits(&call_a.text),
+        call: call_a,
+    };
+    let b = VoiceCase {
+        profile: pb.id.clone(),
+        title: pb.title.clone(),
+        own: mb.matches(&call_b.text),
+        other: ma.hits(&call_b.text),
+        call: call_b,
+    };
+    let control_hits_a = ma.hits(&control.text);
+    let control_hits_b = mb.hits(&control.text);
+
+    let verdict = if a.own && b.own && !a.other && !b.other {
+        ContextVerdict::Confirmed
+    } else if !a.own && !b.own {
+        // Оба ответа мимо своих подписей: профиль на голос не повлиял.
+        ContextVerdict::Flat
+    } else {
+        ContextVerdict::Inconclusive
+    };
+
+    Ok(ProfileVoiceReport {
+        asked_model,
+        calls: 3,
+        question: question.to_string(),
+        a,
+        b,
+        control,
+        control_hits_a,
+        control_hits_b,
+        verdict,
+    })
+}
+
+/// «Учитывает автоматически»: записи `профиль.*` из долговременной памяти
+/// подклеиваются в блок профиля, и без них ответ про пользователя
+/// разваливается. Разница между двумя вызовами — ровно две строки блока.
+pub fn run_profile_auto(model: Option<&str>) -> Res<ProfileAutoReport> {
+    let settings = profile_settings(model)?;
+    let asked_model = settings.model.clone();
+    let token = "Евгений";
+    let question = "Поздоровайся и скажи, сколько будет 12*12.";
+
+    let mut agent = Agent::new(settings.clone())?;
+    agent.set_profile("tutor")?;
+
+    // Без памяти про пользователя: имя взять неоткуда.
+    agent.set_memory(MemoryStore::in_memory());
+    let without_memory = probe(&agent, question)?;
+
+    let mut store = MemoryStore::in_memory();
+    store.apply_ops(&[
+        memory::Op::Upsert {
+            key: "профиль.имя".into(),
+            value: token.into(),
+            layer: Some(Layer::Long),
+        },
+        memory::Op::Upsert {
+            key: "профиль.обращение".into(),
+            value: "здоровайся по имени в первой строке".into(),
+            layer: Some(Layer::Long),
+        },
+    ]);
+    agent.set_memory(store);
+    let with_memory = probe(&agent, question)?;
+
+    let with_recalled = has_word(&with_memory.text, token);
+    let without_recalled = has_word(&without_memory.text, token);
+    let bigger = with_memory.prompt_tokens > without_memory.prompt_tokens;
+
+    let verdict = if with_recalled && !without_recalled && bigger {
+        ContextVerdict::Confirmed
+    } else if !with_recalled {
+        ContextVerdict::Flat
+    } else {
+        ContextVerdict::Leaky
+    };
+
+    Ok(ProfileAutoReport {
+        asked_model,
+        calls: 2,
+        profile: "tutor".into(),
+        question: question.to_string(),
+        token: token.to_string(),
+        with_memory,
+        without_memory,
+        with_recalled,
+        without_recalled,
+        verdict,
+    })
 }

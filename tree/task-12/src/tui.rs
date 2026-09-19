@@ -28,6 +28,7 @@ use crate::complete;
 use crate::compress;
 use crate::config::{self, Effort, Res, Settings};
 use crate::memory::{self, Layer, MemoryStore};
+use crate::profile;
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
 use crate::tokens::{self, Shape, TokenMeter};
@@ -67,11 +68,14 @@ const SETTINGS_ROWS: &[&str] = &[
     "temperature",
     "top_p",
     "top_k",
+    "profile",
     "system_prompt",
 ];
 /// Подсказка по переключателю — одна на `/strategy`, `/help` и ошибки.
 const STRATEGY_USAGE: &str =
     "/strategy [show|off|summary|window|facts|branch|memory|keep N|every N]";
+const PROFILE_USAGE: &str =
+    "/profile [show|list|off|prompt|<id>], id из каталога — /profile list";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -397,6 +401,10 @@ impl App {
             self.session.memory_task(),
         );
         self.agent.set_memory(store);
+        // Профили — рядом со слоями памяти, в том же корне.
+        self.agent
+            .set_profiles(profile::ProfileSet::open(memory::memory_root()));
+        self.settings.profile = self.agent.settings().profile.clone();
     }
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Res<()> {
@@ -750,6 +758,7 @@ impl App {
                 .map(str::to_string)
                 .collect(),
             memory_keys: self.agent.memory().keys(),
+            profiles: self.agent.profiles().ids(),
         }
     }
 
@@ -1044,6 +1053,7 @@ impl App {
             "strategy" | "compress" => self.cmd_strategy(rest),
             "facts" => self.cmd_facts(rest),
             "mem" | "memory" => self.cmd_mem(rest),
+            "profile" | "профиль" => self.cmd_profile(rest),
             "branch" => self.cmd_branch(rest),
             "checkpoint" => self.cmd_checkpoint(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
@@ -1889,6 +1899,66 @@ impl App {
     /// называет человек, и маршрутизатор с ним не спорит. Всё, что здесь
     /// меняется, немедленно оказывается в файле своего слоя — видно через
     /// `/mem show` и обычным `cat`.
+    /// Персонализация: выбрать профиль, посмотреть каталог, посмотреть, что
+    /// именно уезжает в `system`. Правка профилей — в файле каталога
+    /// (`/profile list` печатает путь): руками там удобнее, чем командой в
+    /// одну строку, а встроенные профили файл не перекрывает, пока их не
+    /// переопределят по id.
+    fn cmd_profile(&mut self, rest: &str) {
+        let rest = rest.trim();
+        match rest {
+            "" | "show" | "status" => {
+                let text = match self.agent.profile() {
+                    Some(p) => {
+                        let known = self.agent.known_about_user();
+                        let tail = if known.is_empty() {
+                            "\nдолговременная память про пользователя: пусто".to_string()
+                        } else {
+                            format!(
+                                "\nиз долговременной памяти: {}",
+                                known
+                                    .iter()
+                                    .map(|(k, v)| format!("{k} = {v}"))
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            )
+                        };
+                        format!("{}{tail}", p.card())
+                    }
+                    None => format!(
+                        "профиль: off — обычный ассистент.\n{}",
+                        self.agent.profiles().listing()
+                    ),
+                };
+                self.entries.push(Entry::Info(text));
+            }
+            "list" | "ls" => {
+                let text = self.agent.profiles().listing();
+                self.entries.push(Entry::Info(text));
+            }
+            // Что реально уезжает в system — вместе с тем, что подклеила
+            // долговременная память.
+            "prompt" | "block" => {
+                let text = match self.agent.profile() {
+                    Some(p) => p.block(&self.agent.known_about_user()),
+                    None => "профиль выключен — блока в system нет".to_string(),
+                };
+                self.entries.push(Entry::Info(text));
+            }
+            "help" | "?" => self.status = PROFILE_USAGE.into(),
+            id => match self.agent.set_profile(id) {
+                Ok(()) => {
+                    self.settings.profile = self.agent.settings().profile.clone();
+                    self.status = match self.agent.profile() {
+                        Some(p) => format!("профиль: {} — {}", p.id, p.title),
+                        None => "профиль: off".into(),
+                    };
+                }
+                Err(e) => self.status = format!("{e} ({PROFILE_USAGE})"),
+            },
+        }
+    }
+
     fn cmd_mem(&mut self, rest: &str) {
         let rest = rest.trim();
         let (head, tail) = match rest.split_once(char::is_whitespace) {
@@ -2478,6 +2548,21 @@ impl App {
             "top_p" => self.settings.top_p = cycle_float(TOP_P_CHOICES, self.settings.top_p, delta),
             "top_k" => {
                 self.settings.top_k = cycle_choice(TOP_K_CHOICES, self.settings.top_k, delta)
+            }
+            // Персонализация: off плюс каталог профилей. Выбор уезжает и
+            // в настройки (значит, и в сессию), и в файл каталога.
+            "profile" => {
+                let ids = self.agent.profiles().ids();
+                let cur = ids
+                    .iter()
+                    .position(|id| *id == self.settings.profile)
+                    .unwrap_or(0) as i32;
+                let n = ids.len() as i32;
+                let next = ids[(cur + delta).rem_euclid(n) as usize].clone();
+                self.settings.profile = next.clone();
+                if let Err(e) = self.agent.set_profile(&next) {
+                    self.status = e;
+                }
             }
             "system_prompt" => {}
             _ => {}
@@ -3272,6 +3357,16 @@ impl App {
                 .top_k
                 .map(config::render_top_k)
                 .unwrap_or_else(|| "provider default".into()),
+            "profile" => match self.agent.profile() {
+                Some(p) => format!(
+                    "{}  ({}; заменяет системный промпт, пока тот дефолтный)",
+                    p.id, p.title
+                ),
+                None => format!(
+                    "off  (персонализация выключена; {} профилей в каталоге — /profile list)",
+                    self.agent.profiles().all().len()
+                ),
+            },
             "system_prompt" => {
                 let text = &self.settings.system_prompt;
                 let preview: String = text.chars().take(40).collect();
@@ -3615,6 +3710,7 @@ const HELP: &str = "\
 /mem [show [layer]|dialog|routes|where k]  three memory layers: short / working / long
 /mem <layer> set k v | del k      write to a layer by hand (layer = short|working|long)
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
+/profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /checkpoint [name]        mark the current point so branches can fork from it
 /branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
 /settings                 open the settings panel (Tab on an empty input)
