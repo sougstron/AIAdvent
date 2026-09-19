@@ -17,6 +17,8 @@ pub enum Source {
     FactKeys,
     /// Ключи трёхслойной памяти (`/mem del`, `/mem where`).
     MemoryKeys,
+    /// Id профилей пользователя (`/profile <id>`).
+    Profiles,
 }
 
 /// Узел дерева команд.
@@ -180,6 +182,13 @@ pub const ROOT: &[Node] = &[
     },
     leaf("new"),
     lit("personas", "[cast:] question", &[free("")]),
+    Node {
+        token: "profile",
+        hint: "id|command",
+        alts: &["профиль"],
+        next: PROFILE_NEXT,
+        sources: &[Source::Profiles],
+    },
     leaf("quit"),
     lit("rename", "title", &[free("")]),
     leaf("sessions"),
@@ -206,6 +215,14 @@ pub const ROOT: &[Node] = &[
 ];
 
 const CONTEXT_NEXT: &[Node] = &[leaf("show"), leaf("on"), leaf("off"), leaf("reload")];
+
+/// `/profile` — команды плюс живой список id профилей.
+const PROFILE_NEXT: &[Node] = &[
+    leaf("show"),
+    leaf("list"),
+    leaf("off"),
+    leaf("prompt"),
+];
 
 /// Операции внутри одного слоя (`/mem long set ...`).
 const MEM_LAYER_OPS: &[Node] = &[
@@ -257,6 +274,7 @@ pub struct Values {
     pub models: Vec<String>,
     pub fact_keys: Vec<String>,
     pub memory_keys: Vec<String>,
+    pub profiles: Vec<String>,
 }
 
 impl Values {
@@ -267,6 +285,7 @@ impl Values {
             Source::Models => &self.models,
             Source::FactKeys => &self.fact_keys,
             Source::MemoryKeys => &self.memory_keys,
+            Source::Profiles => &self.profiles,
         }
     }
 }
@@ -465,6 +484,7 @@ mod tests {
             models: vec!["glm-5.3-flash".into()],
             fact_keys: vec!["user.name".into()],
             memory_keys: vec!["профиль.язык".into()],
+            profiles: vec!["chemist".into(), "gopnik".into()],
         }
     }
 

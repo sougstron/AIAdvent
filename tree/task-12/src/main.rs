@@ -11,6 +11,7 @@ mod context;
 mod facts;
 mod isolation;
 mod memory;
+mod profile;
 mod render;
 mod runtime;
 mod session;

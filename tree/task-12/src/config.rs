@@ -429,6 +429,10 @@ fn default_system_prompt() -> String {
     DEFAULT_SYSTEM_PROMPT.to_string()
 }
 
+fn default_profile() -> String {
+    crate::profile::OFF.to_string()
+}
+
 const fn default_context_enabled() -> bool {
     true
 }
@@ -442,6 +446,13 @@ pub struct Settings {
     pub model: String,
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
+    /// Активный профиль пользователя (`profile.rs`): id из каталога или
+    /// [`crate::profile::OFF`]. Персонализация — отдельная настройка, а не
+    /// ещё один кусок текста в `system_prompt`: профиль подключается к
+    /// каждому запросу отдельным блоком и, пока `system_prompt` остался
+    /// дефолтным, заменяет собой «ты — полезный ассистент».
+    #[serde(default = "default_profile")]
+    pub profile: String,
     /// When true, `Agent` injects discovered AGENTS.md / CLAUDE.md files
     /// into the system message. Toggled at runtime via `set_context_enabled`.
     #[serde(default = "default_context_enabled")]
@@ -515,6 +526,7 @@ impl Default for Settings {
         Settings {
             model: default_model(),
             system_prompt: default_system_prompt(),
+            profile: default_profile(),
             context_enabled: true,
             context_strategy: ContextStrategy::default(),
             keep_recent: DEFAULT_KEEP_RECENT,
@@ -604,6 +616,14 @@ impl Settings {
             }
             other => format!("strategy={other}"),
         });
+        parts.push(format!(
+            "profile={}",
+            if self.profile.is_empty() {
+                crate::profile::OFF
+            } else {
+                &self.profile
+            }
+        ));
         parts.push(match self.max_chars {
             Some(n) => format!("max_chars={n}"),
             None => "max_chars=off".into(),
@@ -722,6 +742,10 @@ mod tests {
     fn summary_line_shows_the_context_strategy() {
         let mut s = Settings::default();
         assert!(s.summary().contains("strategy=off"));
+        // Профиль — такая же настройка хода, как и остальные.
+        assert!(s.summary().contains("profile=off"));
+        s.profile = "gopnik".into();
+        assert!(s.summary().contains("profile=gopnik"));
         s.context_strategy = ContextStrategy::Summary;
         assert!(s.summary().contains("strategy=summary(keep=6,every=10)"));
         // Окну и фактам `summarize_every` не нужен — его и не показываем.

@@ -57,7 +57,7 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-11/`.** It is a working agent: a ratatui
+**The active snapshot is `tree/task-12/`.** It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
@@ -70,7 +70,7 @@ window|facts|branch|all`. Task 11 added a sixth value, `memory`, and with it
 an **explicit three-layer memory model** (`memory.rs`): short (current
 dialogue), working (current task) and long (profile, decisions, knowledge).
 The layers are physically separate — one folder and one file each under
-`tree/task-11/memory/{short,working,long}/` — and every record carries who
+`tree/task-12/memory/{short,working,long}/` — and every record carries who
 wrote it and *why it landed in that layer*. Nothing is saved "to memory": the
 layer is chosen explicitly, either by hand (`/mem <layer> set k v`) or by
 `memory::route`, where a key prefix (`профиль.` / `задача.` / `тема.`) beats
@@ -83,10 +83,30 @@ possible. The proof is `ask --verify-memory routing|influence|isolation|all`
 is Confirmed only when removing **one** block (long) kills the profile answer
 and leaves the task answer, and `isolation` only when switching tasks forgets
 the working code while the long-term one survives and the old task's file
-still holds it. All three came back Confirmed live on `glm-5.3-flash`. Its
-`README.md` covers the Agent shape, key resolution, runtime settings, all six
-strategies plus the memory model with their corner cases and real verify
-output, and the live lever self-test (temperature confirmed; top_p flat;
+still holds it. All three came back Confirmed live on `glm-5.3-flash`.
+
+Task 12 put **personalization** on top of that memory: `profile.rs` adds a
+user profile (style, format, limits, a hard answer cap) as its own setting —
+the `profile` row in settings, `/profile`, `--profile` — with three built-ins
+(`chemist`, `gopnik`, `tutor`) and user profiles in
+`tree/task-12/memory/long/profiles.json`. The profile rides **every** request
+as the first `system` block (`<user-profile id="…">`) and replaces the default
+"ты — полезный ассистент" prompt while that prompt is still the default one; a
+custom system prompt is left alone. The long-term layer's `профиль.*` records
+are glued into that same block — that is the "takes it into account by itself"
+half. The proof is `ask --verify-profile wire|voice|auto|all`, and it is
+causal, never "the texts differ": `wire` runs offline and requires that
+switching profiles leaves every other byte of the system message identical
+(that tag-delimited block exists so the boundary is exact); `voice` asks one
+question under two profiles and confirms only on a cross-matrix of
+machine-checkable signatures — own marker present, the other profile's marker
+absent — reporting `Flat` otherwise; `auto` removes the two `профиль.*` memory
+lines and requires the name to disappear from the answer with `prompt_tokens`
+dropping. All three came back Confirmed live on `glm-5.3-flash`.
+
+Its `README.md` covers the Agent shape, key resolution, runtime settings, all six
+strategies plus the memory model and the personalization profile with their
+corner cases and real verify output, and the live lever self-test (temperature confirmed; top_p flat;
 top_k unsupported). It started as a verbatim copy of `tree/task-10/`, which
 came from `tree/task-9/` and, before that, `tree/task-8/` / `tree/task-7/`
 (task 7 already met the requirements, so it stayed frozen); `tree/task-5/`

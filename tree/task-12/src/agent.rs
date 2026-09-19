@@ -11,7 +11,8 @@ use crate::compress::{self, Compressor, Policy};
 use crate::config::{ContextStrategy, Res, Settings};
 use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
 use crate::facts::{self, FactStore, FactsDelta};
-use crate::memory::{self, MemoryStore};
+use crate::memory::{self, Layer, MemoryStore};
+use crate::profile::{self, Profile, ProfileSet};
 use crate::session::Session;
 use crate::strategy;
 
@@ -88,6 +89,11 @@ pub struct Agent {
     /// долговременная. В отличие от фактов, живёт на диске и переживает
     /// перезапуск — поэтому её не сбрасывает `reset`.
     memory: MemoryStore,
+    /// Каталог профилей пользователя (см. `profile.rs`). Какой из них
+    /// активен, хранится в `settings.profile` — там же, где живут остальные
+    /// настройки разговора, поэтому профиль уезжает в сессию и возвращается
+    /// из неё вместе с ними.
+    profiles: ProfileSet,
 }
 
 impl Agent {
@@ -122,6 +128,7 @@ impl Agent {
             compressor: Compressor::new(),
             facts: FactStore::new(),
             memory: MemoryStore::in_memory(),
+            profiles: ProfileSet::in_memory(),
         };
         agent.refresh_context();
         agent
@@ -223,6 +230,53 @@ impl Agent {
 
     pub fn memory_mut(&mut self) -> &mut MemoryStore {
         &mut self.memory
+    }
+
+    pub fn profiles(&self) -> &ProfileSet {
+        &self.profiles
+    }
+
+    /// Активный профиль. Неизвестный id — `None`: чужой голос молча не
+    /// подставляется (см. `ProfileSet::active`).
+    pub fn profile(&self) -> Option<&Profile> {
+        self.profiles.get(&self.settings.profile)
+    }
+
+    /// Выбрать профиль по имени (`off` выключает). Запоминается и в
+    /// настройках, и в файле каталога.
+    pub fn set_profile(&mut self, id: &str) -> Res<()> {
+        self.profiles.set_active(id)?;
+        self.settings.profile = self.profiles.active_id().to_string();
+        Ok(())
+    }
+
+    /// Подцепить каталог с диска. Если в настройках профиль ещё не выбран, а
+    /// файл помнит выбор — он и применяется: персонализация должна пережить
+    /// перезапуск, иначе это не профиль, а настроение сессии.
+    pub fn set_profiles(&mut self, profiles: ProfileSet) {
+        self.profiles = profiles;
+        if self.settings.profile.is_empty() || self.settings.profile == profile::OFF {
+            self.settings.profile = self.profiles.active_id().to_string();
+        } else {
+            // Выбор из настроек (сессия, `--profile`) сильнее файла, но
+            // файл он не переписывает: это выбор на этот запуск.
+            self.profiles.adopt_active(&self.settings.profile.clone());
+        }
+    }
+
+    /// Что долговременная память знает про пользователя: записи с префиксом
+    /// `профиль.` / `profile.`. Это вторая половина блока персонализации —
+    /// то, что агент запомнил сам, а не то, что человек выбрал руками.
+    pub fn known_about_user(&self) -> Vec<(String, String)> {
+        self.memory
+            .records(Layer::Long)
+            .iter()
+            .filter(|r| {
+                let k = r.key.trim().to_lowercase();
+                k.starts_with("профиль.") || k.starts_with("profile.")
+            })
+            .map(|r| (r.key.trim().to_string(), r.value.trim().to_string()))
+            .collect()
     }
 
     pub fn set_memory(&mut self, memory: MemoryStore) {
@@ -459,14 +513,47 @@ impl Agent {
     /// Request/response for an explicit history (TUI session, `/personas`).
     /// Does not mutate the agent's own history.
     pub fn complete(&self, history: &[ChatMessage]) -> Res<Reply> {
+        let max_chars = self.effective_settings().max_chars;
         let outcome = self.complete_outcome(history)?;
-        Ok(Reply::from_outcome(outcome, self.settings.max_chars))
+        Ok(Reply::from_outcome(outcome, max_chars))
+    }
+
+    /// Настройки одного запроса: клампнутые плюс то, что профиль добавляет
+    /// **сам**, без отдельной команды. Сейчас это потолок ответа: профиль
+    /// просит быть кратким словами, а клиент режет по факту (тот же приём,
+    /// что и у `max_chars` в настройках — лимит-просьба гарантией не
+    /// является). Явно выставленный `max_chars` профиль не перебивает.
+    pub(crate) fn effective_settings(&self) -> Settings {
+        let mut settings = self.settings.clone();
+        settings.clamp();
+        if settings.max_chars.is_none() {
+            settings.max_chars = self.profile().and_then(|p| p.max_chars);
+        }
+        settings
     }
 
     /// System prompt + AGENTS.md files. Sent as `role: system` (see
     /// `context.rs`), never pushed onto `history`.
     pub(crate) fn system_for_request(&self) -> String {
-        let base = self.context.assemble(&self.settings.system_prompt);
+        // Профиль подключается к КАЖДОМУ запросу и идёт первым: он задаёт
+        // голос, всё остальное — содержание. Пока системный промпт остался
+        // дефолтным («ты — полезный ассистент…»), профиль его заменяет: два
+        // описания роли подряд — это спор в одном сообщении. Свой
+        // системный промпт профиль не трогает, они складываются.
+        let prompt = match (
+            self.profile(),
+            self.settings.system_prompt.trim() == crate::config::DEFAULT_SYSTEM_PROMPT,
+        ) {
+            (Some(_), true) => String::new(),
+            _ => self.settings.system_prompt.clone(),
+        };
+        let base = self.context.assemble(&prompt);
+        let block = self.profile().map(|p| p.block(&self.known_about_user()));
+        let base = match block {
+            Some(block) if base.trim().is_empty() => block,
+            Some(block) => format!("{block}\n\n{base}"),
+            None => base,
+        };
         // Sticky-слоты стратегии (summary, факты) уезжают сюда же, рядом с
         // AGENTS.md. Какие именно — решает `strategy::apply`.
         let blocks = strategy::blocks(
@@ -487,8 +574,7 @@ impl Agent {
     }
 
     pub fn complete_outcome(&self, history: &[ChatMessage]) -> Res<Outcome> {
-        let mut settings = self.settings.clone();
-        settings.clamp();
+        let settings = self.effective_settings();
         let schema = settings
             .json_mode
             .enabled
@@ -509,8 +595,7 @@ impl Agent {
         history: &[ChatMessage],
         cancel: Option<Arc<AtomicBool>>,
     ) -> Res<ChatStream> {
-        let mut settings = self.settings.clone();
-        settings.clamp();
+        let settings = self.effective_settings();
         api::chat_stream(
             &self.endpoint,
             &settings,
@@ -738,6 +823,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// Профиль подключается к каждому запросу и, пока системный промпт
+    /// дефолтный, заменяет его собой — ровно то, ради чего он отдельная
+    /// настройка, а не приписка к промпту.
+    #[test]
+    fn profile_replaces_the_default_prompt_and_rides_every_request() {
+        let mut agent = Agent::dummy_with(Settings::default());
+        let plain = agent.system_for_request();
+        assert!(plain.contains(crate::config::DEFAULT_SYSTEM_PROMPT));
+        assert!(!plain.contains(crate::profile::BLOCK_HEAD));
+
+        agent.set_profile("gopnik").unwrap();
+        let system = agent.system_for_request();
+        assert!(system.contains(crate::profile::BLOCK_HEAD));
+        assert!(system.contains("братан"));
+        assert!(
+            !system.contains(crate::config::DEFAULT_SYSTEM_PROMPT),
+            "два описания роли подряд — это спор в одном сообщении"
+        );
+        // Каждый запрос, а не только первый.
+        assert_eq!(agent.system_for_request(), system);
+    }
+
+    /// Свой системный промпт профиль не съедает: они складываются.
+    #[test]
+    fn custom_system_prompt_survives_the_profile() {
+        let mut agent = Agent::dummy_with(Settings {
+            system_prompt: "Отвечай только фактами.".into(),
+            ..Settings::default()
+        });
+        agent.set_profile("chemist").unwrap();
+        let system = agent.system_for_request();
+        assert!(system.contains("Отвечай только фактами."));
+        assert!(system.contains("Гипотеза:"));
+        assert_eq!(system.matches(crate::profile::BLOCK_HEAD).count(), 1);
+    }
+
+    /// Долговременная память про пользователя (`профиль.*`) доезжает в тот же
+    /// блок — это и есть «учитывает автоматически».
+    #[test]
+    fn long_term_profile_facts_ride_inside_the_profile_block() {
+        let mut agent = Agent::dummy_with(Settings::default());
+        agent.set_profile("tutor").unwrap();
+        let mut store = MemoryStore::in_memory();
+        store.apply_ops(&[
+            memory::Op::Upsert {
+                key: "профиль.имя".into(),
+                value: "Евгений".into(),
+                layer: Some(Layer::Long),
+            },
+            // Рабочий слой к персонализации отношения не имеет.
+            memory::Op::Upsert {
+                key: "задача.срок".into(),
+                value: "две недели".into(),
+                layer: Some(Layer::Working),
+            },
+        ]);
+        agent.set_memory(store);
+        assert_eq!(
+            agent.known_about_user(),
+            vec![("профиль.имя".to_string(), "Евгений".to_string())]
+        );
+        let system = agent.system_for_request();
+        let (block, _) = crate::profile::split_block(&system);
+        assert!(block.unwrap().contains("профиль.имя: Евгений"));
+    }
+
+    /// Потолок ответа из профиля применяется сам, но явный `max_chars`
+    /// не перебивает.
+    #[test]
+    fn profile_max_chars_applies_unless_the_user_set_one() {
+        let mut agent = Agent::dummy_with(Settings::default());
+        assert!(agent.effective_settings().max_chars.is_none());
+        agent.set_profile("gopnik").unwrap();
+        assert_eq!(agent.effective_settings().max_chars, Some(600));
+        agent.settings_mut().max_chars = Some(50);
+        assert_eq!(agent.effective_settings().max_chars, Some(50));
+    }
+
+    /// Неизвестное имя профиля — ошибка, а не тихая подмена голоса.
+    #[test]
+    fn unknown_profile_is_an_error_and_off_clears_the_block() {
+        let mut agent = Agent::dummy_with(Settings::default());
+        assert!(agent.set_profile("нет-такого").is_err());
+        assert!(agent.profile().is_none());
+        agent.set_profile("chemist").unwrap();
+        assert!(agent.profile().is_some());
+        agent.set_profile(crate::profile::OFF).unwrap();
+        assert!(agent.profile().is_none());
+        assert!(!agent
+            .system_for_request()
+            .contains(crate::profile::BLOCK_HEAD));
     }
 
     #[test]

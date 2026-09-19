@@ -11,6 +11,8 @@ use crate::auth::{self, CheckResult, Provider};
 use crate::billing;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
 use crate::isolation;
+use crate::memory;
+use crate::profile;
 use crate::render;
 use crate::runtime::{BoxSpec, Runtime};
 use crate::session;
@@ -38,6 +40,9 @@ use crate::verify;
         ask --verify-context all              prove window / facts / branch strategies live\n  \
         ask --strategy memory                 three memory layers: short / working / long\n  \
         ask --verify-memory all               prove the memory layers are separate and load-bearing\n  \
+        ask --profile chemist \"...\"            answer through a user profile (style / format / limits)\n  \
+        ask --profiles                        list the profile catalog\n  \
+        ask --verify-profile all              prove the profile reaches the wire and changes the voice\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -140,6 +145,25 @@ pub struct Cli {
     /// printing.
     #[arg(long, value_name = "WHICH")]
     pub verify_memory: Option<String>,
+
+    /// User profile applied to every request: an id from the catalog
+    /// (`--profiles`) or `off`. The profile carries style, format and
+    /// limits, and replaces the default "helpful assistant" prompt while
+    /// that prompt is still the default one.
+    #[arg(long, value_name = "ID")]
+    pub profile: Option<String>,
+
+    /// List the profile catalog (built-ins plus your own) and exit.
+    #[arg(long)]
+    pub profiles: bool,
+
+    /// Live proof for personalization: `wire` (what the profile puts into
+    /// the system message — no network), `voice` (same question, two
+    /// profiles, each answer carrying its own machine-checkable signature),
+    /// `auto` (what the long-term `профиль.*` memory adds by itself) or
+    /// `all`. Exits after printing.
+    #[arg(long, value_name = "WHICH")]
+    pub verify_profile: Option<String>,
 
     /// Where the memory layers live: `<dir>/short`, `<dir>/working`,
     /// `<dir>/long`. Default: the snapshot's own `memory/` next to the
@@ -256,6 +280,14 @@ impl Cli {
         if let Some(e) = &self.effort {
             s.effort = Effort::parse(e)?;
         }
+        // Профиль проверяем по тому же каталогу, который увидит агент:
+        // неизвестное имя должно падать здесь, а не молча уезжать в `off`.
+        if let Some(p) = &self.profile {
+            // Проверяем по тому же каталогу, который увидит агент, но файл
+            // не трогаем: флаг действует на один запуск, а `active` в файле
+            // — это то, что человек выбрал в TUI.
+            s.profile = profile::ProfileSet::open(memory::memory_root()).resolve(p)?;
+        }
         if let Some(path) = &self.json_schema_file {
             let raw =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -349,6 +381,11 @@ pub fn run() -> Res<()> {
         std::env::set_var("ASK_MEMORY_DIR", dir);
     }
 
+    if cli.profiles {
+        println!("{}", profile::ProfileSet::open(memory::memory_root()).listing());
+        return Ok(());
+    }
+
     let settings = cli.to_settings()?;
 
     if cli.verify_billing {
@@ -419,6 +456,33 @@ pub fn run() -> Res<()> {
         println!("живых вызовов всего: {calls}");
         if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
             return Err(format!("memory model not confirmed: {}", bad.status_line()));
+        }
+        return Ok(());
+    }
+
+    if let Some(which) = cli.verify_profile.as_deref() {
+        let checks = verify::ProfileCheck::parse(which)?;
+        println!(
+            "проверяю персонализацию: {}",
+            checks
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let reports = verify::run_profile(&checks, cli.verify_model.as_deref())?;
+        let mut calls = 0;
+        for report in &reports {
+            print!("{}", report.render());
+            println!();
+            calls += report.calls();
+        }
+        for report in &reports {
+            println!("{}", report.status_line());
+        }
+        println!("живых вызовов всего: {calls}");
+        if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
+            return Err(format!("profile not confirmed: {}", bad.status_line()));
         }
         return Ok(());
     }
@@ -501,10 +565,14 @@ fn one_shot(
             println!("{display}");
         }
         if reply.truncated_by_max_chars {
-            eprintln!(
-                "! truncated to max_chars={}",
-                settings.max_chars.unwrap_or(0)
-            );
+            // Потолок мог приехать из профиля, а не из `--max-chars`:
+            // печатаем тот, по которому реально резали.
+            let cap = rt
+                .get(&id)
+                .and_then(|b| b.effective_settings().max_chars)
+                .or(settings.max_chars)
+                .unwrap_or(0);
+            eprintln!("! truncated to max_chars={cap}");
         }
         if let Some(e) = parse_note {
             eprintln!("! {e}");
