@@ -122,7 +122,36 @@ git log --oneline -3 origin/main
 
 Only after the file listing on `origin/main` shows the work is the push done.
 
-### 7. Report links
+### 7. Clean up stale `kanban/*` branches
+
+Every task leaves behind a `kanban/TASK-NNN` branch whose tip is the snapshot
+taken *before* that task ran. Once `main` carries the work, those branches are
+pure noise on GitHub's branch list — and worse, they are misleading: they look
+like the task's result but point at a commit from before it.
+
+A remote branch is safe to delete only when it holds **no unique commit**:
+
+```sh
+git fetch origin --prune
+for r in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/kanban); do
+  git merge-base --is-ancestor "$r" origin/main \
+    && echo "merged, safe to delete: ${r#origin/} ($(git rev-list --count origin/main..$r) unique commits)"
+done
+```
+
+Delete only the ones that printed (never the branch of the task you are
+currently running):
+
+```sh
+git push origin --delete kanban/TASK-0NN ...
+git fetch origin --prune
+```
+
+Deleting remote branches is not reversible from here, so **ask the human
+before doing it** unless they already told you to clean up. Never delete a
+branch that has unique commits, and never delete `main`.
+
+### 8. Report links
 
 Print URLs the human can click, derived from `git remote get-url origin`:
 
@@ -136,9 +165,13 @@ Print URLs the human can click, derived from `git remote get-url origin`:
 success unless the verification in step 6 passes.
 
 ```sh
-.claude/skills/push-to-git/push_all.sh <path-that-must-appear-on-main>
+.claude/skills/push-to-git/push_all.sh [--prune-merged] <path-that-must-appear-on-main>
 ```
 
 Example: `.claude/skills/push-to-git/push_all.sh tree/task-11`
+
+By default it *lists* the stale `kanban/*` branches from step 7 but does not
+touch them. Pass `--prune-merged` (only with the human's go-ahead) to also
+delete the ones that are fully contained in `origin/main`.
 
 It never force-pushes and never checks out another worktree's branch.
