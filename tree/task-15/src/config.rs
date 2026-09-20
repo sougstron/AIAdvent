@@ -463,6 +463,13 @@ pub struct Settings {
     /// (`/todo on`, строка `todo` в настройках, `--todo`).
     #[serde(default)]
     pub todo: bool,
+    /// Кто подписывает план (`run.rs`). Гейт утверждения работает всегда;
+    /// эта настройка решает только, ждём ли мы человека или подписываем
+    /// автоматически (и пишем в журнал `approved-by=auto`). По умолчанию —
+    /// `manual`: «нельзя реализацию до утверждённого плана» должно быть
+    /// поведением по умолчанию, а не опцией.
+    #[serde(default)]
+    pub approve: crate::run::ApprovePolicy,
     /// Inject project invariants and validate every answer client-side.
     /// Enabled by default; the rules themselves live outside the session.
     #[serde(default = "default_invariants")]
@@ -541,6 +548,7 @@ impl Default for Settings {
             model: default_model(),
             system_prompt: default_system_prompt(),
             profile: default_profile(),
+            approve: crate::run::ApprovePolicy::Manual,
             todo: false,
             invariants: true,
             context_enabled: true,

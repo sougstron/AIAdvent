@@ -2,7 +2,8 @@
 
 use crate::agent::Reply;
 use crate::config::Res;
-use crate::invariants::{InvariantSet, Origin, Violation, MAX_ATTEMPTS};
+use crate::invariants::{InvariantSet, Origin, Violation, ViolationKind, MAX_ATTEMPTS};
+use crate::todo::Stage;
 
 #[derive(Clone, Debug)]
 pub struct Attempt {
@@ -26,18 +27,59 @@ pub struct PipelineOutcome {
 
 /// Runs the policy loop with an injectable model call. Rejected attempts are
 /// returned as diagnostics only; the caller must persist only `Pass`.
-pub fn run_with<F>(set: &InvariantSet, enabled: bool, query: &str, mut call: F) -> Res<PipelineOutcome>
+pub fn run_with<F>(set: &InvariantSet, enabled: bool, query: &str, call: F) -> Res<PipelineOutcome>
 where
     F: FnMut(usize, Option<&str>) -> Res<Reply>,
 {
-    if !enabled || set.active_count() == 0 {
-        let reply = call(1, None)?;
-        return Ok(PipelineOutcome {
-            decision: Decision::Pass { text: reply.text.clone(), accounted: Vec::new(), reply },
-            attempts: Vec::new(),
-        });
-    }
+    run_stage_with(set, enabled, None, query, call)
+}
 
+/// Тот же цикл, но узел Validate проверяет ещё и **контракт этапа**
+/// (`todo::check_stage_output`). Смысл — в задаче 15: «перепрыгнуть» этап
+/// можно не только переходом, но и содержанием ответа (план, в котором
+/// сразу лежит готовый ответ; `validate` без машинного вердикта). Такой
+/// ответ — вина модели, поэтому он уходит в тот же retry, что и нарушение
+/// инварианта, с той же формой `Violation` и тем же общим лимитом
+/// [`MAX_ATTEMPTS`]: исчерпали — `GaveUp`, а не «ну ладно, поехали дальше».
+pub fn run_stage_with<F>(
+    set: &InvariantSet,
+    enabled: bool,
+    stage: Option<Stage>,
+    query: &str,
+    mut call: F,
+) -> Res<PipelineOutcome>
+where
+    F: FnMut(usize, Option<&str>) -> Res<Reply>,
+{
+    // Контракт этапа работает всегда, даже когда инварианты выключены:
+    // это не политика проекта, а условие, без которого лестница врёт.
+    if !enabled || set.active_count() == 0 {
+        let Some(stage) = stage else {
+            let reply = call(1, None)?;
+            return Ok(PipelineOutcome {
+                decision: Decision::Pass { text: reply.text.clone(), accounted: Vec::new(), reply },
+                attempts: Vec::new(),
+            });
+        };
+        let mut attempts = Vec::new();
+        let mut retry_note: Option<String> = None;
+        for number in 1..=MAX_ATTEMPTS {
+            let reply = call(number, retry_note.as_deref())?;
+            let violations = contract_violations(stage, &reply.text);
+            attempts.push(Attempt { number, violations: violations.clone(), text: reply.text.clone() });
+            if violations.is_empty() {
+                return Ok(PipelineOutcome {
+                    decision: Decision::Pass { text: reply.text.clone(), accounted: Vec::new(), reply },
+                    attempts,
+                });
+            }
+            retry_note = Some(retry_note_for(&violations));
+            if number == MAX_ATTEMPTS {
+                return Ok(PipelineOutcome { decision: Decision::GaveUp { last: reply, violations }, attempts });
+            }
+        }
+        unreachable!()
+    }
     let requested = set.requested_by(query);
     if !requested.is_empty() {
         return Ok(PipelineOutcome {
@@ -53,7 +95,10 @@ where
     let mut retry_note: Option<String> = None;
     for number in 1..=MAX_ATTEMPTS {
         let reply = call(number, retry_note.as_deref())?;
-        let violations = set.check(&reply.text, &requested);
+        let mut violations = set.check(&reply.text, &requested);
+        if let Some(stage) = stage {
+            violations.extend(contract_violations(stage, &reply.text));
+        }
         attempts.push(Attempt { number, violations: violations.clone(), text: reply.text.clone() });
         if violations.is_empty() {
             let (text, accounted) = InvariantSet::strip_accounting(&reply.text);
@@ -64,15 +109,47 @@ where
         if !user_ids.is_empty() {
             return Ok(PipelineOutcome { decision: Decision::RefusedByInvariant { explanation: set.refusal(&user_ids), ids: user_ids }, attempts });
         }
-        retry_note = Some(format!(
-            "Предыдущий ответ отклонён клиентским валидатором. Нарушения: {}. Сформируй новый ответ без этих нарушений и обязательно закончи корректной строкой ИНВАРИАНТЫ: ...",
-            violations.iter().map(|v| format!("{} ({})", v.id, v.evidence)).collect::<Vec<_>>().join(", ")
-        ));
+        retry_note = Some(retry_note_for(&violations));
         if number == MAX_ATTEMPTS {
             return Ok(PipelineOutcome { decision: Decision::GaveUp { last: reply, violations }, attempts });
         }
     }
     unreachable!()
+}
+
+/// Нарушения контракта этапа в форме [`Violation`] — чтобы retry-заметка,
+/// диагностика и лимит попыток были одни и те же для инвариантов и для
+/// лестницы, а не две похожие реализации.
+fn contract_violations(stage: Stage, text: &str) -> Vec<Violation> {
+    crate::todo::check_stage_output(stage, text)
+        .into_iter()
+        .map(|v| Violation {
+            id: format!("этап:{}", v.id),
+            kind: ViolationKind::Forbidden,
+            evidence: v.evidence,
+            origin: Origin::Model,
+        })
+        .collect()
+}
+
+/// Одна формулировка retry-заметки на оба источника нарушений. Строка про
+/// `ИНВАРИАНТЫ:` добавляется только когда среди нарушений есть учётные —
+/// иначе на этапе с выключенными инвариантами мы просили бы невозможного.
+fn retry_note_for(violations: &[Violation]) -> String {
+    let list = violations
+        .iter()
+        .map(|v| format!("{} ({})", v.id, v.evidence))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut note = format!(
+        "Предыдущий ответ отклонён клиентским валидатором. Нарушения: {list}. \
+         Сформируй новый ответ без этих нарушений"
+    );
+    if violations.iter().any(|v| !v.id.starts_with("этап:")) {
+        note.push_str(" и обязательно закончи корректной строкой ИНВАРИАНТЫ: ...");
+    }
+    note.push('.');
+    note
 }
 
 #[cfg(test)]

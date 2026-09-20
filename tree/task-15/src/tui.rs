@@ -71,6 +71,7 @@ const SETTINGS_ROWS: &[&str] = &[
     "top_k",
     "profile",
     "todo",
+    "approve",
     "system_prompt",
 ];
 /// Подсказка по переключателю — одна на `/strategy`, `/help` и ошибки.
@@ -78,8 +79,8 @@ const STRATEGY_USAGE: &str =
     "/strategy [show|off|summary|window|facts|branch|memory|keep N|every N]";
 const PROFILE_USAGE: &str =
     "/profile [show|list|off|prompt|<id>], id из каталога — /profile list";
-const TODO_USAGE: &str =
-    "/todo [show|on|off|start <задача>|next [итог]|pause [почему]|resume|reset|prompt]";
+const TODO_USAGE: &str = "/todo [show|on|off|start <задача>|approve [коммент]|reject <причина>|\
+                          pause [почему]|resume|abort <причина>|log|reset|prompt]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -305,6 +306,15 @@ struct App {
     /// rendered as the last line of the transcript, replacing the old
     /// full-screen "working" overlay.
     spinner: Option<(String, &'static str)>,
+    /// Прогон задачи (`run.rs`): этап, фаза запроса, попытка, журнал
+    /// переходов и подписи под планом. Вся лестница в TUI двигается
+    /// **только** через `run.apply(...)` — прямых вызовов `TaskState::advance`
+    /// здесь нет, иначе гарантия «этап не перепрыгнуть» держалась бы
+    /// на дисциплине, а не на коде.
+    run: crate::run::TaskRun,
+    /// Этап, чей контракт проверяет пайплайн в текущем ходе. `None` —
+    /// обычный ход «вопрос → ответ».
+    stage_contract: Option<todo::Stage>,
 }
 
 /// Release is the other half of a Press (Windows / kitty event types) and
@@ -410,7 +420,10 @@ impl App {
             tokens: TokenMeter::new(),
             sent_shape: Shape::default(),
             spinner: None,
+            run: crate::run::TaskRun::default(),
+            stage_contract: None,
         };
+        app.adopt_run();
         app.attach_memory();
         app
     }
@@ -999,12 +1012,46 @@ impl App {
         // Новый чат — новая задача: тащить чужую тудушку в пустой чат
         // нечестно, состояние осталось в файле старой сессии.
         self.agent.set_todo(TaskState::new());
+        self.run = crate::run::TaskRun::new(&self.session.id, &self.settings);
         self.entries.clear();
         self.scroll = 0;
         self.follow = true;
         self.focus = Focus::Input;
         self.tokens.reset_session();
         self.status = "New chat".into();
+    }
+
+    /// Поднять прогон из загруженной сессии. Если он там был и не
+    /// терминальный — [`Session`] уже пометила его `interrupted`; наше дело
+    /// сказать об этом человеку строкой в транскрипте, а не продолжить
+    /// молча: посреди запроса нас могли оборвать, и ответ модели пропал.
+    fn adopt_run(&mut self) {
+        self.run = match self.session.run() {
+            Some(r) => r.clone(),
+            None => crate::run::TaskRun::new(&self.session.id, &self.settings),
+        };
+        if self.run.active() {
+            self.agent.set_todo(self.run.state.clone());
+            self.entries.push(Entry::Info(format!(
+                "\u{21bb} {}\n   продолжить: /todo resume · бросить: /todo abort <причина>",
+                self.run.line()
+            )));
+        }
+    }
+
+    /// Записать прогон на диск. Зовётся на каждой смене фазы, **в том числе
+    /// до сетевого вызова**: иначе падение посреди запроса не видно в файле
+    /// сессии, и «продолжаем с последнего стейта» было бы просто словами.
+    fn persist_run(&mut self) {
+        self.agent.set_todo(self.run.state.clone());
+        let mut s = self.session.clone();
+        s.settings = self.settings.clone();
+        s.set_todo(self.run.state.clone());
+        s.set_run(Some(self.run.clone()));
+        if let Err(e) = s.save(&self.sessions_dir) {
+            eprintln!("warning: could not save run: {e}");
+        }
+        self.session.set_run(Some(self.run.clone()));
     }
 
     fn save_session(&mut self) {
@@ -1030,6 +1077,11 @@ impl App {
         // Тудушка принадлежит разговору: пауза на этапе должна пережить
         // выход из приложения и вернуться тем же этапом.
         s.set_todo(self.agent.todo().clone());
+        // Прогон — тоже принадлежность разговора, и удаляется он вместе с
+        // ним. Терминальный прогон `set_run` не сохраняет: постановка
+        // требует чистить его по достижении `done`.
+        s.set_run(self.run.active().then(|| self.run.clone()));
+        self.session.set_run(self.run.active().then(|| self.run.clone()));
         // Память принадлежит ветке: кладём её в дерево тем же движением.
         s.resync_tree();
         s.tree_mut()
@@ -1054,6 +1106,8 @@ impl App {
                 self.entries = entries_from_session(&s);
                 self.status = format!("Loaded '{}'", s.title);
                 self.session = s;
+                // Прогон переезжает вместе с чатом: он привязан к сессии.
+                self.adopt_run();
                 // У загруженного чата свой краткосрочный слой и своя задача
                 // рабочего слоя — перецепляем память на её файлы.
                 self.attach_memory();
@@ -2010,11 +2064,19 @@ impl App {
         let tail = tail.trim();
         match head.to_ascii_lowercase().as_str() {
             "" | "show" | "status" => {
-                let card = self.agent.todo().card();
-                self.entries.push(Entry::Info(format!(
+                let card = if self.run.active() {
+                    self.run.card()
+                } else {
+                    self.agent.todo().card()
+                };
+                let mut text = format!(
                     "тудушка: {}\n{card}",
                     if self.settings.todo { "on" } else { "off" }
-                )));
+                );
+                for line in self.run.pinned.drift(&self.settings) {
+                    text.push_str(&format!("\u{26a0} {line}\n"));
+                }
+                self.entries.push(Entry::Info(text));
             }
             "on" | "off" => {
                 let on = head.eq_ignore_ascii_case("on");
@@ -2032,60 +2094,92 @@ impl App {
                     self.status = format!("нужна формулировка задачи ({TODO_USAGE})");
                     return;
                 }
-                if self.agent.todo().finished() {
-                    self.agent.todo_mut().reset();
+                if !self.run.active() || self.run.status.terminal() {
+                    self.run = crate::run::TaskRun::new(&self.session.id, &self.settings);
                 }
-                match self.agent.todo_mut().start(tail) {
-                    Ok(()) => {
+                match self.run.apply(crate::run::Event::Start(tail.to_string())) {
+                    Ok(_) => {
+                        self.persist_run();
                         self.announce_todo_start();
                         self.run_todo_stages(None, terminal);
                     }
-                    Err(e) => self.status = e,
+                    Err(r) => self.refuse(r),
                 }
             }
-            "pause" => match self.agent.todo_mut().pause(tail) {
-                Ok(()) => {
-                    let line = self.agent.todo().line();
+            "pause" => match self.run.apply(crate::run::Event::Pause(tail.to_string())) {
+                Ok(_) => {
+                    self.persist_run();
+                    let line = self.run.line();
                     self.entries
                         .push(Entry::Info(format!("\u{23f8} пауза · {line}")));
                     self.status = "пауза — /todo resume продолжит с этого этапа".into();
                     self.save_session();
                 }
-                Err(e) => self.status = e,
+                Err(r) => self.refuse(r),
             },
-            "resume" | "continue" | "go" => match self.agent.todo_mut().resume() {
-                Ok(()) => {
-                    self.entries.push(Entry::Info(format!(
-                        "\u{25b6} продолжаем · {}",
-                        self.agent.todo().line()
-                    )));
+            "resume" | "continue" | "go" => match self.run.apply(crate::run::Event::Resume) {
+                Ok(_) => {
+                    self.persist_run();
+                    self.entries
+                        .push(Entry::Info(format!("\u{25b6} продолжаем · {}", self.run.line())));
                     let extra = (!tail.is_empty()).then(|| tail.to_string());
                     self.run_todo_stages(extra, terminal);
                 }
-                Err(e) => self.status = e,
+                Err(r) => self.refuse(r),
             },
-            // Закрыть этап руками: итог — то, что уедет в следующий этап.
-            "next" | "step" => {
-                let summary = if tail.is_empty() { "закрыт вручную" } else { tail };
-                let closed = self.agent.todo().stage;
-                match self.agent.todo_mut().advance(summary) {
+            // Гейт утверждения плана: единственная дверь из `plan` в `execute`.
+            "approve" | "ok" | "yes" => {
+                let by = if tail.is_empty() {
+                    "человек".to_string()
+                } else {
+                    format!("человек — {tail}")
+                };
+                match self.run.apply(crate::run::Event::Approve(by)) {
                     Ok(_) => {
-                        self.entries.push(Entry::Info(todo::leave_line(closed, summary)));
-                        let line = self.agent.todo().line();
-                        self.entries.push(Entry::Info(if self.agent.todo().finished() {
-                            "\u{2714} задача закрыта".into()
-                        } else {
-                            self.agent.todo().enter_line()
-                        }));
-                        self.status = line;
-                        self.save_session();
+                        self.persist_run();
+                        self.entries.push(Entry::Info(format!(
+                            "\u{2714} план утверждён · {}",
+                            self.run.line()
+                        )));
+                        self.run_todo_stages(None, terminal);
                     }
-                    Err(e) => self.status = e,
+                    Err(r) => self.refuse(r),
                 }
             }
+            "reject" | "no" => {
+                match self.run.apply(crate::run::Event::Reject(tail.to_string())) {
+                    Ok(_) => {
+                        self.persist_run();
+                        self.entries.push(Entry::Info(format!(
+                            "\u{21ba} план отклонён: {tail} — переделываем план, а не идём дальше"
+                        )));
+                        self.run_todo_stages(None, terminal);
+                    }
+                    Err(r) => self.refuse(r),
+                }
+            }
+            "abort" | "fail" => {
+                let why = if tail.is_empty() { "брошено человеком" } else { tail };
+                match self.run.apply(crate::run::Event::Abort(why.to_string())) {
+                    Ok(_) => {
+                        self.entries
+                            .push(Entry::Info(format!("\u{2716} прогон брошен: {why}")));
+                        self.finish_run();
+                    }
+                    Err(r) => self.refuse(r),
+                }
+            }
+            "log" | "journal" => {
+                self.entries.push(Entry::Info(format!(
+                    "журнал переходов прогона (последние 20):\n{}",
+                    self.run.log_tail(20)
+                )));
+            }
             "reset" | "clear" | "drop" => {
-                self.agent.todo_mut().reset();
-                self.status = "состояние задачи сброшено".into();
+                self.agent.set_todo(TaskState::new());
+                self.run = crate::run::TaskRun::new(&self.session.id, &self.settings);
+                self.session.set_run(None);
+                self.status = "состояние задачи сброшено, прогон снят".into();
                 self.save_session();
             }
             // Что реально уезжает в system.
@@ -2105,16 +2199,51 @@ impl App {
     }
 
     fn announce_todo_start(&mut self) {
-        let st = self.agent.todo().clone();
         self.entries.push(Entry::Info(format!(
-            "\u{1f4cb} тудушка заведена: {}\n   этапы: {}",
-            st.goal.trim(),
+            "\u{1f4cb} тудушка заведена: {}\n   этапы: {}\n   гейты: план утверждается ({}), финал — только после `ВЕРДИКТ: ok`",
+            self.run.goal().trim(),
             todo::Stage::LADDER
                 .iter()
                 .map(|s| format!("{} {}", s.index(), s.title()))
                 .collect::<Vec<_>>()
-                .join(" \u{2192} ")
+                .join(" \u{2192} "),
+            self.run.pinned.approve.id()
         )));
+    }
+
+    /// Показать отказ таблицы переходов ровно тем же текстом, который лёг
+    /// в журнал прогона. Одна формулировка на человека и на `/todo log` —
+    /// чтобы «реакцию ассистента» можно было проверить, а не пересказать.
+    fn refuse(&mut self, r: crate::run::Refusal) {
+        self.status = r.why.clone();
+        self.entries.push(Entry::Info(r.line()));
+        // Отказ обязан быть виден: он и есть «реакция ассистента» из
+        // постановки. Пришпиливаем вид к низу, иначе человек упрётся в
+        // молчание и решит, что сообщение просто пропало.
+        self.follow = true;
+    }
+
+    /// Прогон дошёл до терминала. Итог уезжает в транскрипт, а сам прогон
+    /// снимается с сессии: постановка требует хранить состояние до `done`,
+    /// а не вечно.
+    fn finish_run(&mut self) {
+        self.entries.push(Entry::Info(match self.run.status {
+            crate::run::RunStatus::DonePass => format!(
+                "\u{2714} прогон завершён: done(pass) — все этапы пройдены, валидация дала `ok`\n   итог: {}",
+                self.run
+                    .state
+                    .log
+                    .last()
+                    .map(|r| r.summary.clone())
+                    .unwrap_or_default()
+            ),
+            _ => format!("\u{2716} прогон завершён: done(fail) — {}", self.run.state.note),
+        }));
+        self.session.set_run(None);
+        self.run = crate::run::TaskRun::new(&self.session.id, &self.settings);
+        self.agent.set_todo(TaskState::new());
+        self.status = "прогон закрыт; состояние снято с сессии".into();
+        self.save_session();
     }
 
     /// Сообщение при включённой тудушке: либо заводим задачу, либо
@@ -2122,94 +2251,173 @@ impl App {
     /// уточнение к текущему этапу, а не новая задача: переобъяснять
     /// ничего не нужно, состояние уже в запросе.
     fn submit_with_todo(&mut self, line: String, terminal: &mut DefaultTerminal) {
-        if self.agent.todo().paused() {
-            if let Err(e) = self.agent.todo_mut().resume() {
-                self.status = e;
-                return;
-            }
-            self.entries.push(Entry::Info(format!(
-                "\u{25b6} продолжаем без повторных объяснений · {}",
-                self.agent.todo().line()
-            )));
-            self.run_todo_stages(Some(line), terminal);
+        // Под гейтом обычным сообщением не проехать: план утверждают
+        // командой, а не фразой «давай дальше».
+        if self.run.awaiting_approval() {
+            self.entries.push(Entry::User(line));
+            self.refuse(crate::run::Refusal {
+                from: self.run.position().line(),
+                event: "message".into(),
+                why: format!(
+                    "этап `{}` закрыт и ждёт утверждения: /todo approve [коммент] или /todo reject <причина>",
+                    self.run.state.stage.id()
+                ),
+            });
+            self.scroll_to_bottom(terminal);
             return;
         }
-        if self.agent.todo().finished() {
-            self.agent.todo_mut().reset();
+        if matches!(
+            self.run.status,
+            crate::run::RunStatus::Paused | crate::run::RunStatus::Interrupted
+        ) {
+            match self.run.apply(crate::run::Event::Resume) {
+                Ok(_) => {
+                    self.persist_run();
+                    self.entries.push(Entry::Info(format!(
+                        "\u{25b6} продолжаем без повторных объяснений · {}",
+                        self.run.line()
+                    )));
+                    self.run_todo_stages(Some(line), terminal);
+                }
+                Err(r) => self.refuse(r),
+            }
+            return;
         }
-        match self.agent.todo_mut().start(&line) {
-            Ok(()) => {
+        if !self.run.active() || self.run.status.terminal() {
+            self.run = crate::run::TaskRun::new(&self.session.id, &self.settings);
+        }
+        match self.run.apply(crate::run::Event::Start(line.clone())) {
+            Ok(_) => {
+                self.persist_run();
                 self.entries.push(Entry::User(line));
                 self.announce_todo_start();
                 self.run_todo_stages(None, terminal);
             }
-            Err(e) => self.status = e,
+            Err(r) => self.refuse(r),
         }
     }
 
-    /// Прогон лестницы: этап за этапом, пока автомат не дойдёт до `done`,
-    /// не встанет на паузу или не упрётся в неподтверждённый этап. Автомат
-    /// двигается только на подтверждении (`TaskState::confirm`) — «ответ
-    /// выглядит законченным» переходом не считается.
+    /// Прогон лестницы: этап за этапом, пока таблица переходов не упрётся
+    /// в терминал, гейт или паузу.
+    ///
+    /// Каждый шаг проходит три отсечки, и ни одну нельзя пропустить:
+    /// пайплайн проверяет контракт этапа (`todo::check_stage_output`) с тем
+    /// же retry, что и инварианты; `TaskState::confirm` требует маркер
+    /// закрытия **текущего** этапа; и только потом `TaskRun::apply` даёт
+    /// таблице решить, куда мы попадём — в следующий этап, под подпись
+    /// человека или обратно на переделку.
     fn run_todo_stages(&mut self, extra: Option<String>, terminal: &mut DefaultTerminal) {
         let mut extra = extra;
-        while self.agent.todo().running() {
-            let state = self.agent.todo().clone();
-            let head = state.enter_line();
-            self.status = state.line();
-            let mut prompt = state.stage_prompt();
+        while self.run.running() {
+            let stage = self.run.state.stage;
+            let head = self.run.state.enter_line();
+            self.status = self.run.line();
+            let mut prompt = self.run.state.stage_prompt();
             if let Some(note) = extra.take().filter(|s| !s.trim().is_empty()) {
                 prompt.push_str(&format!("\n\nУточнение от человека: {}", note.trim()));
             }
+
+            // Фаза на диск ДО сети: упади процесс сейчас — файл сессии
+            // покажет `model`, и при следующем запуске прогон честно
+            // поднимется как `interrupted`, а не как «ничего не было».
+            let _ = self.run.apply(crate::run::Event::PhaseTo(crate::run::Phase::Model));
+            self.run.set_attempt(1);
+            self.persist_run();
+
             let before = self.session.messages.len();
+            self.stage_contract = Some(stage);
             self.send_turn(prompt, Some(head), terminal);
+            self.stage_contract = None;
+
             let Some(answer) = self.last_todo_answer(before) else {
-                // Ход не дошёл до ответа (сеть, Esc). Молча двигать автомат
-                // тут нельзя — встаём на паузу на том же этапе.
-                let _ = self.agent.todo_mut().pause("ход не дошёл до ответа");
+                // Ход не дошёл до ответа (сеть, Esc). Двигать автомат тут
+                // нельзя — встаём на паузу на том же этапе.
+                let _ = self
+                    .run
+                    .apply(crate::run::Event::Pause("ход не дошёл до ответа".into()));
+                self.persist_run();
                 self.entries.push(Entry::Info(format!(
                     "\u{23f8} этап `{}` не закрыт: ответа не было — /todo resume продолжит с него",
-                    state.stage.id()
+                    stage.id()
                 )));
                 break;
             };
-            match self.agent.todo().confirm(&answer) {
-                Ok(summary) => {
-                    let closed = self.agent.todo().stage;
-                    if let Err(e) = self.agent.todo_mut().advance(&summary) {
-                        self.status = e;
-                        break;
-                    }
-                    self.entries
-                        .push(Entry::Info(todo::leave_line(closed, &summary)));
-                }
+
+            let _ = self
+                .run
+                .apply(crate::run::Event::PhaseTo(crate::run::Phase::Decide));
+            self.persist_run();
+
+            let summary = match self.run.state.confirm(&answer) {
+                Ok(s) => s,
                 Err(e) => {
-                    let _ = self.agent.todo_mut().pause(&e);
+                    let _ = self.run.apply(crate::run::Event::Pause(e.clone()));
+                    self.persist_run();
                     self.entries.push(Entry::Info(format!(
-                        "\u{23f8} {e}\n   этап не закрыт, тудушка на паузе — /todo resume"
+                        "\u{23f8} {e}\n   этап не закрыт, прогон на паузе — /todo resume"
                     )));
                     break;
                 }
+            };
+            let verdict = (stage == todo::Stage::Validate)
+                .then(|| todo::parse_verdict(&answer))
+                .flatten();
+
+            match self.run.apply(crate::run::Event::StageClosed {
+                summary: summary.clone(),
+                verdict,
+            }) {
+                Ok(to) => {
+                    self.persist_run();
+                    self.entries
+                        .push(Entry::Info(todo::leave_line(stage, &summary)));
+                    match to.status {
+                        crate::run::RunStatus::AwaitingApproval => {
+                            self.entries.push(Entry::Info(format!(
+                                "\u{270b} этап `{}` закрыт и ждёт утверждения — без /todo approve \
+                                 реализация не начнётся (/todo reject <причина> вернёт план на переделку)",
+                                stage.id()
+                            )));
+                            if self.run.pinned.approve == crate::run::ApprovePolicy::Auto {
+                                let _ = self
+                                    .run
+                                    .apply(crate::run::Event::Approve("auto".into()));
+                                self.persist_run();
+                                self.entries.push(Entry::Info(
+                                    "\u{2714} план утверждён автоматически (approved-by=auto) — \
+                                     гейт пройден, а не пропущен".into(),
+                                ));
+                                continue;
+                            }
+                            break;
+                        }
+                        crate::run::RunStatus::DonePass => {
+                            self.finish_run();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(r) => {
+                    // Таблица не пустила (`validate` без вердикта и т.п.).
+                    // Прогон на том же этапе, состояние не поехало.
+                    self.refuse(r.clone());
+                    let _ = self.run.apply(crate::run::Event::Pause(r.why));
+                    self.persist_run();
+                    break;
+                }
             }
-            self.save_session();
             if self.poll_todo_pause() {
                 break;
             }
         }
-        if self.agent.todo().finished() {
-            self.entries.push(Entry::Info(
-                "\u{2714} задача закрыта: все пять этапов пройдены (/todo show — итоги)".into(),
-            ));
-        }
-        self.status = self.agent.todo().line();
+        self.status = self.run.line();
         self.save_session();
         if self.follow {
             self.scroll_to_bottom(terminal);
         }
     }
 
-    /// Текст ответа последнего хода — или `None`, если хода не случилось
-    /// (ошибка запроса) либо его оборвали на Esc.
     fn last_todo_answer(&self, before: usize) -> Option<String> {
         if self.session.messages.len() != before + 2 {
             return None;
@@ -2230,7 +2438,13 @@ impl App {
                 }
             }
         }
-        if stop && self.agent.todo_mut().pause("пауза по Esc").is_ok() {
+        if stop
+            && self
+                .run
+                .apply(crate::run::Event::Pause("пауза по Esc".into()))
+                .is_ok()
+        {
+            self.persist_run();
             self.entries.push(Entry::Info(
                 "\u{23f8} пауза по Esc — /todo resume продолжит с этого этапа".into(),
             ));
@@ -2836,6 +3050,16 @@ impl App {
                 self.settings.todo = !self.settings.todo;
                 self.agent.settings_mut().todo = self.settings.todo;
             }
+            // Кто подписывает план. Гейт не выключается ни в одном
+            // положении: `auto` — это подпись «auto» в журнале, а не
+            // пропущенный этап.
+            "approve" => {
+                self.settings.approve = match self.settings.approve {
+                    crate::run::ApprovePolicy::Manual => crate::run::ApprovePolicy::Auto,
+                    crate::run::ApprovePolicy::Auto => crate::run::ApprovePolicy::Manual,
+                };
+                self.agent.settings_mut().approve = self.settings.approve;
+            }
             "profile" => {
                 let ids = self.agent.profiles().ids();
                 let cur = ids
@@ -2996,12 +3220,22 @@ impl App {
         // With invariants enabled the complete answer must pass the
         // deterministic validator before any assistant text reaches the
         // transcript or session. Rejected model attempts stay ephemeral.
-        if self.settings.invariants {
+        // Ход этапа всегда идёт через пайплайн, даже когда инварианты
+        // выключены: контракт этапа (`check_stage_output`) — не политика
+        // проекта, а условие, без которого лестница врёт про пройденный
+        // этап. Поэтому `stage_contract` тоже заводит эту ветку.
+        if self.settings.invariants || self.stage_contract.is_some() {
+            let inv_on = self.settings.invariants;
+            let stage = self.stage_contract;
             let agent = self.prepared_agent();
             let set = agent.invariants().clone();
             let hist = history.clone();
-            let result = self.with_spinner(terminal, "проверяю инварианты", move || {
-                crate::pipeline::run_with(&set, true, &invariant_query, |_, retry_note| {
+            let label = match stage {
+                Some(st) => format!("этап `{}`: проверяю ответ", st.id()),
+                None => "проверяю инварианты".to_string(),
+            };
+            let result = self.with_spinner(terminal, &label, move || {
+                crate::pipeline::run_stage_with(&set, inv_on, stage, &invariant_query, |_, retry_note| {
                     let mut attempt = hist.clone();
                     if let Some(note) = retry_note {
                         attempt.push(ChatMessage::user(note));
@@ -3330,7 +3564,8 @@ impl App {
         if !self.settings.todo || !self.agent.todo().active() {
             return 0;
         }
-        self.agent.todo().checklist().len() as u16 + 3
+        // +1 строка под статус прогона (фаза, попытка, гейт).
+        self.agent.todo().checklist().len() as u16 + 4
     }
 
     /// Чеклист задачи под транскриптом: видно этап, шаг и ожидаемое
@@ -3349,14 +3584,21 @@ impl App {
             };
             lines.push(Line::styled(format!(" {mark} {text}"), style));
         }
-        let hints = if st.paused() {
-            "/todo resume \u{b7} /todo show"
+        // Строка прогона: фаза запроса, попытка и гейт — то, чего в
+        // лестнице нет, а для «продолжим с последнего стейта» нужно.
+        lines.push(Line::styled(format!(" {}", self.run.line()), muted()));
+        let hints = if self.run.awaiting_approval() {
+            "/todo approve \u{b7} /todo reject <причина>"
+        } else if st.paused() {
+            "/todo resume \u{b7} /todo log"
         } else {
-            "Esc \u{2014} пауза \u{b7} /todo show"
+            "Esc \u{2014} пауза \u{b7} /todo log"
         };
         let title = format!(
-            "todo \u{b7} {} \u{b7} шаг {}",
-            st.status.as_str(),
+            "todo \u{b7} {} \u{b7} этап {}/{} \u{b7} шаг {}",
+            self.run.status.as_str(),
+            st.stage.index(),
+            todo::Stage::LADDER.len(),
             st.step
         );
         f.render_widget(
@@ -3636,8 +3878,17 @@ impl App {
     /// vertical layout in `draw`.
     fn max_scroll_for(&self, width: u16, height: u16) -> u16 {
         let stats_height = stats_rows(&self.token_stats(), width).len() as u16;
-        let body_height =
-            height.saturating_sub(1 + self.input_box_height(width) + stats_height + FOOTER_HEIGHT);
+        // Панель тудушки забирает строки у транскрипта ровно так же, как в
+        // `draw` — и её обязательно нужно вычесть здесь. Иначе `max_scroll`
+        // получается меньше настоящего на высоту панели, и последние строки
+        // разговора становятся недостижимыми: прокрутка упирается, не дойдя
+        // до низа. Ровно эта ошибка ловилась живым смоуком дважды.
+        let body_height = height.saturating_sub(
+            1 + self.todo_panel_height()
+                + self.input_box_height(width)
+                + stats_height
+                + FOOTER_HEIGHT,
+        );
         let inner_width = width.saturating_sub(2); // horizontal padding
         let total_lines = Paragraph::new(self.transcript_lines())
             .wrap(Wrap { trim: false })
@@ -3773,6 +4024,14 @@ impl App {
                     )
                 }
             }
+            "approve" => match self.settings.approve {
+                crate::run::ApprovePolicy::Manual => {
+                    "manual (план утверждает человек: /todo approve)".to_string()
+                }
+                crate::run::ApprovePolicy::Auto => {
+                    "auto   (план подписывается автоматически; гейт всё равно проходится)".to_string()
+                }
+            },
             "profile" => match self.agent.profile() {
                 Some(p) => format!(
                     "{}  ({}; заменяет системный промпт, пока тот дефолтный)",

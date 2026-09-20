@@ -45,6 +45,7 @@ use crate::verify;
         ask --verify-profile all              prove the profile reaches the wire and changes the voice\n  \
         ask --todo \"...\"                      run the answer through the task state machine\n  \
         ask --verify-todo all                 prove the task state machine holds and survives a pause\n  \
+        ask --verify-lifecycle all            prove the task lifecycle is gated: no execute before an approved plan\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -164,6 +165,24 @@ pub struct Cli {
     /// plain turn. Off by default.
     #[arg(long)]
     pub todo: bool,
+
+    /// Who signs off the plan before implementation starts: `manual`
+    /// (a human runs `/todo approve`) or `auto` (signed automatically and
+    /// logged as `approved-by=auto`). The gate itself is never skipped.
+    /// Default: `manual` in the TUI, `auto` for a non-interactive
+    /// `ask --todo "..."`, where there is nobody to ask.
+    #[arg(long, value_name = "manual|auto")]
+    pub approve: Option<String>,
+
+    /// Live proof for the controlled task lifecycle (task 15): `machine`
+    /// (the whole transition table offline — every illegal transition must
+    /// be refused *and* leave the run byte-identical), `gate` (live: the
+    /// model is told to skip the plan and the run must stay on `plan`),
+    /// `resume` (a run picked back up from disk, not from memory),
+    /// `cleanup` (where the run lives on disk and when it is removed),
+    /// `offline` or `all`. Exits after printing.
+    #[arg(long, value_name = "WHICH")]
+    pub verify_lifecycle: Option<String>,
 
     /// Live proof for the task state machine: `machine` (legal transitions
     /// pass, illegal ones are refused — no network), `wire` (what the state
@@ -320,6 +339,15 @@ impl Cli {
         if self.todo {
             s.todo = true;
         }
+        // Кто подписывает план. Без флага: в TUI ждём человека, а в
+        // неинтерактивном заходе спросить некого — подпись ставит `auto`,
+        // и это видно в журнале строкой `approved-by=auto`. Гейт при этом
+        // проходится в обоих случаях.
+        s.approve = match &self.approve {
+            Some(v) => crate::run::ApprovePolicy::parse(v)?,
+            None if self.todo && !self.question.is_empty() => crate::run::ApprovePolicy::Auto,
+            None => crate::run::ApprovePolicy::Manual,
+        };
         s.invariants = match self.invariants.as_str() {
             "on" => true,
             "off" => false,
@@ -505,6 +533,37 @@ pub fn run() -> Res<()> {
         return Ok(());
     }
 
+    if let Some(which) = cli.verify_lifecycle.as_deref() {
+        let checks = verify::LifeCheck::parse(which)?;
+        println!(
+            "проверяю жизненный цикл задачи: {}",
+            checks
+                .iter()
+                .map(|c| if c.offline() {
+                    format!("{} (без сети)", c.label())
+                } else {
+                    c.label().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let reports = verify::run_lifecycle(&checks, cli.verify_model.as_deref())?;
+        let mut calls = 0;
+        for report in &reports {
+            print!("{}", report.render());
+            println!();
+            calls += report.calls;
+        }
+        for report in &reports {
+            println!("{}", report.status_line());
+        }
+        println!("живых вызовов всего: {calls}");
+        if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
+            return Err(format!("lifecycle not confirmed: {}", bad.status_line()));
+        }
+        return Ok(());
+    }
+
     if let Some(which) = cli.verify_todo.as_deref() {
         let checks = verify::TodoCheck::parse(which)?;
         println!(
@@ -610,71 +669,122 @@ pub fn run() -> Res<()> {
 /// Лестница этапов в один заход (`ask --todo "..."`). Печатает каждый
 /// переход — то же «явно показывает, когда переходит на следующий шаг», но
 /// в терминал, а не в панель.
+///
+/// Правила переходов сюда не копируются: и TUI, и этот путь двигают один и
+/// тот же [`crate::run::TaskRun`] через одну и ту же таблицу. Разница
+/// только в дефолте гейта — в неинтерактивном заходе плану некому сказать
+/// «ок», поэтому подпись ставит `auto`, и это видно в журнале.
 fn todo_shot(settings: Settings, question: &str) -> Res<()> {
-    let mut agent = crate::agent::Agent::new(settings)?;
-    let mut state = crate::todo::TaskState::new();
-    state.start(question)?;
+    let mut agent = crate::agent::Agent::new(settings.clone())?;
+    let mut run = crate::run::TaskRun::new("one-shot", &settings);
+    run.apply(crate::run::Event::Start(question.to_string()))
+        .map_err(|r| r.why)?;
 
     let mut history: Vec<api::ChatMessage> = Vec::new();
-    while state.running() {
-        agent.set_todo(state.clone());
-        eprintln!("{}", state.enter_line());
-        let prompt = state.stage_prompt();
-        let mut turn = history.clone();
-        turn.push(api::ChatMessage::user(prompt.clone()));
+    loop {
+        if run.awaiting_approval() {
+            // Гейт проходится, а не пропускается: в одноразовом заходе
+            // подпись ставит `auto`, но переход всё равно идёт событием
+            // `Approve` и ложится в журнал.
+            if settings.approve == crate::run::ApprovePolicy::Auto {
+                run.apply(crate::run::Event::Approve("auto".into()))
+                    .map_err(|r| r.why)?;
+                eprintln!(
+                    "\u{2714} план утверждён автоматически (approved-by=auto) \u{b7} {}",
+                    run.line()
+                );
+            } else {
+                eprintln!("{}", run.line());
+                return Err(format!(
+                    "план этапа `plan` закрыт и ждёт утверждения, а спросить некого: \
+                     запустите с --approve auto или ведите задачу в TUI ({})",
+                    run.log_tail(1)
+                ));
+            }
+        }
+        if !run.running() {
+            break;
+        }
+        eprintln!("{}", run.state.enter_line());
         let set = agent.invariants().clone();
-        let result = crate::pipeline::run_with(
+        let inv_on = agent.settings().invariants;
+        let hist = history.clone();
+        let mut sent_prompt = String::new();
+        let outcome = crate::run::Engine::step(
+            &mut run,
             &set,
-            agent.settings().invariants,
-            &prompt,
-            |_, retry_note| {
-                let mut attempt = turn.clone();
+            inv_on,
+            None,
+            |prompt, _, retry_note| {
+                sent_prompt = prompt.to_string();
+                let mut attempt = hist.clone();
+                attempt.push(api::ChatMessage::user(prompt.to_string()));
                 if let Some(note) = retry_note {
                     attempt.push(api::ChatMessage::user(note));
                 }
                 agent.complete(&attempt)
             },
+            &mut |r: &crate::run::TaskRun| {
+                // Одноразовый заход ничего не хранит на диске: прогон
+                // живёт ровно столько, сколько идёт процесс. Фазу всё
+                // равно показываем — по ней видно, где нас оборвёт.
+                let _ = r;
+            },
         )?;
-        let reply = match result.decision {
-            crate::pipeline::Decision::Pass { text, mut reply, .. } => {
-                reply.text = text;
-                reply
-            }
-            crate::pipeline::Decision::RefusedByInvariant { explanation, .. } => {
-                println!("{explanation}");
-                return Ok(());
-            }
-            crate::pipeline::Decision::GaveUp { .. } => {
-                return Err(format!(
-                    "инварианты не соблюдены после {} попыток",
-                    crate::invariants::MAX_ATTEMPTS
-                ));
-            }
-        };
-        println!("{}", reply.text.trim());
-        history.push(api::ChatMessage::user(prompt));
-        history.push(api::ChatMessage::assistant(reply.text.clone()));
-
-        match state.confirm(&reply.text) {
-            Ok(summary) => {
-                let closed = state.stage;
-                state.advance(&summary)?;
+        agent.set_todo(run.state.clone());
+        match outcome {
+            crate::run::StepOutcome::Advanced { closed, summary, next, text } => {
+                eprintln!("\u{2192} следующий этап: `{}`", next.id());
+                println!("{}", text.trim());
+                println!();
+                history.push(api::ChatMessage::user(sent_prompt));
+                history.push(api::ChatMessage::assistant(text));
                 eprintln!("{}", crate::todo::leave_line(closed, &summary));
             }
-            Err(e) => {
-                state.pause(&e)?;
-                eprintln!("\u{23f8} {e}");
-                break;
+            crate::run::StepOutcome::AwaitingApproval { stage, summary, text } => {
+                println!("{}", text.trim());
+                println!();
+                history.push(api::ChatMessage::user(sent_prompt));
+                history.push(api::ChatMessage::assistant(text));
+                eprintln!("{}", crate::todo::leave_line(stage, &summary));
+                eprintln!(
+                    "\u{270b} этап `{}` закрыт и ждёт утверждения \u{2014} до подписи реализация не начнётся",
+                    stage.id()
+                );
+            }
+            crate::run::StepOutcome::Done { pass, why, text } => {
+                if let Some(t) = text {
+                    println!("{}", t.trim());
+                }
+                eprintln!("{}", run.line());
+                return if pass {
+                    Ok(())
+                } else {
+                    Err(format!("прогон закрыт как done(fail): {why}"))
+                };
+            }
+            crate::run::StepOutcome::Paused { why, text } => {
+                if let Some(t) = text {
+                    println!("{}", t.trim());
+                }
+                eprintln!("\u{23f8} {why}");
+                return Err(format!(
+                    "лестница не дошла до done: остановились на этапе `{}` ({why})",
+                    run.state.stage.id()
+                ));
+            }
+            crate::run::StepOutcome::Refused(r) => {
+                eprintln!("{}", r.line());
+                return Err(format!("переход отклонён: {}", r.why));
             }
         }
-        println!();
     }
-    eprintln!("{}", state.line());
-    if !state.finished() {
+    eprintln!("{}", run.line());
+    if run.status != crate::run::RunStatus::DonePass {
         return Err(format!(
-            "лестница не дошла до done: остановились на этапе `{}` ({})",
-            state.stage.id(),
-            state.note
+            "лестница не дошла до done: остановились на `{}` ({})",
+            run.status.as_str(),
+            run.state.stage.id()
         ));
     }
     Ok(())

@@ -4356,3 +4356,835 @@ pub fn run_todo_ladder(model: Option<&str>) -> Res<TodoLadderReport> {
         verdict,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Задача 15: контролируемый жизненный цикл задачи (`run.rs`).
+// ---------------------------------------------------------------------------
+
+/// Что именно доказываем про жизненный цикл.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LifeCheck {
+    /// Вся таблица переходов. Каждый незаконный переход обязан быть отказом
+    /// **и** оставить прогон побайтно тем же. Без сети.
+    Machine,
+    /// Живьём: модели прямым текстом велят пропустить план и сразу выдать
+    /// финальный ответ. Confirmed — только если прогон остался на `plan`.
+    Gate,
+    /// Прогон поднимается **с диска** (не из памяти) и продолжается с того
+    /// же этапа. Офлайн-половина — файл сессии; живая — что продолжению не
+    /// нужно переобъяснять задачу.
+    Resume,
+    /// Где прогон лежит и когда исчезает: во время работы есть, после
+    /// паузы и перезагрузки — тот же, после `done` — нет, вместе с
+    /// сессией — нет. Без сети.
+    Cleanup,
+}
+
+impl LifeCheck {
+    pub const ALL: [LifeCheck; 4] = [
+        LifeCheck::Machine,
+        LifeCheck::Gate,
+        LifeCheck::Resume,
+        LifeCheck::Cleanup,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LifeCheck::Machine => "machine",
+            LifeCheck::Gate => "gate",
+            LifeCheck::Resume => "resume",
+            LifeCheck::Cleanup => "cleanup",
+        }
+    }
+
+    pub fn offline(self) -> bool {
+        matches!(self, LifeCheck::Machine | LifeCheck::Cleanup)
+    }
+
+    pub fn parse(s: &str) -> Res<Vec<LifeCheck>> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Ok(LifeCheck::ALL.to_vec()),
+            "offline" => Ok(vec![LifeCheck::Machine, LifeCheck::Cleanup]),
+            "machine" | "table" | "states" => Ok(vec![LifeCheck::Machine]),
+            "gate" | "approve" | "plan" => Ok(vec![LifeCheck::Gate]),
+            "resume" | "continue" | "pause" => Ok(vec![LifeCheck::Resume]),
+            "cleanup" | "storage" | "disk" => Ok(vec![LifeCheck::Cleanup]),
+            other => Err(format!(
+                "unknown lifecycle check `{other}`; expected machine, gate, resume, cleanup, offline or all"
+            )),
+        }
+    }
+}
+
+/// Один пункт протокола жизненного цикла.
+#[derive(Clone, Debug)]
+pub struct LifeStep {
+    pub what: String,
+    pub got: String,
+    pub state: String,
+    pub ok: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LifeReport {
+    pub label: &'static str,
+    pub asked_model: String,
+    pub calls: usize,
+    pub steps: Vec<LifeStep>,
+    pub notes: Vec<String>,
+    pub verdict: ContextVerdict,
+}
+
+impl LifeReport {
+    pub fn confirmed(&self) -> bool {
+        self.verdict == ContextVerdict::Confirmed
+    }
+
+    pub fn status_line(&self) -> String {
+        format!(
+            "{}: verdict={} пунктов={} провалов={}",
+            self.label,
+            self.verdict.as_str(),
+            self.steps.len(),
+            self.steps.iter().filter(|s| !s.ok).count()
+        )
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = format!("== жизненный цикл задачи: {} ==\n", self.label);
+        if !self.asked_model.is_empty() {
+            out.push_str(&format!("модель: {} · живых вызовов: {}\n", self.asked_model, self.calls));
+        }
+        for s in &self.steps {
+            out.push_str(&format!(
+                "  [{}] {} -> {} | состояние: {}\n",
+                if s.ok { "ok" } else { "ПРОВАЛ" },
+                s.what,
+                s.got,
+                s.state
+            ));
+        }
+        for n in &self.notes {
+            out.push_str(&format!("  \u{b7} {n}\n"));
+        }
+        out.push_str(&format!("verdict: {}\n", self.verdict.as_str()));
+        out
+    }
+}
+
+pub fn run_lifecycle(checks: &[LifeCheck], model: Option<&str>) -> Res<Vec<LifeReport>> {
+    let mut out = Vec::new();
+    for check in checks {
+        out.push(match check {
+            LifeCheck::Machine => life_machine(),
+            LifeCheck::Cleanup => life_cleanup()?,
+            LifeCheck::Gate => life_gate(model)?,
+            LifeCheck::Resume => life_resume(model)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Слепок прогона без журнала и часов: журнал растёт и на отказах (он их и
+/// фиксирует), `updated_at` тикает. Сравнивать «состояние не поехало» нужно
+/// по остальному, иначе проверка доказывала бы обратное.
+fn run_fingerprint(run: &crate::run::TaskRun) -> String {
+    let mut v: serde_json::Value = serde_json::to_value(run).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("log");
+        obj.remove("updated_at");
+    }
+    v.to_string()
+}
+
+fn life_step(
+    what: &str,
+    got: Result<crate::run::Position, crate::run::Refusal>,
+    want_ok: bool,
+    run: &crate::run::TaskRun,
+) -> LifeStep {
+    LifeStep {
+        what: what.to_string(),
+        got: match &got {
+            Ok(p) => p.line(),
+            Err(r) => format!("отказ: {}", r.why),
+        },
+        state: run.position().line(),
+        ok: got.is_ok() == want_ok,
+    }
+}
+
+/// Протокол по всей таблице переходов. Два обязательства на каждый
+/// незаконный переход: он **отказ**, и прогон после него побайтно тот же.
+pub fn life_machine() -> LifeReport {
+    use crate::run::{ApprovePolicy, Event, Phase, RunStatus, TaskRun};
+    use crate::todo::{Stage, Verdict};
+
+    let mut steps = Vec::new();
+    let mut notes = Vec::new();
+    let settings = Settings::default();
+    let mut run = TaskRun::new("verify-lifecycle", &settings);
+
+    // Каждый незаконный переход проверяется парой: отказ + неподвижность.
+    let illegal = |run: &mut TaskRun, what: &str, ev: Event, steps: &mut Vec<LifeStep>| {
+        let before = run_fingerprint(run);
+        let got = run.apply(ev);
+        let refused = got.is_err();
+        steps.push(life_step(what, got, false, run));
+        let held = run_fingerprint(run) == before;
+        steps.push(LifeStep {
+            what: format!("{what}: состояние не сдвинулось"),
+            got: if held { "побайтно то же".into() } else { "СОСТОЯНИЕ ПОЕХАЛО".into() },
+            state: run.position().line(),
+            ok: held && refused,
+        });
+    };
+
+    illegal(&mut run, "start с пустой формулировкой", Event::Start("   ".into()), &mut steps);
+    illegal(&mut run, "закрыть этап до старта", Event::StageClosed { summary: "а".into(), verdict: None }, &mut steps);
+    illegal(&mut run, "resume до старта", Event::Resume, &mut steps);
+
+    let got = run.apply(Event::Start("посчитать буквы".into()));
+    steps.push(life_step("start", got, true, &run));
+    illegal(&mut run, "start поверх идущего прогона", Event::Start("другая".into()), &mut steps);
+
+    let got = run.apply(Event::StageClosed { summary: "изучил".into(), verdict: None });
+    steps.push(life_step("study закрыт -> plan", got, true, &run));
+
+    illegal(&mut run, "approve, когда никто не ждёт подписи", Event::Approve("я".into()), &mut steps);
+    illegal(&mut run, "закрыть этап без итога", Event::StageClosed { summary: "  ".into(), verdict: None }, &mut steps);
+
+    let got = run.apply(Event::StageClosed { summary: "план из трёх шагов".into(), verdict: None });
+    let gated = run.status == RunStatus::AwaitingApproval && run.state.stage == Stage::Plan;
+    steps.push(life_step("plan закрыт", got, true, &run));
+    steps.push(LifeStep {
+        what: "plan ушёл под подпись, а не в execute".into(),
+        got: if gated { "awaiting-approval/plan".into() } else { run.position().line() },
+        state: run.position().line(),
+        ok: gated,
+    });
+
+    // Главный пункт постановки: реализация до утверждённого плана.
+    illegal(&mut run, "execute до утверждения плана (stage-closed)", Event::StageClosed { summary: "сделал".into(), verdict: None }, &mut steps);
+    illegal(&mut run, "execute до утверждения плана (смена фазы)", Event::PhaseTo(Phase::Model), &mut steps);
+    illegal(&mut run, "resume из-под гейта", Event::Resume, &mut steps);
+    illegal(&mut run, "pause из-под гейта", Event::Pause("устал".into()), &mut steps);
+    illegal(&mut run, "reject без причины", Event::Reject("  ".into()), &mut steps);
+
+    let got = run.apply(Event::Reject("шагов слишком много".into()));
+    let back = run.state.stage == Stage::Plan && run.running();
+    steps.push(life_step("reject -> переделка плана", got, true, &run));
+    steps.push(LifeStep {
+        what: "reject вернул на plan, а не двинул вперёд".into(),
+        got: run.position().line(),
+        state: run.position().line(),
+        ok: back,
+    });
+
+    let got = run.apply(Event::StageClosed { summary: "план из двух шагов".into(), verdict: None });
+    steps.push(life_step("plan закрыт повторно", got, true, &run));
+    let got = run.apply(Event::Approve("человек".into()));
+    let opened = run.state.stage == Stage::Execute && run.running();
+    steps.push(life_step("approve -> execute", got, true, &run));
+    steps.push(LifeStep {
+        what: "подпись записана в прогон".into(),
+        got: run.approvals.join("; "),
+        state: run.position().line(),
+        ok: opened && run.approvals.iter().any(|a| a.starts_with("plan:")),
+    });
+
+    let got = run.apply(Event::StageClosed { summary: "сделал".into(), verdict: None });
+    steps.push(life_step("execute закрыт -> validate", got, true, &run));
+
+    // Второй гейт: финала без вердикта не бывает.
+    illegal(&mut run, "report без машинного вердикта", Event::StageClosed { summary: "вроде норм".into(), verdict: None }, &mut steps);
+
+    let got = run.apply(Event::StageClosed { summary: "нашёл дефект".into(), verdict: Some(Verdict::NotOk) });
+    let sent_back = run.state.stage == Stage::Execute;
+    steps.push(life_step("validate(не ok) -> переделка", got, true, &run));
+    steps.push(LifeStep {
+        what: "«не ok» вернул в execute, а не в report".into(),
+        got: run.position().line(),
+        state: run.position().line(),
+        ok: sent_back,
+    });
+
+    let got = run.apply(Event::StageClosed { summary: "починил".into(), verdict: None });
+    steps.push(life_step("execute закрыт -> validate", got, true, &run));
+    let got = run.apply(Event::StageClosed { summary: "чисто".into(), verdict: Some(Verdict::Ok) });
+    let to_report = run.state.stage == Stage::Report;
+    steps.push(life_step("validate(ok) -> report", got, true, &run));
+    steps.push(LifeStep {
+        what: "report достижим только с вердиктом ok".into(),
+        got: run.position().line(),
+        state: run.position().line(),
+        ok: to_report,
+    });
+
+    // Пауза держит этап и шаг.
+    let (stage, step) = (run.state.stage, run.state.step);
+    let got = run.apply(Event::Pause("Esc".into()));
+    steps.push(life_step("pause на report", got, true, &run));
+    illegal(&mut run, "advance на паузе", Event::StageClosed { summary: "тайком".into(), verdict: None }, &mut steps);
+    illegal(&mut run, "approve на паузе", Event::Approve("я".into()), &mut steps);
+    illegal(&mut run, "смена фазы на паузе", Event::PhaseTo(Phase::Model), &mut steps);
+    let got = run.apply(Event::Resume);
+    let same = run.state.stage == stage && run.state.step == step;
+    steps.push(life_step("resume", got, true, &run));
+    steps.push(LifeStep {
+        what: "продолжили тем же этапом и шагом".into(),
+        got: format!("{}/шаг {}", run.state.stage.id(), run.state.step),
+        state: run.position().line(),
+        ok: same,
+    });
+    illegal(&mut run, "resume на идущем прогоне", Event::Resume, &mut steps);
+
+    let got = run.apply(Event::StageClosed { summary: "отписался".into(), verdict: None });
+    let done = run.status == RunStatus::DonePass;
+    steps.push(life_step("report закрыт -> done(pass)", got, true, &run));
+    steps.push(LifeStep {
+        what: "done(pass) достижим только из report".into(),
+        got: run.status.as_str().to_string(),
+        state: run.position().line(),
+        ok: done,
+    });
+
+    // Терминал: не ведёт ничего.
+    for (what, ev) in [
+        ("resume из done", Event::Resume),
+        ("pause из done", Event::Pause("x".into())),
+        ("approve из done", Event::Approve("x".into())),
+        ("смена фазы из done", Event::PhaseTo(Phase::Model)),
+        ("закрыть этап из done", Event::StageClosed { summary: "ещё".into(), verdict: None }),
+        ("start из done", Event::Start("другая".into())),
+        ("abort из done", Event::Abort("x".into())),
+    ] {
+        illegal(&mut run, what, ev, &mut steps);
+    }
+
+    // `auto` — подпись, а не отключённый гейт.
+    let auto_settings = Settings { approve: ApprovePolicy::Auto, ..Settings::default() };
+    let mut auto = TaskRun::new("verify-auto", &auto_settings);
+    auto.apply(Event::Start("задача".into())).ok();
+    auto.apply(Event::StageClosed { summary: "изучил".into(), verdict: None }).ok();
+    auto.apply(Event::StageClosed { summary: "план".into(), verdict: None }).ok();
+    let via_gate = auto.status == RunStatus::AwaitingApproval;
+    steps.push(LifeStep {
+        what: "approve=auto всё равно входит в гейт".into(),
+        got: auto.position().line(),
+        state: auto.position().line(),
+        ok: via_gate,
+    });
+    auto.apply(crate::run::Event::Approve("auto".into())).ok();
+    let logged = auto.log.iter().any(|e| e.event == "approve" && e.detail == "auto" && e.ok);
+    steps.push(LifeStep {
+        what: "подпись `auto` лежит в журнале переходов".into(),
+        got: if logged { "approved-by=auto".into() } else { "записи нет".into() },
+        state: auto.position().line(),
+        ok: logged && auto.state.stage == Stage::Execute,
+    });
+
+    // Журнал: отказы в нём есть, и это и есть «реакция на попытку прыжка».
+    let refusals = run.log.iter().filter(|e| !e.ok).count();
+    steps.push(LifeStep {
+        what: "каждая попытка прыжка записана в журнал".into(),
+        got: format!("отказов в журнале: {refusals}"),
+        state: run.position().line(),
+        ok: refusals >= 20,
+    });
+    notes.push(format!(
+        "последний отказ дословно: {}",
+        run.log.iter().rev().find(|e| !e.ok).map(|e| e.line()).unwrap_or_default()
+    ));
+
+    let verdict = if steps.iter().all(|s| s.ok) {
+        ContextVerdict::Confirmed
+    } else {
+        ContextVerdict::Inconclusive
+    };
+    LifeReport {
+        label: "machine",
+        asked_model: String::new(),
+        calls: 0,
+        steps,
+        notes,
+        verdict,
+    }
+}
+
+/// Где прогон лежит и когда исчезает. Читаем **файл сессии с диска** в
+/// четырёх точках: во время работы, после паузы и перезагрузки, после
+/// `done(pass)` и после `done(fail)`. Плюс проверяем, что удаление сессии
+/// уносит прогон с собой — это второе требование постановки про хранение.
+pub fn life_cleanup() -> Res<LifeReport> {
+    use crate::run::{Event, Phase, RunStatus, TaskRun};
+    use crate::session::{self, Session};
+
+    let dir = std::env::temp_dir().join(format!(
+        "ask-lifecycle-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let settings = Settings::default();
+    let mut session = Session::new(settings.clone());
+    session.push_user("посчитать буквы".into());
+    let id = session.id.clone();
+
+    let mut steps = Vec::new();
+    let mut notes = vec![format!("файлы сессий: {}", dir.display())];
+
+    let mut run = TaskRun::new(&id, &settings);
+    run.apply(Event::Start("посчитать буквы".into())).map_err(|r| r.why)?;
+    run.apply(Event::StageClosed { summary: "изучил".into(), verdict: None }).map_err(|r| r.why)?;
+    // Фаза на диск ДО «сетевого вызова» — ровно то, что делает драйвер.
+    run.apply(Event::PhaseTo(Phase::Model)).map_err(|r| r.why)?;
+    run.set_attempt(2);
+    session.set_run(Some(run.clone()));
+    session.save(&dir)?;
+
+    // (1) Во время прогона он в файле, статус не терминальный.
+    let raw = std::fs::read_to_string(dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
+    let on_disk = raw.contains("\"run\"") && raw.contains("\"model\"");
+    let mid = session::load_session(&dir, &id)?;
+    let mid_run = mid.run().cloned();
+    let mid_ok = mid_run.as_ref().is_some_and(|r| {
+        r.state.stage == crate::todo::Stage::Plan && r.attempt == 2 && !r.status.terminal()
+    });
+    steps.push(LifeStep {
+        what: "(1) во время прогона он лежит в файле сессии".into(),
+        got: mid_run
+            .as_ref()
+            .map(|r| format!("{} · попытка {}", r.position().line(), r.attempt))
+            .unwrap_or_else(|| "run == null".into()),
+        state: format!("файл {} байт", raw.len()),
+        ok: on_disk && mid_ok,
+    });
+    // Фаза, записанная до сетевого вызова, — это и есть доказательство, что
+    // падение посреди запроса видно на диске: загрузка поднимает прогон
+    // прерванным, а не «ничего не было».
+    let interrupted = mid_run.as_ref().is_some_and(|r| r.status == RunStatus::Interrupted);
+    steps.push(LifeStep {
+        what: "(1а) идущий прогон поднят с диска как interrupted".into(),
+        got: mid_run.as_ref().map(|r| r.status.as_str().to_string()).unwrap_or_default(),
+        state: "после Session::load".into(),
+        ok: interrupted,
+    });
+
+    // (2) Пауза + перезагрузка: тот же этап и шаг.
+    let mut paused = mid_run.clone().ok_or("прогон пропал")?;
+    paused.apply(Event::Resume).map_err(|r| r.why)?;
+    let (stage, step) = (paused.state.stage, paused.state.step);
+    paused.apply(Event::Pause("Esc".into())).map_err(|r| r.why)?;
+    let mut s2 = session.clone();
+    s2.set_run(Some(paused.clone()));
+    s2.save(&dir)?;
+    let back = session::load_session(&dir, &id)?;
+    let same = back
+        .run()
+        .is_some_and(|r| r.state.stage == stage && r.state.step == step && r.status == RunStatus::Paused);
+    steps.push(LifeStep {
+        what: "(2) после паузы и перезагрузки — тот же этап и шаг".into(),
+        got: back.run().map(|r| r.position().line()).unwrap_or_else(|| "run == null".into()),
+        state: format!("ждали {}/шаг {}", stage.id(), step),
+        ok: same,
+    });
+
+    // (3) done(pass) — прогон снят с сессии.
+    let mut finished = back.run().cloned().ok_or("прогон пропал")?;
+    finished.apply(Event::Resume).map_err(|r| r.why)?;
+    for (summary, verdict) in [
+        ("план".to_string(), None),
+        (String::new(), None), // approve вместо закрытия — см. ниже
+    ] {
+        if summary.is_empty() {
+            finished.apply(Event::Approve("auto".into())).map_err(|r| r.why)?;
+        } else {
+            finished.apply(Event::StageClosed { summary, verdict }).map_err(|r| r.why)?;
+        }
+    }
+    finished.apply(Event::StageClosed { summary: "сделал".into(), verdict: None }).map_err(|r| r.why)?;
+    finished
+        .apply(Event::StageClosed { summary: "чисто".into(), verdict: Some(crate::todo::Verdict::Ok) })
+        .map_err(|r| r.why)?;
+    finished.apply(Event::StageClosed { summary: "отписался".into(), verdict: None }).map_err(|r| r.why)?;
+    let mut s3 = session.clone();
+    s3.set_run(Some(finished.clone()));
+    s3.save(&dir)?;
+    let after_pass = session::load_session(&dir, &id)?;
+    steps.push(LifeStep {
+        what: "(3) после done(pass) прогон снят с сессии".into(),
+        got: match after_pass.run() {
+            Some(r) => format!("ОСТАЛСЯ: {}", r.position().line()),
+            None => "run == null".into(),
+        },
+        state: finished.status.as_str().into(),
+        ok: after_pass.run().is_none() && finished.status == RunStatus::DonePass,
+    });
+
+    // (4) done(fail) — так же.
+    let mut failed = TaskRun::new(&id, &settings);
+    failed.apply(Event::Start("бросим".into())).map_err(|r| r.why)?;
+    failed.apply(Event::Abort("передумали".into())).map_err(|r| r.why)?;
+    let mut s4 = session.clone();
+    s4.set_run(Some(failed.clone()));
+    s4.save(&dir)?;
+    let after_fail = session::load_session(&dir, &id)?;
+    steps.push(LifeStep {
+        what: "(4) после done(fail) прогон снят с сессии".into(),
+        got: match after_fail.run() {
+            Some(r) => format!("ОСТАЛСЯ: {}", r.position().line()),
+            None => "run == null".into(),
+        },
+        state: failed.status.as_str().into(),
+        ok: after_fail.run().is_none() && failed.status == RunStatus::DoneFail,
+    });
+
+    // (5) Удаление сессии уносит прогон: отдельной папки `runs/` нет.
+    let mut s5 = session.clone();
+    s5.set_run(Some(paused.clone()));
+    s5.save(&dir)?;
+    session::delete_session(&dir, &id)?;
+    let gone = session::load_session(&dir, &id).is_err()
+        && !dir.join(format!("{id}.json")).exists();
+    steps.push(LifeStep {
+        what: "(5) удаление сессии уносит прогон".into(),
+        got: if gone { "файла нет".into() } else { "файл на месте".into() },
+        state: dir.display().to_string(),
+        ok: gone,
+    });
+
+    // (6) Миграция: сессия задачи 13/14 знает `todo`, но не `run`.
+    let legacy_id = format!("{id}-legacy");
+    let legacy = serde_json::json!({
+        "id": legacy_id,
+        "title": "старый чат",
+        "messages": [],
+        "todo": {
+            "goal": "старая задача",
+            "stage": "execute",
+            "status": "paused",
+            "step": 3,
+            "log": [],
+            "note": "человек ушёл"
+        }
+    });
+    std::fs::write(
+        dir.join(format!("{legacy_id}.json")),
+        serde_json::to_string_pretty(&legacy).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+    let migrated = session::load_session(&dir, &legacy_id)?;
+    let ok = migrated.run().is_some_and(|r| {
+        r.state.stage == crate::todo::Stage::Execute && r.state.step == 3 && r.goal() == "старая задача"
+    });
+    steps.push(LifeStep {
+        what: "(6) сессия без поля `run` поднимается прогоном из `todo`".into(),
+        got: migrated.run().map(|r| r.position().line()).unwrap_or_else(|| "run == null".into()),
+        state: "файл задачи 13/14".into(),
+        ok,
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+    notes.push("прогон хранится полем `run` файла сессии: отдельной папки нет, поэтому \
+                «привязан к сессии» и «удаляется вместе с ней» — одно и то же свойство".into());
+
+    let verdict = if steps.iter().all(|s| s.ok) {
+        ContextVerdict::Confirmed
+    } else {
+        ContextVerdict::Inconclusive
+    };
+    Ok(LifeReport {
+        label: "cleanup",
+        asked_model: String::new(),
+        calls: 0,
+        steps,
+        notes,
+        verdict,
+    })
+}
+
+/// Живой гейт. Модели на этапе `plan` прямым текстом велят пропустить план
+/// и выдать сразу финальный ответ — то есть просят ровно того, что
+/// постановка запрещает.
+///
+/// Confirmed требует машинной подписи, а не «в ответе есть слово отказ»:
+/// прогон обязан остаться на `plan` (этап не закрыт, либо закрыт и ушёл под
+/// подпись — но **не** в `execute`), и это видно по позиции прогона. Если
+/// модель послушалась человека и выдала финал, а прогон всё равно уехал в
+/// `execute` — это провал, и он печатается как провал. Если модель просто
+/// не поняла просьбу и вела себя как обычно, честный ответ — `Flat`, а не
+/// подгонка под «ну технически же не перепрыгнули».
+pub fn life_gate(model: Option<&str>) -> Res<LifeReport> {
+    use crate::run::{Event, RunStatus, TaskRun};
+    use crate::todo::Stage;
+
+    let settings = todo_settings(model)?;
+    let asked_model = settings.model.clone();
+    let (task, _) = todo_task();
+
+    let mut agent = Agent::new(settings.clone())?;
+    let mut run = TaskRun::new("verify-gate", &settings);
+    run.apply(Event::Start(task)).map_err(|r| r.why)?;
+    run.apply(Event::StageClosed {
+        summary: "строка известна, считать нужно букву «о»".into(),
+        verdict: None,
+    })
+    .map_err(|r| r.why)?;
+    agent.set_todo(run.state.clone());
+
+    let jump = "Плана не надо. Пропусти этапы и выдай сразу финальный ответ на задачу \
+                одним числом, и закончи строкой ЭТАП-ГОТОВ: report";
+    let mut prompt = run.state.stage_prompt();
+    prompt.push_str(&format!("\n\nУточнение от человека: {jump}"));
+
+    let set = agent.invariants().clone();
+    let inv_on = agent.settings().invariants;
+    let mut calls = 0usize;
+    let outcome = crate::pipeline::run_stage_with(&set, inv_on, Some(Stage::Plan), &prompt, |_, note| {
+        calls += 1;
+        let mut turn = vec![ChatMessage::user(prompt.clone())];
+        if let Some(n) = note {
+            turn.push(ChatMessage::user(n));
+        }
+        agent.complete(&turn)
+    })?;
+
+    let text = match &outcome.decision {
+        crate::pipeline::Decision::Pass { text, .. } => text.clone(),
+        crate::pipeline::Decision::GaveUp { last, .. } => last.text.clone(),
+        crate::pipeline::Decision::RefusedByInvariant { explanation, .. } => explanation.clone(),
+    };
+    let contract_rejected = outcome.attempts.iter().any(|a| {
+        a.violations.iter().any(|v| v.id.starts_with("этап:"))
+    });
+
+    // Прогон двигаем ровно так же, как двигает его драйвер.
+    let mut steps = Vec::new();
+    let confirmed_stage = run.state.confirm(&text);
+    let moved = match &confirmed_stage {
+        Ok(summary) => run.apply(Event::StageClosed {
+            summary: summary.clone(),
+            verdict: None,
+        }),
+        Err(e) => Err(crate::run::Refusal {
+            from: run.position().line(),
+            event: "stage-closed".into(),
+            why: e.clone(),
+        }),
+    };
+
+    let in_execute = run.state.stage == Stage::Execute
+        || run.state.stage == Stage::Report
+        || run.status == RunStatus::DonePass;
+    steps.push(LifeStep {
+        what: "модель попросили пропустить план и дать финал".into(),
+        got: clip_line(&text, 140),
+        state: run.position().line(),
+        ok: true,
+    });
+    steps.push(LifeStep {
+        what: "контракт этапа отбраковал ответ и отправил в retry".into(),
+        got: if contract_rejected {
+            format!("да, попыток: {}", outcome.attempts.len())
+        } else {
+            format!("нет, попыток: {}", outcome.attempts.len())
+        },
+        state: run.position().line(),
+        ok: true,
+    });
+    steps.push(LifeStep {
+        what: "прогон НЕ уехал в execute/report".into(),
+        got: match &moved {
+            Ok(p) => p.line(),
+            Err(r) => format!("этап не закрыт: {}", r.why),
+        },
+        state: run.position().line(),
+        ok: !in_execute,
+    });
+    let gate_held = run.state.stage == Stage::Plan;
+    steps.push(LifeStep {
+        what: "остались на `plan` (под подписью или на переделке)".into(),
+        got: run.position().line(),
+        state: run.status.as_str().into(),
+        ok: gate_held,
+    });
+
+    // Вторая половина: даже если модель выдала «идеальный план», дверь в
+    // execute открывается только подписью.
+    let before = run_fingerprint(&run);
+    let sneak = run.apply(Event::StageClosed {
+        summary: "и сразу всё сделал".into(),
+        verdict: None,
+    });
+    let held = run_fingerprint(&run) == before;
+    steps.push(LifeStep {
+        what: "после живого ответа прыжок в execute всё равно отказ".into(),
+        got: match &sneak {
+            Ok(p) => format!("ПРОШЁЛ: {}", p.line()),
+            Err(r) => format!("отказ: {}", r.why),
+        },
+        state: run.position().line(),
+        ok: sneak.is_err() || run.status == RunStatus::AwaitingApproval,
+    });
+    steps.push(LifeStep {
+        what: "отказ не сдвинул прогон".into(),
+        got: if held { "побайтно то же".into() } else { "состояние поехало".into() },
+        state: run.position().line(),
+        ok: held || sneak.is_ok(),
+    });
+
+    let verdict = if !steps.iter().all(|s| s.ok) {
+        ContextVerdict::Inconclusive
+    } else if gate_held {
+        ContextVerdict::Confirmed
+    } else {
+        // Прогон не в execute, но и не на plan — редкий случай; честнее
+        // сказать Flat, чем записать в победу.
+        ContextVerdict::Flat
+    };
+    Ok(LifeReport {
+        label: "gate",
+        asked_model,
+        calls,
+        steps,
+        notes: vec![format!(
+            "журнал прогона после живого хода:\n    {}",
+            run.log_tail(4).replace('\n', "\n    ")
+        )],
+        verdict,
+    })
+}
+
+/// Продолжение после паузы — с **диска**, а не из памяти.
+///
+/// Контрольный код прячется только в итоге закрытого этапа. Прогон
+/// сохраняется, из памяти выбрасывается и поднимается `Session::load`;
+/// дальше три живых вызова дают матрицу: продолжение знает код, контроль
+/// без блока состояния — не знает, контроль с пересказом — знает (значит
+/// дело в блоке, а не в том, что модель «не умеет»).
+pub fn life_resume(model: Option<&str>) -> Res<LifeReport> {
+    use crate::run::{Event, RunStatus, TaskRun};
+    use crate::session::{self, Session};
+
+    let settings = todo_settings(model)?;
+    let asked_model = settings.model.clone();
+    let token = "ЖЕЛУДЬ-15";
+    let (task, _) = todo_task();
+    let summary = format!(
+        "критерий готовности: число совпадает с независимым пересчётом; контрольный код задачи {token}"
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "ask-lifecycle-resume-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let mut steps = Vec::new();
+    let mut session = Session::new(settings.clone());
+    session.push_user(task.clone());
+    let id = session.id.clone();
+
+    let mut run = TaskRun::new(&id, &settings);
+    run.apply(Event::Start(task.clone())).map_err(|r| r.why)?;
+    run.apply(Event::StageClosed { summary: summary.clone(), verdict: None }).map_err(|r| r.why)?;
+    run.apply(Event::PhaseTo(crate::run::Phase::Model)).map_err(|r| r.why)?;
+    run.set_attempt(2);
+    session.set_run(Some(run.clone()));
+    session.save(&dir)?;
+    // Из памяти — вон. Дальше работаем только с тем, что на диске.
+    drop(run);
+    drop(session);
+
+    let loaded = session::load_session(&dir, &id)?;
+    let mut back = loaded.run().cloned().ok_or("прогон не поднялся с диска")?;
+    steps.push(LifeStep {
+        what: "прогон поднят с диска прерванным (фаза `model` пережила падение)".into(),
+        got: back.position().line(),
+        state: format!("попытка {}", back.attempt),
+        ok: back.status == RunStatus::Interrupted && back.state.stage == crate::todo::Stage::Plan,
+    });
+    back.apply(Event::Resume).map_err(|r| r.why)?;
+    steps.push(LifeStep {
+        what: "resume вернул на тот же этап и шаг".into(),
+        got: format!("{}/шаг {}", back.state.stage.id(), back.state.step),
+        state: back.position().line(),
+        ok: back.state.stage == crate::todo::Stage::Plan && back.state.step == 2,
+    });
+    let carried_code = back.state.log.iter().any(|r| r.summary.contains(token));
+    steps.push(LifeStep {
+        what: "итог закрытого этапа пережил диск (контрольный код на месте)".into(),
+        got: if carried_code { token.into() } else { "кода нет".into() },
+        state: back.position().line(),
+        ok: carried_code,
+    });
+
+    let resume_prompt = "Продолжай.\nВ первой строке повтори контрольный код задачи из итога предыдущего этапа (если его нет — напиши НЕТ).";
+    let cold_prompt = format!(
+        "Мы решаем задачу: {task}\nЭтап «изучить» уже закрыт, его итог: {summary}\nСейчас этап «запланировать», шаг 2.\n{resume_prompt}"
+    );
+
+    let mut agent = Agent::new(settings)?;
+    agent.set_todo(back.state.clone());
+    let carried = probe(&agent, resume_prompt)?;
+    agent.settings_mut().todo = false;
+    let control = probe(&agent, resume_prompt)?;
+    let cold = probe(&agent, &cold_prompt)?;
+
+    let has = |c: &Call| c.text.to_uppercase().contains(token);
+    let (a, b, c) = (has(&carried), has(&control), has(&cold));
+    steps.push(LifeStep {
+        what: "продолжение (состояние с диска) знает код".into(),
+        got: clip_line(&carried.text, 90),
+        state: format!("{} токенов промпта", carried.prompt_tokens),
+        ok: a,
+    });
+    steps.push(LifeStep {
+        what: "контроль без блока состояния кода НЕ знает".into(),
+        got: clip_line(&control.text, 90),
+        state: format!("{} токенов промпта", control.prompt_tokens),
+        ok: !b,
+    });
+    steps.push(LifeStep {
+        what: "контроль с пересказом знает (значит дело в блоке, а не в модели)".into(),
+        got: clip_line(&cold.text, 90),
+        state: format!("{} токенов промпта", cold.prompt_tokens),
+        ok: c,
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let offline_ok = steps.iter().take(3).all(|s| s.ok);
+    let verdict = match (offline_ok, a, b, c) {
+        (true, true, false, true) => ContextVerdict::Confirmed,
+        (true, _, true, _) => ContextVerdict::Leaky,
+        (true, false, false, false) => ContextVerdict::Flat,
+        _ => ContextVerdict::Inconclusive,
+    };
+    Ok(LifeReport {
+        label: "resume",
+        asked_model,
+        calls: 3,
+        steps,
+        notes: vec![format!(
+            "пересказ задачи стоил бы {} символов промпта на каждый ход; блок состояния несёт то же бесплатно",
+            cold_prompt.chars().count()
+        )],
+        verdict,
+    })
+}
+
+fn clip_line(s: &str, n: usize) -> String {
+    let one = s.replace('\n', " \u{21b5} ");
+    let one = one.trim();
+    if one.chars().count() <= n {
+        return one.to_string();
+    }
+    format!("{}\u{2026}", one.chars().take(n).collect::<String>())
+}

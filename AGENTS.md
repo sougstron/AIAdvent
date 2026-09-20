@@ -57,7 +57,7 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-14/`.** It is a working agent: a ratatui
+**The active snapshot is `tree/task-15/`.** It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
@@ -134,7 +134,7 @@ each stage closed *itself* and the final answer holds the right number. All
 four came back Confirmed live on `glm-5.3-flash`.
 
 Task 14 adds **project invariants**. Editable rules live outside dialogue
-history in `tree/task-14/invariants.json`; architecture, accepted decisions,
+history in `tree/task-15/invariants.json`; architecture, accepted decisions,
 stack constraints and business rules share one schema (`id`, `rule`, `why`,
 `workaround`, deterministic `forbid`/`triggers`). The prompt builder injects
 one `<invariants>` system block before the final task-state block. Every
@@ -145,6 +145,26 @@ discarded and retried, with a hard limit of five; rejected attempts never
 enter history. The mechanism is on by default (`--invariants off` is the
 control), and `ask --verify-invariants all` causally proves the wire block,
 origin classification, retry limit and refusal explanation offline.
+
+Task 15 wraps that ladder in a **controlled task lifecycle** (`run.rs`). A
+run (`TaskRun`) is the task materialised for as long as it is being worked
+on: a status (`idle`, `running`, `awaiting-approval`, `paused`,
+`interrupted`, `done(pass)`, `done(fail)`), the stage, and the phase of the
+current request (`prompt`/`model`/`validate`/`decide`). Every transition goes
+through one pure function, `run::transition` — neither the TUI nor the CLI
+can move the ladder any other way, so an illegal transition is a `Refusal`
+that leaves the run byte-identical and lands in the run log with the exact
+text the human is shown (`/todo log`). Two gates are structural rather than
+prompt-level: `plan` closes into *awaiting approval*, not into `execute`
+(`/todo approve`, `/todo reject <why>`; `--approve auto` is a signature
+logged as `approved-by=auto`, never a skipped gate), and `report` is
+unreachable without a machine-checkable `ВЕРДИКТ: ok|не ok` line closing
+`validate`. Stage contracts (`todo::check_stage_output`) feed the same retry
+path as invariants, so a stage cannot be jumped by content either. The run
+is stored as the `run` field of the session file — it survives Esc, app exit
+and restart, and is cleared only at `done` or when the session is deleted.
+Proof: `ask --verify-lifecycle machine|gate|resume|cleanup|offline|all`, all
+four Confirmed live on `glm-5.3-flash`.
 
 Its `README.md` covers the Agent shape, key resolution, runtime settings, all six
 strategies plus the memory model, the personalization profile and the task
@@ -166,8 +186,9 @@ src/session.rs session persistence (~/.ask/sessions/*.json)
 src/render.rs  JSON-mode flattening ("Key: value" lines), shared by CLI and TUI
 src/tui.rs     the chat TUI: transcript, input, slash commands, settings/sessions panels
 src/todo.rs    the task state machine: stages, transitions, the system block
+src/run.rs     the controlled task lifecycle: run states, the transition table, gates, the run log
 src/invariants.rs editable rules, system block, deterministic validator
-src/pipeline.rs   Prompt → LLM → Validate → Pass/Fail retry loop
+src/pipeline.rs   Prompt → LLM → Validate (invariants + stage contract) → Pass/Fail retry loop
 src/verify.rs  the stop-condition self-test
 ```
 
