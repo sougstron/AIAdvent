@@ -17,6 +17,7 @@ use crate::config::{self, ContextStrategy, Res, Settings, DEFAULT_MODEL};
 use crate::memory::{self, Layer, MemoryStore};
 use crate::profile;
 use crate::session::StoredMessage;
+use crate::todo::{self, TaskState};
 
 const PING_PROMPT: &str = "Reply with the single word PONG.";
 const LONG_PROMPT: &str =
@@ -3586,6 +3587,772 @@ pub fn run_profile_auto(model: Option<&str>) -> Res<ProfileAutoReport> {
         without_memory,
         with_recalled,
         without_recalled,
+        verdict,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Задача 13: состояние задачи как конечный автомат (`todo.rs`).
+// ---------------------------------------------------------------------------
+
+/// Что именно проверяем в тудушке.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TodoCheck {
+    /// Сам автомат: законные переходы проходят, незаконные — отказ. Без сети.
+    Machine,
+    /// Что уезжает в `system`: блок один, в нём этап/шаг/ожидаемое действие
+    /// и итоги пройденных этапов, а при переходе меняется **только** он.
+    /// Без сети.
+    Wire,
+    /// Живьём: пауза и продолжение без повторных объяснений. Confirmed
+    /// только когда то, что знает продолжение, не знает контроль без блока.
+    Resume,
+    /// Живьём: вся лестница на задаче с машинно-проверяемым ответом.
+    Ladder,
+}
+
+impl TodoCheck {
+    pub const ALL: [TodoCheck; 4] = [
+        TodoCheck::Machine,
+        TodoCheck::Wire,
+        TodoCheck::Resume,
+        TodoCheck::Ladder,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TodoCheck::Machine => "machine",
+            TodoCheck::Wire => "wire",
+            TodoCheck::Resume => "resume",
+            TodoCheck::Ladder => "ladder",
+        }
+    }
+
+    /// Не нужна ли этой проверке сеть.
+    pub fn offline(self) -> bool {
+        matches!(self, TodoCheck::Machine | TodoCheck::Wire)
+    }
+
+    /// `machine|wire|resume|ladder|all`.
+    pub fn parse(s: &str) -> Res<Vec<TodoCheck>> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Ok(TodoCheck::ALL.to_vec()),
+            "offline" => Ok(vec![TodoCheck::Machine, TodoCheck::Wire]),
+            "machine" | "fsm" | "states" => Ok(vec![TodoCheck::Machine]),
+            "wire" | "prompt" | "system" => Ok(vec![TodoCheck::Wire]),
+            "resume" | "pause" | "continue" => Ok(vec![TodoCheck::Resume]),
+            "ladder" | "flow" | "stages" => Ok(vec![TodoCheck::Ladder]),
+            other => Err(format!(
+                "unknown todo check `{other}`; expected machine, wire, resume, ladder, offline or all"
+            )),
+        }
+    }
+}
+
+/// Один пункт протокола автомата: что пробовали и что вышло.
+#[derive(Clone, Debug)]
+pub struct MachineStep {
+    pub what: String,
+    /// Чем кончилось: `ok` или текст отказа.
+    pub got: String,
+    /// Состояние после попытки.
+    pub state: String,
+    /// Совпало ли с ожиданием.
+    pub ok: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TodoMachineReport {
+    pub steps: Vec<MachineStep>,
+    pub verdict: ContextVerdict,
+}
+
+/// Один случай сборки `system` с блоком состояния.
+#[derive(Clone, Debug)]
+pub struct TodoWireCase {
+    pub label: String,
+    pub stage: String,
+    pub block: Option<String>,
+    /// Сколько раз встретился заголовок блока: два блока — баг.
+    pub blocks: usize,
+    /// Всё, что не блок состояния.
+    pub rest: String,
+    /// Обязательные строки блока, которых в нём не нашлось.
+    pub missing: Vec<String>,
+}
+
+impl TodoWireCase {
+    fn line(&self) -> String {
+        format!(
+            "[{}] этап={} блоков={} потеряно строк={} остальное={} симв.",
+            self.label,
+            self.stage,
+            self.blocks,
+            self.missing.len(),
+            self.rest.chars().count()
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TodoWireReport {
+    pub cases: Vec<TodoWireCase>,
+    /// Совпало ли «остальное» до и после перехода на следующий этап.
+    pub rest_identical: bool,
+    /// Отличаются ли сами блоки.
+    pub blocks_differ: bool,
+    /// Уехал ли итог закрытого этапа в блок.
+    pub log_carried: bool,
+    /// При `todo=off` блока нет вовсе.
+    pub off_has_no_block: bool,
+    pub verdict: ContextVerdict,
+}
+
+#[derive(Clone, Debug)]
+pub struct TodoResumeReport {
+    pub asked_model: String,
+    pub calls: usize,
+    /// Контрольный код, который есть только в итоге закрытого этапа.
+    pub token: String,
+    /// Что человек напечатал, продолжая работу.
+    pub resume_prompt: String,
+    /// Сколько пришлось бы напечатать, объясняя всё заново.
+    pub cold_chars: usize,
+    /// Продолжение: блок состояния на месте, человек сказал «продолжай».
+    pub carried: Call,
+    /// Контроль: тот же вопрос без блока состояния.
+    pub control: Call,
+    /// Контроль наоборот: без блока, но с полным пересказом в запросе.
+    pub cold: Call,
+    pub carried_has: bool,
+    pub control_has: bool,
+    pub cold_has: bool,
+    pub verdict: ContextVerdict,
+}
+
+/// Один этап живого прогона лестницы.
+#[derive(Clone, Debug)]
+pub struct TodoStageCase {
+    pub stage: String,
+    /// Какой этап закрыл ответ (по маркеру); пусто — маркера не было.
+    pub claimed: String,
+    pub confirmed: bool,
+    pub summary: String,
+    pub call: Call,
+}
+
+impl TodoStageCase {
+    fn line(&self) -> String {
+        format!(
+            "[{}] закрыл=`{}` подтверждён={} · {}\n  итог: {}",
+            self.stage,
+            if self.claimed.is_empty() {
+                "—"
+            } else {
+                &self.claimed
+            },
+            self.confirmed,
+            self.call.line(),
+            clip(&self.summary, 160)
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TodoLadderReport {
+    pub asked_model: String,
+    pub calls: usize,
+    pub task: String,
+    /// Машинно-проверяемый ответ, посчитанный здесь же, а не вписанный руками.
+    pub want: String,
+    pub stages: Vec<TodoStageCase>,
+    pub reached_done: bool,
+    /// Есть ли правильное число в финальном ответе человеку.
+    pub answer_ok: bool,
+    pub verdict: ContextVerdict,
+}
+
+#[derive(Clone, Debug)]
+pub enum TodoReport {
+    Machine(TodoMachineReport),
+    Wire(TodoWireReport),
+    Resume(Box<TodoResumeReport>),
+    Ladder(Box<TodoLadderReport>),
+}
+
+impl TodoReport {
+    pub fn verdict(&self) -> ContextVerdict {
+        match self {
+            TodoReport::Machine(r) => r.verdict,
+            TodoReport::Wire(r) => r.verdict,
+            TodoReport::Resume(r) => r.verdict,
+            TodoReport::Ladder(r) => r.verdict,
+        }
+    }
+
+    pub fn confirmed(&self) -> bool {
+        self.verdict() == ContextVerdict::Confirmed
+    }
+
+    pub fn calls(&self) -> usize {
+        match self {
+            TodoReport::Machine(_) | TodoReport::Wire(_) => 0,
+            TodoReport::Resume(r) => r.calls,
+            TodoReport::Ladder(r) => r.calls,
+        }
+    }
+
+    pub fn status_line(&self) -> String {
+        match self {
+            TodoReport::Machine(r) => format!(
+                "machine: verdict={} переходов={} провалов={}",
+                r.verdict.as_str(),
+                r.steps.len(),
+                r.steps.iter().filter(|s| !s.ok).count()
+            ),
+            TodoReport::Wire(r) => format!(
+                "wire: verdict={} случаев={} остальное не тронуто={} блоки различаются={} итог доехал={} off без блока={}",
+                r.verdict.as_str(),
+                r.cases.len(),
+                r.rest_identical,
+                r.blocks_differ,
+                r.log_carried,
+                r.off_has_no_block
+            ),
+            TodoReport::Resume(r) => format!(
+                "resume: verdict={} код={} продолжение помнит={} контроль без блока={} пересказ помнит={} набрано человеком {}→{} симв. prompt_tokens {}→{}",
+                r.verdict.as_str(),
+                r.token,
+                r.carried_has,
+                r.control_has,
+                r.cold_has,
+                r.cold_chars,
+                r.resume_prompt.chars().count(),
+                r.control.prompt_tokens,
+                r.carried.prompt_tokens
+            ),
+            TodoReport::Ladder(r) => format!(
+                "ladder: verdict={} этапов подтверждено={}/{} дошли до done={} ответ={} (ждали {})",
+                r.verdict.as_str(),
+                r.stages.iter().filter(|s| s.confirmed).count(),
+                r.stages.len(),
+                r.reached_done,
+                r.answer_ok,
+                r.want
+            ),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            TodoReport::Machine(r) => {
+                let mut out = String::from(
+                    "=== автомат состояния задачи (без сети) ===\n\
+                     законные переходы проходят, незаконные — отказ\n\n",
+                );
+                for s in &r.steps {
+                    out.push_str(&format!(
+                        "{} {:<44} → {:<34} [{}]\n",
+                        if s.ok { "\u{2713}" } else { "\u{2717}" },
+                        s.what,
+                        clip(&s.got, 34),
+                        s.state
+                    ));
+                }
+                out.push_str(&format!("\nverdict={}\n", r.verdict.as_str()));
+                out
+            }
+            TodoReport::Wire(r) => {
+                let mut out = String::from(
+                    "=== состояние задачи на проводе (без сети) ===\n\
+                     один и тот же запрос, меняется только этап\n\n",
+                );
+                for c in &r.cases {
+                    out.push_str(&c.line());
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "\nодно состояние — один блок: {}\n\
+                     в блоке есть этап, шаг и ожидаемое действие: {}\n\
+                     итог закрытого этапа уехал в блок: {}\n\
+                     при переходе остальное в system не изменилось: {}\n\
+                     блоки двух этапов различаются: {}\n\
+                     при todo=off блока нет вовсе: {}\n\
+                     verdict={}\n",
+                    r.cases.iter().all(|c| c.blocks <= 1),
+                    r.cases.iter().all(|c| c.missing.is_empty()),
+                    r.log_carried,
+                    r.rest_identical,
+                    r.blocks_differ,
+                    r.off_has_no_block,
+                    r.verdict.as_str()
+                ));
+                out
+            }
+            TodoReport::Resume(r) => {
+                let mut out = format!(
+                    "=== пауза и продолжение без повторных объяснений (живьём) ===\n\
+                     модель: просили {}\n\
+                     контрольный код живёт только в итоге закрытого этапа: {}\n\
+                     человек печатает при продолжении: «{}» ({} симв.)\n\
+                     пересказ того же своими словами стоил бы {} симв.\n\n",
+                    r.asked_model,
+                    r.token,
+                    r.resume_prompt.trim(),
+                    r.resume_prompt.chars().count(),
+                    r.cold_chars
+                );
+                out.push_str(&format!(
+                    "[продолжение, блок состояния на месте] {}\n  {}\n  код на месте: {}\n\n",
+                    r.carried.line(),
+                    clip(&r.carried.text, 200),
+                    r.carried_has
+                ));
+                out.push_str(&format!(
+                    "[контроль, блока нет] {}\n  {}\n  код на месте: {}\n\n",
+                    r.control.line(),
+                    clip(&r.control.text, 200),
+                    r.control_has
+                ));
+                out.push_str(&format!(
+                    "[контроль наоборот: блока нет, но всё пересказано] {}\n  {}\n  код на месте: {}\n",
+                    r.cold.line(),
+                    clip(&r.cold.text, 200),
+                    r.cold_has
+                ));
+                out.push_str(&format!(
+                    "\nпродолжение знает то, чего не знает контроль → verdict={}\n",
+                    r.verdict.as_str()
+                ));
+                out
+            }
+            TodoReport::Ladder(r) => {
+                let mut out = format!(
+                    "=== лестница этапов целиком (живьём) ===\n\
+                     модель: просили {}\n\
+                     задача: {}\n\
+                     машинно-проверяемый ответ: {}\n\n",
+                    r.asked_model, r.task, r.want
+                );
+                for s in &r.stages {
+                    out.push_str(&s.line());
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!(
+                    "каждый этап закрыл сам себя: {}\n\
+                     автомат дошёл до done: {}\n\
+                     финальный ответ содержит {}: {}\n\
+                     verdict={}\n",
+                    r.stages.iter().all(|s| s.confirmed),
+                    r.reached_done,
+                    r.want,
+                    r.answer_ok,
+                    r.verdict.as_str()
+                ));
+                out
+            }
+        }
+    }
+}
+
+pub fn run_todo(checks: &[TodoCheck], model: Option<&str>) -> Res<Vec<TodoReport>> {
+    let mut out = Vec::new();
+    for check in checks {
+        out.push(match check {
+            TodoCheck::Machine => TodoReport::Machine(run_todo_machine()),
+            TodoCheck::Wire => TodoReport::Wire(run_todo_wire()),
+            TodoCheck::Resume => TodoReport::Resume(Box::new(run_todo_resume(model)?)),
+            TodoCheck::Ladder => TodoReport::Ladder(Box::new(run_todo_ladder(model)?)),
+        });
+    }
+    Ok(out)
+}
+
+/// Один пункт протокола: что пробовали, чего ждали и что вышло.
+fn machine_step(what: &str, got: Res<String>, want_ok: bool, st: &TaskState) -> MachineStep {
+    MachineStep {
+        what: what.to_string(),
+        got: match &got {
+            Ok(s) if s.is_empty() => "ok".to_string(),
+            Ok(s) => s.clone(),
+            Err(e) => format!("отказ: {e}"),
+        },
+        state: state_line(st),
+        ok: got.is_ok() == want_ok,
+    }
+}
+
+/// Короткая запись состояния для протокола.
+fn state_line(st: &TaskState) -> String {
+    format!("{}/{}/шаг {}", st.status.as_str(), st.stage.id(), st.step)
+}
+
+/// Протокол автомата: каждая строка — попытка перехода и то, чем она
+/// кончилась. Проверка не в том, что «ничего не упало», а в том, что
+/// незаконный переход именно **отказ**, и состояние после него не поехало.
+pub fn run_todo_machine() -> TodoMachineReport {
+    let mut steps = Vec::new();
+    let mut st = TaskState::new();
+
+
+    // Пустое состояние: двигать нечего.
+    let r = st.advance("нечего").map(|s| s.id().to_string());
+    steps.push(machine_step("advance из idle", r, false, &st));
+    let r = st.pause("нечего").map(|_| String::new());
+    steps.push(machine_step("pause из idle", r, false, &st));
+    let r = st.resume().map(|_| String::new());
+    steps.push(machine_step("resume из idle", r, false, &st));
+
+    let r = st.start("посчитать буквы").map(|_| String::new());
+    steps.push(machine_step("start из idle", r, true, &st));
+    let r = st.start("другая задача").map(|_| String::new());
+    steps.push(machine_step("start поверх идущей задачи", r, false, &st));
+
+    // Лестница целиком.
+    for want in [
+        todo::Stage::Plan,
+        todo::Stage::Execute,
+        todo::Stage::Validate,
+    ] {
+        let got = st.advance("итог этапа").map(|s| s.id().to_string());
+        let matched = got.as_deref() == Ok(want.id());
+        let r = if matched {
+            got
+        } else {
+            Err(format!("ожидали {}, получили {got:?}", want.id()))
+        };
+        steps.push(machine_step(&format!("advance → {}", want.id()), r, true, &st));
+    }
+
+    // Пауза держит этап и шаг, и двигаться с неё нельзя.
+    let before = state_line(&st);
+    let r = st.pause("человек ушёл").map(|_| String::new());
+    steps.push(machine_step("pause на validate", r, true, &st));
+    let r = st.advance("тайком").map(|s| s.id().to_string());
+    steps.push(machine_step("advance на паузе", r, false, &st));
+    let held = state_line(&st) == format!("paused/{}", before.trim_start_matches("running/"));
+    steps.push(MachineStep {
+        what: "пауза сохранила этап и шаг".into(),
+        got: if held {
+            "ok".into()
+        } else {
+            format!("было {before}, стало {}", state_line(&st))
+        },
+        state: state_line(&st),
+        ok: held,
+    });
+
+    // Продолжение — с того же места, а не с начала.
+    let r = st.resume().map(|_| String::new());
+    steps.push(machine_step("resume с паузы", r, true, &st));
+    let same = st.stage == todo::Stage::Validate && st.step == 4;
+    steps.push(MachineStep {
+        what: "продолжили тем же этапом и шагом".into(),
+        got: if same { "ok".into() } else { state_line(&st) },
+        state: state_line(&st),
+        ok: same,
+    });
+
+    let r = st.advance("проверено").map(|s| s.id().to_string());
+    steps.push(machine_step("advance → report", r, true, &st));
+    let r = st.advance("отписался").map(|s| s.id().to_string());
+    steps.push(machine_step("advance → done", r, true, &st));
+
+    // Done терминален.
+    let r = st.advance("ещё разок").map(|s| s.id().to_string());
+    steps.push(machine_step("advance из done", r, false, &st));
+    let r = st.pause("ещё разок").map(|_| String::new());
+    steps.push(machine_step("pause из done", r, false, &st));
+    let r = st.resume().map(|_| String::new());
+    steps.push(machine_step("resume из done", r, false, &st));
+
+    // Состояние переживает файл сессии — иначе пауза не пережила бы выход.
+    let raw = serde_json::to_string(&st).unwrap_or_default();
+    let back: Res<TaskState> = serde_json::from_str(&raw).map_err(|e| e.to_string());
+    let survived = back.as_ref().map(|b| b == &st).unwrap_or(false);
+    steps.push(MachineStep {
+        what: "состояние пережило запись и чтение JSON".into(),
+        got: if survived {
+            "ok".into()
+        } else {
+            "состояние не совпало".into()
+        },
+        state: state_line(&st),
+        ok: survived,
+    });
+
+    let verdict = if steps.iter().all(|s| s.ok) {
+        ContextVerdict::Confirmed
+    } else {
+        ContextVerdict::Inconclusive
+    };
+    TodoMachineReport { steps, verdict }
+}
+
+/// Агент с готовым состоянием задачи и без файлов контекста: проверяем
+/// сборку `system`, а не окружение машины.
+fn todo_agent(state: TaskState, todo_on: bool) -> Agent {
+    let settings = Settings {
+        system_prompt: CUSTOM_PROMPT.to_string(),
+        context_enabled: false,
+        todo: todo_on,
+        ..Settings::default()
+    };
+    let mut agent = Agent::with_endpoint(api::Endpoint::unusable(), settings);
+    agent.set_todo(state);
+    agent
+}
+
+fn todo_wire_case(label: &str, agent: &Agent) -> TodoWireCase {
+    let system = agent.system_for_request();
+    let (block, rest) = todo::split_block(&system);
+    let st = agent.todo();
+    let body = block.clone().unwrap_or_default();
+    // Три обязательные строки — ровно то, чего требовала постановка.
+    let want = [
+        format!("Этап задачи: {}", st.stage.index()),
+        format!("Текущий шаг: {}", st.step),
+        format!("Ожидаемое действие: {}", st.stage.expected()),
+    ];
+    let missing = if agent.todo_on_wire() {
+        want.into_iter().filter(|w| !body.contains(w)).collect()
+    } else {
+        Vec::new()
+    };
+    TodoWireCase {
+        label: label.to_string(),
+        stage: st.stage.id().to_string(),
+        blocks: system.matches(todo::BLOCK_HEAD).count(),
+        block,
+        rest,
+        missing,
+    }
+}
+
+/// Что реально уезжает в `system`. Ноль запросов: сборку видно целиком.
+pub fn run_todo_wire() -> TodoWireReport {
+    let mut cases = Vec::new();
+
+    // 1. Тудушка выключена — блока нет, сколько бы состояния ни накопилось.
+    let mut walked = TaskState::new();
+    let _ = walked.start("посчитать буквы «о» в строке");
+    let _ = walked.advance("критерий готовности: число совпадает с пересчётом");
+    let off = todo_agent(walked.clone(), false);
+    cases.push(todo_wire_case("todo=off", &off));
+    let off_has_no_block = cases[0].block.is_none() && cases[0].blocks == 0;
+
+    // 2. Тудушка включена, этап `plan`.
+    let on_plan = todo_agent(walked.clone(), true);
+    cases.push(todo_wire_case("этап plan", &on_plan));
+    let log_carried = cases[1]
+        .block
+        .as_deref()
+        .is_some_and(|b| b.contains("число совпадает с пересчётом"));
+
+    // 3. Переход на следующий этап: поменяться должен только блок.
+    let mut next = walked.clone();
+    let _ = next.advance("план из трёх шагов, проверка пересчётом");
+    let on_exec = todo_agent(next.clone(), true);
+    cases.push(todo_wire_case("этап execute", &on_exec));
+    let rest_identical = cases[1].rest == cases[2].rest && cases[1].rest.contains(CUSTOM_PROMPT);
+    let blocks_differ = cases[1].block != cases[2].block;
+
+    // 4. Пауза видна в блоке — иначе модель не знает, что стоять.
+    let mut paused = next.clone();
+    let _ = paused.pause("человек ушёл за чаем");
+    let on_pause = todo_agent(paused, true);
+    cases.push(todo_wire_case("пауза", &on_pause));
+    let pause_visible = cases[3]
+        .block
+        .as_deref()
+        .is_some_and(|b| b.contains("status=\"paused\"") && b.contains("причина паузы"));
+
+    let verdict = if cases.iter().any(|c| c.blocks > 1 || !c.missing.is_empty())
+        || !off_has_no_block
+        || !log_carried
+        || !rest_identical
+        || !blocks_differ
+        || !pause_visible
+    {
+        ContextVerdict::Inconclusive
+    } else {
+        ContextVerdict::Confirmed
+    };
+
+    TodoWireReport {
+        cases,
+        rest_identical,
+        blocks_differ,
+        log_carried,
+        off_has_no_block,
+        verdict,
+    }
+}
+
+/// Настройки живых проверок тудушки: та же изоляция, что у профиля, плюс
+/// включённая настройка `todo` и `temperature=0`.
+fn todo_settings(model: Option<&str>) -> Res<Settings> {
+    let mut settings = context_settings(model)?;
+    settings.temperature = Some(0.0);
+    settings.todo = true;
+    Ok(settings)
+}
+
+/// Задача с машинно-проверяемым ответом: число считается здесь же, а не
+/// вписывается руками, поэтому проверять ответ можно без доверия к автору.
+const TODO_PHRASE: &str = "колокольчик подорожник одуванчик";
+
+fn todo_task() -> (String, String) {
+    let want = TODO_PHRASE.chars().filter(|c| *c == 'о').count();
+    (
+        format!("Посчитай, сколько раз буква «о» встречается в строке «{TODO_PHRASE}»."),
+        want.to_string(),
+    )
+}
+
+/// Пауза и продолжение. Контрольный код лежит **только** в итоге закрытого
+/// этапа — не в формулировке задачи и не в истории: история во всех трёх
+/// вызовах пуста. Значит, единственный путь, которым он может доехать до
+/// модели, — блок состояния. Отсюда и контроль: тот же запрос без блока
+/// знать код неоткуда.
+pub fn run_todo_resume(model: Option<&str>) -> Res<TodoResumeReport> {
+    let settings = todo_settings(model)?;
+    let asked_model = settings.model.clone();
+    let token = "ЖЕЛУДЬ-41";
+    let (task, _) = todo_task();
+    let summary = format!(
+        "критерий готовности: число совпадает с независимым пересчётом; контрольный код задачи {token}"
+    );
+
+    // Состояние: этап `study` закрыт, стоим на `plan`, пауза.
+    let mut state = TaskState::new();
+    state.start(&task)?;
+    state.advance(&summary)?;
+    state.pause("человек ушёл за чаем")?;
+
+    let resume_prompt = "Продолжай.\nВ первой строке повтори контрольный код задачи из итога предыдущего этапа (если его нет — напиши НЕТ).";
+    // То же самое, но объяснённое заново — во сколько обошлось бы человеку.
+    let cold_prompt = format!(
+        "Мы решаем задачу: {task}\nЭтап «изучить» уже закрыт, его итог: {summary}\nСейчас этап «запланировать», шаг 2.\n{resume_prompt}"
+    );
+    let cold_chars = cold_prompt.chars().count();
+
+    let mut agent = Agent::new(settings.clone())?;
+    let mut carried_state = state.clone();
+    carried_state.resume()?;
+    agent.set_todo(carried_state);
+    let carried = probe(&agent, resume_prompt)?;
+
+    // Контроль: тот же запрос, блока состояния нет.
+    agent.settings_mut().todo = false;
+    let control = probe(&agent, resume_prompt)?;
+    // Контроль наоборот: блока нет, но всё пересказано в запросе. Нужен,
+    // чтобы отличить «блок не доехал» от «модель просто не умеет».
+    let cold = probe(&agent, &cold_prompt)?;
+
+    let has = |c: &Call| c.text.to_uppercase().contains(token);
+    let carried_has = has(&carried);
+    let control_has = has(&control);
+    let cold_has = has(&cold);
+
+    let verdict = match (carried_has, control_has, cold_has) {
+        (true, false, true) => ContextVerdict::Confirmed,
+        // Код всплыл и без блока — эксперимент не про блок.
+        (_, true, _) => ContextVerdict::Leaky,
+        // Ни один вызов кода не назвал: проверять нечего.
+        (false, false, false) => ContextVerdict::Flat,
+        _ => ContextVerdict::Inconclusive,
+    };
+
+    Ok(TodoResumeReport {
+        asked_model,
+        calls: 3,
+        token: token.to_string(),
+        resume_prompt: resume_prompt.to_string(),
+        cold_chars,
+        carried,
+        control,
+        cold,
+        carried_has,
+        control_has,
+        cold_has,
+        verdict,
+    })
+}
+
+/// Вся лестница живьём, ровно так же, как её гоняет TUI: на каждом этапе
+/// отдельный запрос, автомат двигается только на подтверждении этапа.
+pub fn run_todo_ladder(model: Option<&str>) -> Res<TodoLadderReport> {
+    let settings = todo_settings(model)?;
+    let asked_model = settings.model.clone();
+    let (task, want) = todo_task();
+
+    let mut agent = Agent::new(settings)?;
+    let mut state = TaskState::new();
+    state.start(&task)?;
+    agent.set_todo(state.clone());
+
+    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut stages = Vec::new();
+    let mut report_text = String::new();
+
+    while state.running() {
+        agent.set_todo(state.clone());
+        let prompt = state.stage_prompt();
+        let call = ask_call(&agent, &history, &prompt)?;
+        history.push(ChatMessage::user(prompt));
+        history.push(ChatMessage::assistant(call.text.clone()));
+
+        let claimed = todo::parse_completion(&call.text)
+            .map(|(s, _)| s.id().to_string())
+            .unwrap_or_default();
+        let stage_id = state.stage.id().to_string();
+        let confirmed = state.confirm(&call.text);
+        let summary = match &confirmed {
+            Ok(s) => s.clone(),
+            Err(e) => e.clone(),
+        };
+        if state.stage == todo::Stage::Report {
+            report_text = call.text.clone();
+        }
+        stages.push(TodoStageCase {
+            stage: stage_id,
+            claimed,
+            confirmed: confirmed.is_ok(),
+            summary: summary.clone(),
+            call,
+        });
+        match confirmed {
+            Ok(s) => {
+                state.advance(&s)?;
+            }
+            // Этап себя не закрыл — автомат встаёт, а не едет дальше.
+            Err(e) => {
+                state.pause(&e)?;
+                break;
+            }
+        }
+    }
+
+    let reached_done = state.finished();
+    let answer_ok = report_text.contains(&want);
+    let all_confirmed = stages.iter().all(|s| s.confirmed) && stages.len() == todo::Stage::LADDER.len();
+    let verdict = if all_confirmed && reached_done && answer_ok {
+        ContextVerdict::Confirmed
+    } else if stages.iter().all(|s| !s.confirmed) {
+        ContextVerdict::Flat
+    } else {
+        ContextVerdict::Inconclusive
+    };
+
+    Ok(TodoLadderReport {
+        asked_model,
+        calls: stages.len(),
+        task,
+        want,
+        stages,
+        reached_done,
+        answer_ok,
         verdict,
     })
 }

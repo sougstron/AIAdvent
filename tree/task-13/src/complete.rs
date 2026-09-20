@@ -183,6 +183,13 @@ pub const ROOT: &[Node] = &[
     leaf("new"),
     lit("personas", "[cast:] question", &[free("")]),
     Node {
+        token: "todo",
+        hint: "command",
+        alts: &["туду", "task"],
+        next: TODO_NEXT,
+        sources: &[],
+    },
+    Node {
         token: "profile",
         hint: "id|command",
         alts: &["профиль"],
@@ -215,6 +222,20 @@ pub const ROOT: &[Node] = &[
 ];
 
 const CONTEXT_NEXT: &[Node] = &[leaf("show"), leaf("on"), leaf("off"), leaf("reload")];
+
+/// `/todo` — автомат состояния задачи; значения здесь фиксированные,
+/// живого списка нет.
+const TODO_NEXT: &[Node] = &[
+    leaf("show"),
+    leaf("on"),
+    leaf("off"),
+    leaf("start"),
+    leaf("next"),
+    leaf("pause"),
+    leaf("resume"),
+    leaf("reset"),
+    leaf("prompt"),
+];
 
 /// `/profile` — команды плюс живой список id профилей.
 const PROFILE_NEXT: &[Node] = &[

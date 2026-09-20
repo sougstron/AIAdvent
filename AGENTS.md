@@ -57,7 +57,7 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-12/`.** It is a working agent: a ratatui
+**The active snapshot is `tree/task-13/`.** It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
@@ -104,9 +104,38 @@ absent — reporting `Flat` otherwise; `auto` removes the two `профиль.*`
 lines and requires the name to disappear from the answer with `prompt_tokens`
 dropping. All three came back Confirmed live on `glm-5.3-flash`.
 
+Task 13 put a **task state machine** on top of that: `todo.rs` turns one
+turn into a ladder — `study → plan → execute → validate → report → done`
+(«изучить → запланировать → сделать → валидировать → отписаться») — where
+every step carries the three things the brief asked for: the stage, the
+current step and the expected action. It is its own setting, **off by
+default** (`todo` row in settings, `/todo`, `--todo`): the plain one-turn
+answer stays the default, and while the switch is off not a single token or
+screen row is spent on it. The state rides every request as one final
+`<task-state>` block in `system`, carrying the goal and the итог of each
+closed stage — which is what makes "continue without re-explaining" work.
+A stage never closes itself: the model must end with `ЭТАП-ГОТОВ: <stage>`
+plus `ИТОГ: <one line>`, and `TaskState::confirm` checks the claimed id
+against the *current* stage; a missing or foreign marker pauses the machine
+instead of advancing it. Pause is legal on any stage (Esc, `/todo pause`, a
+turn that never produced an answer) and keeps stage/step; the state lives in
+the session file, so a pause survives quitting the app. The proof is
+`ask --verify-todo machine|wire|resume|ladder|offline|all`, and it is
+causal, never "the texts differ": `machine` is a 19-step transition log where
+every illegal move must be a *refusal* and the state must not budge after
+one; `wire` requires exactly one block, all three mandatory lines in it,
+byte-identical rest of `system` across a stage change, and no block at all
+when the setting is off; `resume` plants a control code that exists **only**
+in the closed stage's итог (history is empty in all three calls) and confirms
+on a true/false/true matrix — carried knows it, the block-less control does
+not, the "explained from scratch" control does; `ladder` runs all five stages
+on a task whose answer the checker computes itself, and confirms only when
+each stage closed *itself* and the final answer holds the right number. All
+four came back Confirmed live on `glm-5.3-flash`.
+
 Its `README.md` covers the Agent shape, key resolution, runtime settings, all six
-strategies plus the memory model and the personalization profile with their
-corner cases and real verify output, and the live lever self-test (temperature confirmed; top_p flat;
+strategies plus the memory model, the personalization profile and the task
+state machine with their corner cases and real verify output, and the live lever self-test (temperature confirmed; top_p flat;
 top_k unsupported). It started as a verbatim copy of `tree/task-10/`, which
 came from `tree/task-9/` and, before that, `tree/task-8/` / `tree/task-7/`
 (task 7 already met the requirements, so it stayed frozen); `tree/task-5/`
@@ -123,6 +152,7 @@ src/api.rs     request body, multi-turn chat(), effort->reasoning_effort, max_ch
 src/session.rs session persistence (~/.ask/sessions/*.json)
 src/render.rs  JSON-mode flattening ("Key: value" lines), shared by CLI and TUI
 src/tui.rs     the chat TUI: transcript, input, slash commands, settings/sessions panels
+src/todo.rs    the task state machine: stages, transitions, the system block
 src/verify.rs  the stop-condition self-test
 ```
 

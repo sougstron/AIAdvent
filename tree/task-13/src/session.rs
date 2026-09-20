@@ -86,6 +86,12 @@ pub struct Session {
     /// задачи 11 читаются как «задача по умолчанию».
     #[serde(default)]
     memory_task: String,
+    /// Состояние задачи (`todo.rs`) на момент сохранения. Лежит в сессии, а
+    /// не в файлах памяти, потому что тудушка привязана к разговору: пауза
+    /// на этапе `execute` должна пережить выход из приложения и вернуться
+    /// тем же этапом. Сессии до задачи 13 читаются как «задачи нет».
+    #[serde(default)]
+    todo: crate::todo::TaskState,
 }
 
 /// Per-process counter that makes ids unique when many sessions are created
@@ -109,6 +115,7 @@ impl Session {
             facts: FactStore::default(),
             tree: BranchStore::new(),
             memory_task: crate::memory::DEFAULT_TASK.to_string(),
+            todo: crate::todo::TaskState::new(),
         }
     }
 
@@ -119,6 +126,14 @@ impl Session {
         } else {
             &self.memory_task
         }
+    }
+
+    pub fn todo(&self) -> &crate::todo::TaskState {
+        &self.todo
+    }
+
+    pub fn set_todo(&mut self, state: crate::todo::TaskState) {
+        self.todo = state;
     }
 
     pub fn set_memory_task(&mut self, task: &str) {

@@ -67,3 +67,6 @@ tree/task-13/target/*
 !tree/task-13/target/release/
 tree/task-13/target/release/*
 !tree/task-13/target/release/ask
+
+# kanban4ai worktree metadata — tool state, not project code
+.kanban/
