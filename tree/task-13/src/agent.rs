@@ -13,6 +13,7 @@ use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
 use crate::facts::{self, FactStore, FactsDelta};
 use crate::memory::{self, Layer, MemoryStore};
 use crate::profile::{self, Profile, ProfileSet};
+use crate::todo::TaskState;
 use crate::session::Session;
 use crate::strategy;
 
@@ -94,6 +95,10 @@ pub struct Agent {
     /// настройки разговора, поэтому профиль уезжает в сессию и возвращается
     /// из неё вместе с ними.
     profiles: ProfileSet,
+    /// Состояние задачи (см. `todo.rs`). Живёт рядом с настройками, а не
+    /// внутри них: настройка `todo` — это «вести автомат или нет», а сам
+    /// автомат — состояние разговора, и уезжает он в файл сессии.
+    todo: TaskState,
 }
 
 impl Agent {
@@ -129,6 +134,7 @@ impl Agent {
             facts: FactStore::new(),
             memory: MemoryStore::in_memory(),
             profiles: ProfileSet::in_memory(),
+            todo: TaskState::new(),
         };
         agent.refresh_context();
         agent
@@ -230,6 +236,26 @@ impl Agent {
 
     pub fn memory_mut(&mut self) -> &mut MemoryStore {
         &mut self.memory
+    }
+
+    /// Состояние задачи. Пустое, пока `/todo start` (или первое сообщение
+    /// при включённой тудушке) его не завело.
+    pub fn todo(&self) -> &TaskState {
+        &self.todo
+    }
+
+    pub fn todo_mut(&mut self) -> &mut TaskState {
+        &mut self.todo
+    }
+
+    pub fn set_todo(&mut self, state: TaskState) {
+        self.todo = state;
+    }
+
+    /// Уезжает ли блок состояния в `system`: настройка включена И задача
+    /// заведена. Выключенная тудушка не стоит ни одного токена.
+    pub fn todo_on_wire(&self) -> bool {
+        self.settings.todo && self.todo.active()
     }
 
     pub fn profiles(&self) -> &ProfileSet {
@@ -556,12 +582,18 @@ impl Agent {
         };
         // Sticky-слоты стратегии (summary, факты) уезжают сюда же, рядом с
         // AGENTS.md. Какие именно — решает `strategy::apply`.
-        let blocks = strategy::blocks(
+        let mut blocks = strategy::blocks(
             self.settings.context_strategy,
             &self.compressor,
             &self.facts,
             &self.memory,
         );
+        // Состояние задачи идёт последним — ближе всего к сообщениям: это
+        // не роль и не знания, а «где мы сейчас». Выключенная тудушка или
+        // пустое состояние не добавляют в запрос ничего.
+        if self.todo_on_wire() {
+            blocks.push(self.todo.block());
+        }
         if blocks.is_empty() {
             return base;
         }
@@ -904,6 +936,44 @@ mod tests {
     }
 
     /// Неизвестное имя профиля — ошибка, а не тихая подмена голоса.
+    #[test]
+    /// Выключенная тудушка не стоит ни одного токена, включённая — уезжает
+    /// одним блоком и последней, после блоков стратегии.
+    fn todo_block_rides_only_when_enabled_and_active() {
+        let mut agent = Agent::dummy_with(Settings {
+            system_prompt: "Отвечай только фактами.".into(),
+            ..Settings::default()
+        });
+        let mut state = crate::todo::TaskState::new();
+        state.start("посчитать буквы").unwrap();
+        state.advance("критерий: совпадение с пересчётом").unwrap();
+        agent.set_todo(state);
+
+        // Настройка выключена — блока нет, сколько бы состояния ни накопилось.
+        assert!(!agent.todo_on_wire());
+        assert!(!agent
+            .system_for_request()
+            .contains(crate::todo::BLOCK_HEAD));
+
+        agent.settings_mut().todo = true;
+        let system = agent.system_for_request();
+        assert_eq!(system.matches(crate::todo::BLOCK_HEAD).count(), 1);
+        assert!(system.contains("stage=\"plan\""));
+        assert!(system.contains("критерий: совпадение с пересчётом"));
+        // Состояние идёт последним — ближе всего к сообщениям.
+        let (block, rest) = crate::todo::split_block(&system);
+        assert!(block.is_some());
+        assert!(!rest.contains(crate::todo::BLOCK_HEAD));
+        assert!(system.trim_end().ends_with(crate::todo::BLOCK_END));
+
+        // Пустое состояние при включённой настройке — тоже без блока.
+        agent.set_todo(crate::todo::TaskState::new());
+        assert!(!agent.todo_on_wire());
+        assert!(!agent
+            .system_for_request()
+            .contains(crate::todo::BLOCK_HEAD));
+    }
+
     #[test]
     fn unknown_profile_is_an_error_and_off_clears_the_block() {
         let mut agent = Agent::dummy_with(Settings::default());

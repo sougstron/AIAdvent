@@ -29,6 +29,7 @@ use crate::compress;
 use crate::config::{self, Effort, Res, Settings};
 use crate::memory::{self, Layer, MemoryStore};
 use crate::profile;
+use crate::todo::{self, TaskState};
 use crate::render::{self, strip_fences};
 use crate::session::{self, Session, SessionSummary};
 use crate::tokens::{self, Shape, TokenMeter};
@@ -69,6 +70,7 @@ const SETTINGS_ROWS: &[&str] = &[
     "top_p",
     "top_k",
     "profile",
+    "todo",
     "system_prompt",
 ];
 /// Подсказка по переключателю — одна на `/strategy`, `/help` и ошибки.
@@ -76,6 +78,8 @@ const STRATEGY_USAGE: &str =
     "/strategy [show|off|summary|window|facts|branch|memory|keep N|every N]";
 const PROFILE_USAGE: &str =
     "/profile [show|list|off|prompt|<id>], id из каталога — /profile list";
+const TODO_USAGE: &str =
+    "/todo [show|on|off|start <задача>|next [итог]|pause [почему]|resume|reset|prompt]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -566,6 +570,10 @@ impl App {
                 self.cmd_selected = 0;
                 if let Some(cmd) = line.trim().strip_prefix('/') {
                     self.handle_command(cmd.trim(), terminal);
+                } else if self.settings.todo {
+                    // Тудушка включена — обычный ход превращается в лестницу
+                    // этапов (см. `todo.rs`), а не в один запрос.
+                    self.submit_with_todo(line.trim().to_string(), terminal);
                 } else {
                     self.send_message(line.trim().to_string(), terminal);
                 }
@@ -964,6 +972,9 @@ impl App {
         // Новый чат — новый краткосрочный слой. Рабочий и долговременный
         // остаются: они переживают смену разговора.
         self.agent.memory_mut().set_session(&self.session.id);
+        // Новый чат — новая задача: тащить чужую тудушку в пустой чат
+        // нечестно, состояние осталось в файле старой сессии.
+        self.agent.set_todo(TaskState::new());
         self.entries.clear();
         self.scroll = 0;
         self.follow = true;
@@ -992,6 +1003,9 @@ impl App {
         s.compressor = self.agent.compressor().clone();
         s.set_facts(self.agent.facts().clone());
         s.set_memory_task(self.agent.memory().task());
+        // Тудушка принадлежит разговору: пауза на этапе должна пережить
+        // выход из приложения и вернуться тем же этапом.
+        s.set_todo(self.agent.todo().clone());
         // Память принадлежит ветке: кладём её в дерево тем же движением.
         s.resync_tree();
         s.tree_mut()
@@ -1011,6 +1025,7 @@ impl App {
                 self.save_session();
                 self.settings = s.settings.clone();
                 self.agent.resume(&s);
+                self.agent.set_todo(s.todo().clone());
                 self.tokens.reset_session();
                 self.entries = entries_from_session(&s);
                 self.status = format!("Loaded '{}'", s.title);
@@ -1054,6 +1069,7 @@ impl App {
             "facts" => self.cmd_facts(rest),
             "mem" | "memory" => self.cmd_mem(rest),
             "profile" | "профиль" => self.cmd_profile(rest),
+            "todo" | "туду" | "task" => self.cmd_todo(rest, terminal),
             "branch" => self.cmd_branch(rest),
             "checkpoint" => self.cmd_checkpoint(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
@@ -1959,6 +1975,245 @@ impl App {
         }
     }
 
+    /// `/todo …` — руками по автомату состояния задачи. Всё, что делает
+    /// прогон сам, здесь доступно по шагам: это и есть способ поставить
+    /// паузу на любом этапе и продолжить с него же.
+    fn cmd_todo(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
+        let (head, tail) = rest
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or((rest.trim(), ""));
+        let tail = tail.trim();
+        match head.to_ascii_lowercase().as_str() {
+            "" | "show" | "status" => {
+                let card = self.agent.todo().card();
+                self.entries.push(Entry::Info(format!(
+                    "тудушка: {}\n{card}",
+                    if self.settings.todo { "on" } else { "off" }
+                )));
+            }
+            "on" | "off" => {
+                let on = head.eq_ignore_ascii_case("on");
+                self.settings.todo = on;
+                self.agent.settings_mut().todo = on;
+                self.status = if on {
+                    "тудушка on — следующее сообщение пойдёт лестницей этапов".into()
+                } else {
+                    "тудушка off — обычный ход «вопрос → ответ» (состояние задачи сохранено)"
+                        .into()
+                };
+            }
+            "start" | "new" => {
+                if tail.is_empty() {
+                    self.status = format!("нужна формулировка задачи ({TODO_USAGE})");
+                    return;
+                }
+                if self.agent.todo().finished() {
+                    self.agent.todo_mut().reset();
+                }
+                match self.agent.todo_mut().start(tail) {
+                    Ok(()) => {
+                        self.announce_todo_start();
+                        self.run_todo_stages(None, terminal);
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
+            "pause" => match self.agent.todo_mut().pause(tail) {
+                Ok(()) => {
+                    let line = self.agent.todo().line();
+                    self.entries
+                        .push(Entry::Info(format!("\u{23f8} пауза · {line}")));
+                    self.status = "пауза — /todo resume продолжит с этого этапа".into();
+                    self.save_session();
+                }
+                Err(e) => self.status = e,
+            },
+            "resume" | "continue" | "go" => match self.agent.todo_mut().resume() {
+                Ok(()) => {
+                    self.entries.push(Entry::Info(format!(
+                        "\u{25b6} продолжаем · {}",
+                        self.agent.todo().line()
+                    )));
+                    let extra = (!tail.is_empty()).then(|| tail.to_string());
+                    self.run_todo_stages(extra, terminal);
+                }
+                Err(e) => self.status = e,
+            },
+            // Закрыть этап руками: итог — то, что уедет в следующий этап.
+            "next" | "step" => {
+                let summary = if tail.is_empty() { "закрыт вручную" } else { tail };
+                let closed = self.agent.todo().stage;
+                match self.agent.todo_mut().advance(summary) {
+                    Ok(_) => {
+                        self.entries.push(Entry::Info(todo::leave_line(closed, summary)));
+                        let line = self.agent.todo().line();
+                        self.entries.push(Entry::Info(if self.agent.todo().finished() {
+                            "\u{2714} задача закрыта".into()
+                        } else {
+                            self.agent.todo().enter_line()
+                        }));
+                        self.status = line;
+                        self.save_session();
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
+            "reset" | "clear" | "drop" => {
+                self.agent.todo_mut().reset();
+                self.status = "состояние задачи сброшено".into();
+                self.save_session();
+            }
+            // Что реально уезжает в system.
+            "prompt" | "block" => {
+                let text = if self.agent.todo_on_wire() {
+                    self.agent.todo().block()
+                } else if !self.settings.todo {
+                    "тудушка выключена — блока в system нет (/todo on)".into()
+                } else {
+                    "задачи нет — блока в system нет (/todo start <что сделать>)".into()
+                };
+                self.entries.push(Entry::Info(text));
+            }
+            "help" | "?" => self.status = TODO_USAGE.into(),
+            other => self.status = format!("не знаю `{other}` ({TODO_USAGE})"),
+        }
+    }
+
+    fn announce_todo_start(&mut self) {
+        let st = self.agent.todo().clone();
+        self.entries.push(Entry::Info(format!(
+            "\u{1f4cb} тудушка заведена: {}\n   этапы: {}",
+            st.goal.trim(),
+            todo::Stage::LADDER
+                .iter()
+                .map(|s| format!("{} {}", s.index(), s.title()))
+                .collect::<Vec<_>>()
+                .join(" \u{2192} ")
+        )));
+    }
+
+    /// Сообщение при включённой тудушке: либо заводим задачу, либо
+    /// продолжаем ту, что стоит на паузе. Во втором случае текст человека —
+    /// уточнение к текущему этапу, а не новая задача: переобъяснять
+    /// ничего не нужно, состояние уже в запросе.
+    fn submit_with_todo(&mut self, line: String, terminal: &mut DefaultTerminal) {
+        if self.agent.todo().paused() {
+            if let Err(e) = self.agent.todo_mut().resume() {
+                self.status = e;
+                return;
+            }
+            self.entries.push(Entry::Info(format!(
+                "\u{25b6} продолжаем без повторных объяснений · {}",
+                self.agent.todo().line()
+            )));
+            self.run_todo_stages(Some(line), terminal);
+            return;
+        }
+        if self.agent.todo().finished() {
+            self.agent.todo_mut().reset();
+        }
+        match self.agent.todo_mut().start(&line) {
+            Ok(()) => {
+                self.entries.push(Entry::User(line));
+                self.announce_todo_start();
+                self.run_todo_stages(None, terminal);
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Прогон лестницы: этап за этапом, пока автомат не дойдёт до `done`,
+    /// не встанет на паузу или не упрётся в неподтверждённый этап. Автомат
+    /// двигается только на подтверждении (`TaskState::confirm`) — «ответ
+    /// выглядит законченным» переходом не считается.
+    fn run_todo_stages(&mut self, extra: Option<String>, terminal: &mut DefaultTerminal) {
+        let mut extra = extra;
+        while self.agent.todo().running() {
+            let state = self.agent.todo().clone();
+            let head = state.enter_line();
+            self.status = state.line();
+            let mut prompt = state.stage_prompt();
+            if let Some(note) = extra.take().filter(|s| !s.trim().is_empty()) {
+                prompt.push_str(&format!("\n\nУточнение от человека: {}", note.trim()));
+            }
+            let before = self.session.messages.len();
+            self.send_turn(prompt, Some(head), terminal);
+            let Some(answer) = self.last_todo_answer(before) else {
+                // Ход не дошёл до ответа (сеть, Esc). Молча двигать автомат
+                // тут нельзя — встаём на паузу на том же этапе.
+                let _ = self.agent.todo_mut().pause("ход не дошёл до ответа");
+                self.entries.push(Entry::Info(format!(
+                    "\u{23f8} этап `{}` не закрыт: ответа не было — /todo resume продолжит с него",
+                    state.stage.id()
+                )));
+                break;
+            };
+            match self.agent.todo().confirm(&answer) {
+                Ok(summary) => {
+                    let closed = self.agent.todo().stage;
+                    if let Err(e) = self.agent.todo_mut().advance(&summary) {
+                        self.status = e;
+                        break;
+                    }
+                    self.entries
+                        .push(Entry::Info(todo::leave_line(closed, &summary)));
+                }
+                Err(e) => {
+                    let _ = self.agent.todo_mut().pause(&e);
+                    self.entries.push(Entry::Info(format!(
+                        "\u{23f8} {e}\n   этап не закрыт, тудушка на паузе — /todo resume"
+                    )));
+                    break;
+                }
+            }
+            self.save_session();
+            if self.poll_todo_pause() {
+                break;
+            }
+        }
+        if self.agent.todo().finished() {
+            self.entries.push(Entry::Info(
+                "\u{2714} задача закрыта: все пять этапов пройдены (/todo show — итоги)".into(),
+            ));
+        }
+        self.status = self.agent.todo().line();
+        self.save_session();
+        if self.follow {
+            self.scroll_to_bottom(terminal);
+        }
+    }
+
+    /// Текст ответа последнего хода — или `None`, если хода не случилось
+    /// (ошибка запроса) либо его оборвали на Esc.
+    fn last_todo_answer(&self, before: usize) -> Option<String> {
+        if self.session.messages.len() != before + 2 {
+            return None;
+        }
+        let last = self.session.messages.last()?;
+        (last.role == "assistant" && !last.interrupted && !last.content.trim().is_empty())
+            .then(|| last.content.clone())
+    }
+
+    /// Esc между этапами — пауза. Во время самого этапа Esc обрывает
+    /// генерацию, и на паузу встаёт уже `run_todo_stages`.
+    fn poll_todo_pause(&mut self) -> bool {
+        let mut stop = false;
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            if let Ok(event::Event::Key(key)) = event::read() {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                    stop = true;
+                }
+            }
+        }
+        if stop && self.agent.todo_mut().pause("пауза по Esc").is_ok() {
+            self.entries.push(Entry::Info(
+                "\u{23f8} пауза по Esc — /todo resume продолжит с этого этапа".into(),
+            ));
+        }
+        stop
+    }
+
     fn cmd_mem(&mut self, rest: &str) {
         let rest = rest.trim();
         let (head, tail) = match rest.split_once(char::is_whitespace) {
@@ -2551,6 +2806,12 @@ impl App {
             }
             // Персонализация: off плюс каталог профилей. Выбор уезжает и
             // в настройки (значит, и в сессию), и в файл каталога.
+            // Булев переключатель: стрелка в любую сторону просто меняет
+            // значение, как и у остальных двухпозиционных строк.
+            "todo" => {
+                self.settings.todo = !self.settings.todo;
+                self.agent.settings_mut().todo = self.settings.todo;
+            }
             "profile" => {
                 let ids = self.agent.profiles().ids();
                 let cur = ids
@@ -2672,8 +2933,23 @@ impl App {
     }
 
     fn send_message(&mut self, question: String, terminal: &mut DefaultTerminal) {
+        self.send_turn(question, None, terminal);
+    }
+
+    /// Один ход. `echo` — то, что увидит человек вместо сырого текста
+    /// запроса: этапы тудушки уезжают на провод целиком (это и есть
+    /// инструкция этапа), а в чате показывают одну строку перехода.
+    fn send_turn(
+        &mut self,
+        question: String,
+        echo: Option<String>,
+        terminal: &mut DefaultTerminal,
+    ) {
         self.session.push_user(question.clone());
-        self.entries.push(Entry::User(question));
+        match echo {
+            Some(text) => self.entries.push(Entry::Info(text)),
+            None => self.entries.push(Entry::User(question)),
+        }
         self.follow = true;
         self.agent.set_history(self.session.history());
         let history = self.agent.history().to_vec();
@@ -2937,9 +3213,11 @@ impl App {
         let input_height = self.input_box_height(width);
         let stats = self.token_stats();
         let token_rows = stats_rows(&stats, width);
-        let [header, body, input, tokens, footer] = Layout::vertical([
+        let todo_height = self.todo_panel_height();
+        let [header, body, todo_area, input, tokens, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(4),
+            Constraint::Length(todo_height),
             Constraint::Length(input_height),
             Constraint::Length(token_rows.len() as u16),
             Constraint::Length(FOOTER_HEIGHT),
@@ -2947,6 +3225,9 @@ impl App {
         .areas(f.area());
         self.draw_header(f, header);
         self.draw_transcript(f, body);
+        if todo_height > 0 {
+            self.draw_todo_panel(f, todo_area);
+        }
         self.draw_input(f, input, width);
         self.draw_token_bar(f, tokens, token_rows);
         self.draw_footer(f, footer);
@@ -2962,6 +3243,47 @@ impl App {
         } else if self.focus == Focus::Input && self.command_popup_active() {
             self.draw_command_popup(f, body);
         }
+    }
+
+    /// Высота панели тудушки: ноль, пока тудушка выключена или задачи нет —
+    /// выключенная фича не должна занимать ни строки экрана.
+    fn todo_panel_height(&self) -> u16 {
+        if !self.settings.todo || !self.agent.todo().active() {
+            return 0;
+        }
+        self.agent.todo().checklist().len() as u16 + 3
+    }
+
+    /// Чеклист задачи под транскриптом: видно этап, шаг и ожидаемое
+    /// действие, не листая чат.
+    fn draw_todo_panel(&self, f: &mut Frame, area: Rect) {
+        let st = self.agent.todo();
+        let mut lines: Vec<Line> = vec![Line::styled(
+            format!("задача: {}", st.goal.trim()),
+            Style::default(),
+        )];
+        for (mark, text) in st.checklist() {
+            let style = match mark {
+                "\u{1f449}" => accent(),
+                "\u{2714}" => Style::default(),
+                _ => muted(),
+            };
+            lines.push(Line::styled(format!(" {mark} {text}"), style));
+        }
+        let hints = if st.paused() {
+            "/todo resume \u{b7} /todo show"
+        } else {
+            "Esc \u{2014} пауза \u{b7} /todo show"
+        };
+        let title = format!(
+            "todo \u{b7} {} \u{b7} шаг {}",
+            st.status.as_str(),
+            st.step
+        );
+        f.render_widget(
+            Paragraph::new(lines).block(panel(&title, hints)),
+            area,
+        );
     }
 
     /// Input box: renders only the wrapped lines visible inside the (at most
@@ -3357,6 +3679,21 @@ impl App {
                 .top_k
                 .map(config::render_top_k)
                 .unwrap_or_else(|| "provider default".into()),
+            "todo" => {
+                let st = self.agent.todo();
+                if self.settings.todo {
+                    format!("on   ({})", st.line())
+                } else {
+                    format!(
+                        "off  (состояние задачи не ведётся; {} — /todo on)",
+                        if st.active() {
+                            "сохранённая задача есть"
+                        } else {
+                            "задачи нет"
+                        }
+                    )
+                }
+            }
             "profile" => match self.agent.profile() {
                 Some(p) => format!(
                     "{}  ({}; заменяет системный промпт, пока тот дефолтный)",
@@ -3711,6 +4048,7 @@ const HELP: &str = "\
 /mem <layer> set k v | del k      write to a layer by hand (layer = short|working|long)
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
+/todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
 /checkpoint [name]        mark the current point so branches can fork from it
 /branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
 /settings                 open the settings panel (Tab on an empty input)

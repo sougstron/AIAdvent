@@ -43,6 +43,8 @@ use crate::verify;
         ask --profile chemist \"...\"            answer through a user profile (style / format / limits)\n  \
         ask --profiles                        list the profile catalog\n  \
         ask --verify-profile all              prove the profile reaches the wire and changes the voice\n  \
+        ask --todo \"...\"                      run the answer through the task state machine\n  \
+        ask --verify-todo all                 prove the task state machine holds and survives a pause\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -156,6 +158,21 @@ pub struct Cli {
     /// List the profile catalog (built-ins plus your own) and exit.
     #[arg(long)]
     pub profiles: bool,
+
+    /// Task state machine (`todo.rs`): run the answer through the
+    /// study → plan → execute → validate → report ladder instead of one
+    /// plain turn. Off by default.
+    #[arg(long)]
+    pub todo: bool,
+
+    /// Live proof for the task state machine: `machine` (legal transitions
+    /// pass, illegal ones are refused — no network), `wire` (what the state
+    /// puts into the system message — no network), `resume` (pause, then
+    /// continue without re-explaining anything), `ladder` (the whole ladder
+    /// on a task with a machine-checkable answer), `offline` or `all`.
+    /// Exits after printing.
+    #[arg(long, value_name = "WHICH")]
+    pub verify_todo: Option<String>,
 
     /// Live proof for personalization: `wire` (what the profile puts into
     /// the system message — no network), `voice` (same question, two
@@ -287,6 +304,9 @@ impl Cli {
             // не трогаем: флаг действует на один запуск, а `active` в файле
             // — это то, что человек выбрал в TUI.
             s.profile = profile::ProfileSet::open(memory::memory_root()).resolve(p)?;
+        }
+        if self.todo {
+            s.todo = true;
         }
         if let Some(path) = &self.json_schema_file {
             let raw =
@@ -460,6 +480,37 @@ pub fn run() -> Res<()> {
         return Ok(());
     }
 
+    if let Some(which) = cli.verify_todo.as_deref() {
+        let checks = verify::TodoCheck::parse(which)?;
+        println!(
+            "проверяю состояние задачи: {}",
+            checks
+                .iter()
+                .map(|c| if c.offline() {
+                    format!("{} (без сети)", c.label())
+                } else {
+                    c.label().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let reports = verify::run_todo(&checks, cli.verify_model.as_deref())?;
+        let mut calls = 0;
+        for report in &reports {
+            print!("{}", report.render());
+            println!();
+            calls += report.calls();
+        }
+        for report in &reports {
+            println!("{}", report.status_line());
+        }
+        println!("живых вызовов всего: {calls}");
+        if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
+            return Err(format!("todo not confirmed: {}", bad.status_line()));
+        }
+        return Ok(());
+    }
+
     if let Some(which) = cli.verify_profile.as_deref() {
         let checks = verify::ProfileCheck::parse(which)?;
         println!(
@@ -522,7 +573,59 @@ pub fn run() -> Res<()> {
         return crate::tui::run(settings, loaded);
     }
 
+    if settings.todo {
+        // Тудушка включена — один вопрос превращается в лестницу этапов,
+        // ровно как в TUI: по запросу на этап, переход только на
+        // подтверждении этапа.
+        return todo_shot(settings, &question);
+    }
     one_shot(&cli, settings, &question, loaded)
+}
+
+/// Лестница этапов в один заход (`ask --todo "..."`). Печатает каждый
+/// переход — то же «явно показывает, когда переходит на следующий шаг», но
+/// в терминал, а не в панель.
+fn todo_shot(settings: Settings, question: &str) -> Res<()> {
+    let mut agent = crate::agent::Agent::new(settings)?;
+    let mut state = crate::todo::TaskState::new();
+    state.start(question)?;
+
+    let mut history: Vec<api::ChatMessage> = Vec::new();
+    while state.running() {
+        agent.set_todo(state.clone());
+        eprintln!("{}", state.enter_line());
+        let prompt = state.stage_prompt();
+        let mut turn = history.clone();
+        turn.push(api::ChatMessage::user(prompt.clone()));
+        let reply = agent.complete(&turn)?;
+        println!("{}", reply.text.trim());
+        history.push(api::ChatMessage::user(prompt));
+        history.push(api::ChatMessage::assistant(reply.text.clone()));
+
+        match state.confirm(&reply.text) {
+            Ok(summary) => {
+                let closed = state.stage;
+                state.advance(&summary)?;
+                eprintln!("{}", crate::todo::leave_line(closed, &summary));
+            }
+            // Этап себя не закрыл — автомат встаёт, а не едет дальше.
+            Err(e) => {
+                state.pause(&e)?;
+                eprintln!("\u{23f8} {e}");
+                break;
+            }
+        }
+        println!();
+    }
+    eprintln!("{}", state.line());
+    if !state.finished() {
+        return Err(format!(
+            "лестница не дошла до done: остановились на этапе `{}` ({})",
+            state.stage.id(),
+            state.note
+        ));
+    }
+    Ok(())
 }
 
 /// The one-shot path runs through the multi-agent runtime rather than around

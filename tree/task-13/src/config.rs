@@ -453,6 +453,12 @@ pub struct Settings {
     /// дефолтным, заменяет собой «ты — полезный ассистент».
     #[serde(default = "default_profile")]
     pub profile: String,
+    /// Тудушка: вести ли состояние задачи конечным автоматом (`todo.rs`).
+    /// По умолчанию **выключено** — обычный ход «вопрос → ответ» остаётся
+    /// поведением по умолчанию, а лестница этапов включается осознанно
+    /// (`/todo on`, строка `todo` в настройках, `--todo`).
+    #[serde(default)]
+    pub todo: bool,
     /// When true, `Agent` injects discovered AGENTS.md / CLAUDE.md files
     /// into the system message. Toggled at runtime via `set_context_enabled`.
     #[serde(default = "default_context_enabled")]
@@ -527,6 +533,7 @@ impl Default for Settings {
             model: default_model(),
             system_prompt: default_system_prompt(),
             profile: default_profile(),
+            todo: false,
             context_enabled: true,
             context_strategy: ContextStrategy::default(),
             keep_recent: DEFAULT_KEEP_RECENT,
@@ -624,6 +631,7 @@ impl Settings {
                 &self.profile
             }
         ));
+        parts.push(format!("todo={}", if self.todo { "on" } else { "off" }));
         parts.push(match self.max_chars {
             Some(n) => format!("max_chars={n}"),
             None => "max_chars=off".into(),
