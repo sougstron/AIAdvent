@@ -92,6 +92,14 @@ pub struct Session {
     /// тем же этапом. Сессии до задачи 13 читаются как «задачи нет».
     #[serde(default)]
     todo: crate::todo::TaskState,
+    /// Прогон задачи (`run.rs`): этап + фаза запроса + попытка + журнал
+    /// переходов + подписи под планом. Лежит здесь, а не в отдельной папке
+    /// `runs/`, ровно по двум требованиям постановки 15: прогон **привязан
+    /// к сессии** и **удаляется вместе с ней** — и то и другое получается
+    /// бесплатно, второго источника правды не заводим. `None` — прогона
+    /// нет (не начинали, или он дошёл до `done` и убрался за собой).
+    #[serde(default)]
+    run: Option<crate::run::TaskRun>,
 }
 
 /// Per-process counter that makes ids unique when many sessions are created
@@ -116,6 +124,7 @@ impl Session {
             tree: BranchStore::new(),
             memory_task: crate::memory::DEFAULT_TASK.to_string(),
             todo: crate::todo::TaskState::new(),
+            run: None,
         }
     }
 
@@ -130,6 +139,21 @@ impl Session {
 
     pub fn todo(&self) -> &crate::todo::TaskState {
         &self.todo
+    }
+
+    pub fn run(&self) -> Option<&crate::run::TaskRun> {
+        self.run.as_ref()
+    }
+
+    /// Записать прогон в сессию. Терминальный прогон (`done(pass)` /
+    /// `done(fail)`) не сохраняется: постановка требует, чтобы состояние
+    /// жило до завершения прогона, а не вечно. Итог к этому моменту уже
+    /// уехал в транскрипт, так что ничего не теряется.
+    pub fn set_run(&mut self, run: Option<crate::run::TaskRun>) {
+        self.run = match run {
+            Some(r) if r.status.terminal() || !r.active() => None,
+            other => other,
+        };
     }
 
     pub fn set_todo(&mut self, state: crate::todo::TaskState) {
@@ -276,6 +300,31 @@ impl Session {
         self.updated_at = now_secs();
     }
 
+    /// Поднять прогон с диска.
+    ///
+    /// Две вещи, обе обязательные для «продолжения после паузы»:
+    ///
+    /// * Сессия, записанная до задачи 15, прогона не знает — но знает
+    ///   `todo`. Если задача там активна, собираем прогон из неё, чтобы
+    ///   старый чат продолжился, а не начался заново.
+    /// * Прогон, найденный в состоянии `running`, означает, что процесс
+    ///   умер на полушаге (или сессию бросили посреди запроса). Молча
+    ///   продолжать нельзя — помечаем `interrupted`, дальше решает человек.
+    fn migrate_run(&mut self) {
+        match &mut self.run {
+            Some(run) => {
+                run.mark_interrupted();
+            }
+            None if self.todo.active() => {
+                let mut run = crate::run::TaskRun::new(&self.id, &self.settings);
+                run.adopt(self.todo.clone());
+                run.mark_interrupted();
+                self.run = Some(run);
+            }
+            None => {}
+        }
+    }
+
     pub fn save(&self, dir: &Path) -> Res<()> {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let path = session_file(dir, &self.id)?;
@@ -410,6 +459,7 @@ fn load_session_file(path: &Path) -> Res<Session> {
     // Файл до задачи 10 знает только плоский `messages` — дерево строим на
     // лету, одной линейной веткой.
     session.migrate_tree();
+    session.migrate_run();
     Ok(session)
 }
 
@@ -861,5 +911,74 @@ mod tests {
         let dir = tmp_dir("empty-continue");
         assert_eq!(continue_last(&dir).unwrap_err(), "no saved sessions");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Прогон принадлежит сессии: переживает запись/чтение, поднимается
+    /// прерванным, если его застали идущим, и уходит вместе с файлом.
+    #[test]
+    fn run_round_trips_and_dies_with_the_session() {
+        let dir = tmp_dir("run-roundtrip");
+        let mut s = Session::new(Settings::default());
+        s.push_user("посчитать буквы".into());
+        let mut run = crate::run::TaskRun::new(&s.id, &Settings::default());
+        run.apply(crate::run::Event::Start("посчитать буквы".into())).unwrap();
+        run.apply(crate::run::Event::PhaseTo(crate::run::Phase::Model)).unwrap();
+        s.set_run(Some(run));
+        s.save(&dir).unwrap();
+
+        let back = load_session(&dir, &s.id).unwrap();
+        let r = back.run().expect("прогон должен лежать в сессии");
+        // Идущий прогон в файле = процесс умер на полушаге.
+        assert_eq!(r.status, crate::run::RunStatus::Interrupted);
+        assert_eq!(r.state.stage, crate::todo::Stage::Study);
+
+        delete_session(&dir, &s.id).unwrap();
+        assert!(load_session(&dir, &s.id).is_err());
+    }
+
+    /// Терминальный прогон в сессии не хранится: постановка требует
+    /// чистить его по достижении `done`, а итог к этому моменту уже в
+    /// транскрипте.
+    #[test]
+    fn finished_run_is_not_stored() {
+        let mut s = Session::new(Settings::default());
+        let mut run = crate::run::TaskRun::new(&s.id, &Settings::default());
+        run.apply(crate::run::Event::Start("задача".into())).unwrap();
+        run.apply(crate::run::Event::Abort("передумали".into())).unwrap();
+        s.set_run(Some(run));
+        assert!(s.run().is_none());
+    }
+
+    /// Сессия задачи 13/14 знает `todo`, но не знает `run`. Перезапуск не
+    /// должен стоить человеку начатой задачи.
+    #[test]
+    fn session_without_run_field_is_migrated_from_todo() {
+        let dir = tmp_dir("run-migration");
+        let id = "1700000000-mig-0";
+        let legacy = serde_json::json!({
+            "id": id,
+            "title": "старый чат",
+            "messages": [],
+            "todo": {
+                "goal": "старая задача",
+                "stage": "execute",
+                "status": "paused",
+                "step": 3,
+                "log": [],
+                "note": "человек ушёл"
+            }
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let s = load_session(&dir, id).unwrap();
+        let r = s.run().expect("прогон должен собраться из `todo`");
+        assert_eq!(r.state.stage, crate::todo::Stage::Execute);
+        assert_eq!(r.state.step, 3);
+        assert_eq!(r.goal(), "старая задача");
     }
 }

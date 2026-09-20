@@ -156,6 +156,15 @@ impl Stage {
         }
     }
 
+    /// Нужно ли этапу подтверждение человека (гейт). Структурно, а не
+    /// текстом в промпте: `plan` закрывается не в `execute`, а в
+    /// «жду утверждения», и дальше хода нет, пока человек не скажет «ок» —
+    /// или не отклонит план с причиной. Это и есть «нельзя делать
+    /// реализацию до утверждённого плана» из постановки задачи 15.
+    pub fn requires_approval(self) -> bool {
+        matches!(self, Stage::Plan)
+    }
+
     /// Что агент делает на этом этапе. Это уезжает в запрос дословно —
     /// отсюда императив и запреты: без «не решай» этап `study` превращается
     /// в обычный ответ, и вся лестница теряет смысл.
@@ -210,6 +219,7 @@ impl Stage {
         }
     }
 
+
     /// Разобрать id этапа (для [`DONE_MARK`] и `/todo`).
     pub fn parse(s: &str) -> Option<Stage> {
         let s = s.trim().trim_end_matches(['.', ',', '!', ')']).trim();
@@ -224,6 +234,86 @@ impl Stage {
         .into_iter()
         .find(|st| st.id().eq_ignore_ascii_case(s))
     }
+}
+/// Нарушение контракта этапа (см. [`check_stage_output`]). id — этап,
+/// evidence — что именно не так. Принадлежит модели: ответ, не
+/// соблюдающий контракт, переделывается, а не проглатывается.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractViolation {
+    pub id: String,
+    pub evidence: String,
+}
+
+/// Строка, которой этап `validate` выносит вердикт: `ВЕРДИКТ: ok` или
+/// `ВЕРДИКТ: не ok`. Разбирается детерминированно — «финал без валидации»
+/// (постановка 15) означает: без этой строки у `validate` этап не закрыт,
+/// а `report` достижим только с вердиктом `ok`.
+pub const VERDICT_MARK: &str = "ВЕРДИКТ:";
+
+/// Вердикт этапа `validate`. `NotOk` тащит за собой названный дефект.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Ok,
+    NotOk,
+}
+
+/// Найти вердикт в ответе на этапе `validate`. Нет строки — `None`, и это
+/// не «ok»: отсутствие машинного вердикта этап не закрывает.
+pub fn parse_verdict(text: &str) -> Option<Verdict> {
+    for line in text.lines() {
+        // Разметка вокруг маркера — не содержание: `**ВЕРДИКТ:** ok` и
+        // `- ВЕРДИКТ: ok` — одно и то же. Звёздочки снимаем целиком,
+        // иначе закрывающие `**` съедали бы сам маркер.
+        let line = line.replace('*', "");
+        let line = line.trim().trim_start_matches(['#', '-', '>', ' ']).trim();
+        if let Some(rest) = strip_mark(line, VERDICT_MARK) {
+            let v = rest.trim().trim_end_matches(['.', '!']).trim().to_lowercase();
+            if v.starts_with("не ok") || v.starts_with("не ок") || v.starts_with("not ok") {
+                return Some(Verdict::NotOk);
+            }
+            if v.starts_with("ok") || v.starts_with("ок") {
+                return Some(Verdict::Ok);
+            }
+        }
+    }
+    None
+}
+
+/// Детерминированный контракт этапа: проверяет только машинно-решаемые
+/// признаки (маркеры, нумерацию), никаких эвристик «похоже на реализацию».
+/// Нарушение — вина модели: уходит в тот же retry-механизм, что и
+/// инварианты (`pipeline.rs`). Маркер закрытия этапа (`ЭТАП-ГОТОВ:` +
+/// `ИТОГ:`) здесь не проверяется — его сверяет [`TaskState::confirm`].
+pub fn check_stage_output(stage: Stage, text: &str) -> Vec<ContractViolation> {
+    let mut out = Vec::new();
+    let bad = |evidence: String| ContractViolation { id: stage.id().to_string(), evidence };
+    match stage {
+        Stage::Plan => {
+            // 2–5 пронумерованных шагов: строки вида `1.`, `2)` и т.п.
+            let steps = text.lines().filter(|l| is_numbered(l)).count();
+            if !(2..=5).contains(&steps) {
+                out.push(bad(format!(
+                    "план обязан содержать 2–5 пронумерованных шагов, найдено {steps}"
+                )));
+            }
+        }
+        Stage::Validate => {
+            if parse_verdict(text).is_none() {
+                out.push(bad(format!(
+                    "нет строки `{VERDICT_MARK} ok|не ok` — без машинного вердикта этап не закрывается"
+                )));
+            }
+        }
+        Stage::Study | Stage::Execute | Stage::Report | Stage::Done => {}
+    }
+    out
+}
+
+/// Строка-нумерованный пункт: `1.`, `2)`, `12.` и т.п. в начале строки.
+fn is_numbered(l: &str) -> bool {
+    let l = l.trim_start();
+    let digits = l.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && l.chars().nth(digits).is_some_and(|c| c == '.' || c == ')')
 }
 
 /// Состояние автомата. `Idle` — задачи нет; блок в `system` не уезжает.
@@ -356,6 +446,34 @@ impl TaskState {
         }
     }
 
+    /// Записать закрытый этап в журнал лестницы, **не** двигая `stage`.
+    ///
+    /// Куда идти дальше, решает не лестница, а таблица переходов
+    /// (`run.rs::transition`): после `plan` это может быть не `execute`, а
+    /// ожидание подписи, после `validate` с вердиктом «не ok» — возврат в
+    /// `execute`. Поэтому запись итога и выбор следующего этапа здесь
+    /// разведены: `close` только фиксирует, что было сделано.
+    pub fn close(&mut self, stage: Stage, summary: &str) {
+        self.log.push(StageRecord {
+            stage,
+            step: self.step,
+            summary: summary.trim().to_string(),
+        });
+        self.note.clear();
+    }
+
+    /// То же, но запись помечена как переделка: этап закрыт не «сделано»,
+    /// а «возвращено на доработку». В блоке `system` это видно дословно,
+    /// поэтому модель знает, что второй заход — не первый.
+    pub fn rework(&mut self, stage: Stage, why: &str) {
+        self.log.push(StageRecord {
+            stage,
+            step: self.step,
+            summary: format!("\u{21ba} переделка — {}", why.trim()),
+        });
+        self.note.clear();
+    }
+
     /// Пауза на текущем этапе. Разрешена на любом рабочем этапе — это
     /// требование постановки, поэтому `stage`/`step` не трогаем вовсе.
     pub fn pause(&mut self, why: &str) -> Res<()> {
@@ -386,11 +504,6 @@ impl TaskState {
         }
     }
 
-    /// Снести состояние. Единственный способ уйти из `Done` и единственный
-    /// способ начать другую задачу, не потеряв это молча.
-    pub fn reset(&mut self) {
-        *self = TaskState::new();
-    }
 
     /// Заявленное закрытие этапа из ответа модели. Возвращает итог этапа
     /// или объяснение, почему этап не закрыт.
@@ -682,7 +795,7 @@ mod tests {
         assert!(st.pause("хочу").is_err());
         assert!(st.resume().is_err());
         assert_eq!(st.log.len(), Stage::LADDER.len());
-        st.reset();
+        st = TaskState::new();
         assert_eq!(st.status, Status::Idle);
         assert!(!st.active());
     }
@@ -715,7 +828,7 @@ mod tests {
         assert!(st.start("вторая").is_err());
         st.pause("пауза").unwrap();
         assert!(st.start("вторая").is_err());
-        st.reset();
+        st = TaskState::new();
         st.start("вторая").unwrap();
         assert_eq!(st.goal, "вторая");
     }
@@ -809,5 +922,67 @@ mod tests {
         assert!(p.contains(RESULT_MARK));
         // Формулировку задачи в запрос не дублируем — она в блоке system.
         assert!(!p.contains("посчитать буквы"));
+    }
+
+    /// Вердикт — машинная строка, а не «звучит одобрительно». Отсутствие
+    /// строки должно читаться как «вердикта нет», а не как «ok».
+    #[test]
+    fn verdict_is_parsed_deterministically() {
+        assert_eq!(parse_verdict("ВЕРДИКТ: ok"), Some(Verdict::Ok));
+        assert_eq!(parse_verdict("**ВЕРДИКТ:** ОК."), Some(Verdict::Ok));
+        assert_eq!(parse_verdict("- ВЕРДИКТ: не ok, нашёл дефект"), Some(Verdict::NotOk));
+        assert_eq!(parse_verdict("ВЕРДИКТ: не ок"), Some(Verdict::NotOk));
+        assert_eq!(parse_verdict("ВЕРДИКТ: not ok"), Some(Verdict::NotOk));
+        // Порядок важен: «не ok» начинается не с «ok», и наоборот.
+        assert_eq!(parse_verdict("всё отлично, замечаний нет"), None);
+        assert_eq!(parse_verdict("вердикт где-то был"), None);
+    }
+
+    #[test]
+    fn stage_contract_catches_a_jumped_stage() {
+        // План: 2–5 пронумерованных шагов и ничего больше.
+        assert!(check_stage_output(Stage::Plan, "1. раз\n2. два\n3) три").is_empty());
+        assert!(!check_stage_output(Stage::Plan, "просто сделаю и всё").is_empty());
+        assert!(!check_stage_output(Stage::Plan, "1. единственный шаг").is_empty());
+        assert!(!check_stage_output(
+            Stage::Plan,
+            "1.\n2.\n3.\n4.\n5.\n6."
+        )
+        .is_empty());
+
+        // Валидация без машинного вердикта не закрывается.
+        assert!(check_stage_output(Stage::Validate, "всё сошлось\nВЕРДИКТ: ok").is_empty());
+        let bad = check_stage_output(Stage::Validate, "по-моему нормально");
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].id, "validate");
+
+        // Остальные этапы контрактом не связаны — выдумывать не будем.
+        for st in [Stage::Study, Stage::Execute, Stage::Report, Stage::Done] {
+            assert!(check_stage_output(st, "что угодно").is_empty());
+        }
+    }
+
+    #[test]
+    fn only_plan_is_gated() {
+        assert!(Stage::Plan.requires_approval());
+        for st in [Stage::Study, Stage::Execute, Stage::Validate, Stage::Report, Stage::Done] {
+            assert!(!st.requires_approval(), "{} не должен требовать подписи", st.id());
+        }
+    }
+
+    /// `close` фиксирует итог, но **не** выбирает следующий этап: этим
+    /// занимается таблица переходов. Иначе гейт можно было бы обойти,
+    /// просто закрыв этап.
+    #[test]
+    fn close_records_without_choosing_the_next_stage() {
+        let mut st = TaskState::new();
+        st.start("задача").unwrap();
+        let was = st.stage;
+        st.close(Stage::Study, "итог");
+        assert_eq!(st.stage, was, "close не двигает этап");
+        assert_eq!(st.log.len(), 1);
+        st.rework(Stage::Plan, "план отклонён");
+        assert_eq!(st.log.len(), 2);
+        assert!(st.log[1].summary.contains("переделка"));
     }
 }

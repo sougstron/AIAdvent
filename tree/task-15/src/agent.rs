@@ -258,9 +258,6 @@ impl Agent {
         &self.todo
     }
 
-    pub fn todo_mut(&mut self) -> &mut TaskState {
-        &mut self.todo
-    }
 
     pub fn set_todo(&mut self, state: TaskState) {
         self.todo = state;

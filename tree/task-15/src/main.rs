@@ -14,6 +14,7 @@ mod invariants;
 mod memory;
 mod profile;
 mod render;
+mod run;
 mod runtime;
 mod pipeline;
 mod session;
