@@ -57,7 +57,7 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-13/`.** It is a working agent: a ratatui
+**The active snapshot is `tree/task-14/`.** It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
@@ -133,6 +133,19 @@ on a task whose answer the checker computes itself, and confirms only when
 each stage closed *itself* and the final answer holds the right number. All
 four came back Confirmed live on `glm-5.3-flash`.
 
+Task 14 adds **project invariants**. Editable rules live outside dialogue
+history in `tree/task-14/invariants.json`; architecture, accepted decisions,
+stack constraints and business rules share one schema (`id`, `rule`, `why`,
+`workaround`, deterministic `forbid`/`triggers`). The prompt builder injects
+one `<invariants>` system block before the final task-state block. Every
+user-facing execution path validates the complete answer client-side before
+persisting it. An explicit user conflict returns the rule id, reason and
+allowed workaround without a model call. A model-originated violation is
+discarded and retried, with a hard limit of five; rejected attempts never
+enter history. The mechanism is on by default (`--invariants off` is the
+control), and `ask --verify-invariants all` causally proves the wire block,
+origin classification, retry limit and refusal explanation offline.
+
 Its `README.md` covers the Agent shape, key resolution, runtime settings, all six
 strategies plus the memory model, the personalization profile and the task
 state machine with their corner cases and real verify output, and the live lever self-test (temperature confirmed; top_p flat;
@@ -153,6 +166,8 @@ src/session.rs session persistence (~/.ask/sessions/*.json)
 src/render.rs  JSON-mode flattening ("Key: value" lines), shared by CLI and TUI
 src/tui.rs     the chat TUI: transcript, input, slash commands, settings/sessions panels
 src/todo.rs    the task state machine: stages, transitions, the system block
+src/invariants.rs editable rules, system block, deterministic validator
+src/pipeline.rs   Prompt → LLM → Validate → Pass/Fail retry loop
 src/verify.rs  the stop-condition self-test
 ```
 
