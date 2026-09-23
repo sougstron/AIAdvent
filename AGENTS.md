@@ -57,7 +57,7 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-15/`.** It is a working agent: a ratatui
+**The active snapshot is `tree/task-16/`.** It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the
@@ -134,7 +134,7 @@ each stage closed *itself* and the final answer holds the right number. All
 four came back Confirmed live on `glm-5.3-flash`.
 
 Task 14 adds **project invariants**. Editable rules live outside dialogue
-history in `tree/task-15/invariants.json`; architecture, accepted decisions,
+history in `tree/task-16/invariants.json`; architecture, accepted decisions,
 stack constraints and business rules share one schema (`id`, `rule`, `why`,
 `workaround`, deterministic `forbid`/`triggers`). The prompt builder injects
 one `<invariants>` system block before the final task-state block. Every
