@@ -1,0 +1,20 @@
+{
+  "layer": "working",
+  "scope": "default",
+  "records": [
+    {
+      "key": "задача.название",
+      "value": "отчёт по квартальным продажам",
+      "turn": 1,
+      "source": "extractor",
+      "reason": "префикс ключа `задача.`"
+    },
+    {
+      "key": "задача.срок",
+      "value": "пятница",
+      "turn": 1,
+      "source": "extractor",
+      "reason": "префикс ключа `задача.`"
+    }
+  ]
+}
