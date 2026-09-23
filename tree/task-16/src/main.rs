@@ -10,6 +10,7 @@ mod config;
 mod context;
 mod facts;
 mod isolation;
+mod mcp;
 mod invariants;
 mod memory;
 mod profile;
