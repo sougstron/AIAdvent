@@ -1937,3 +1937,52 @@ verdict: Confirmed
    `paused · этап N/5 · фаза model`, продолжение — `/todo resume`.
 7. Довести до `done(pass)` и проверить файл сессии: поле `run` должно
    исчезнуть, а итог — остаться в транскрипте.
+
+## Подключение MCP (задача 16)
+
+Минимальный MCP-клиент — `src/mcp.rs`, без внешнего SDK: MCP поверх
+Streamable HTTP — это JSON-RPC 2.0 в POST-запросах, и его хватает `ureq`.
+Пока клиент только подключается и берёт список инструментов, ничего не
+вызывает.
+
+```sh
+ask --mcp-tools                                     # публичный DeepWiki (без ключа)
+ask --mcp-tools https://docs.mcp.cloudflare.com/mcp # любой другой MCP-сервер
+```
+
+Что происходит на проводе:
+
+1. `initialize` (протокол `2025-06-18`) — сервер отвечает `serverInfo`,
+   версией протокола и, если нужно, заголовком `Mcp-Session-Id`, который
+   клиент дальше шлёт в каждом запросе;
+2. `notifications/initialized` — уведомление без `id`, сервер отвечает 202;
+3. `tools/list` — с переходом по `nextCursor`, пока сервер отдаёт страницы.
+
+Ответ может прийти обычным JSON или SSE-потоком (`text/event-stream`, так
+отвечает DeepWiki); клиент берёт из потока сообщение со своим `id` и
+пропускает серверные уведомления.
+
+Живой прогон (2026-09-23):
+
+```
+$ ask --mcp-tools
+MCP: подключаюсь к https://mcp.deepwiki.com/mcp
+соединение установлено: DeepWiki 2.14.3 (протокол 2025-06-18)
+инструментов: 3
+
+• ask_wiki_question(question*, repoName*)
+  Ask any question about a GitHub repository's codebase and get an AI-powered answer
+
+• read_wiki_contents(repoName*)
+  View documentation about a GitHub repository.
+
+• read_wiki_structure(repoName*)
+  Get a list of documentation topics for a GitHub repository.
+```
+
+`*` — обязательный параметр из `inputSchema`. На
+`https://docs.mcp.cloudflare.com/mcp` тот же код получил 2 инструмента
+(`search_cloudflare_documentation`, `migrate_pages_to_workers_guide`).
+Если сервер недоступен или ответил не по протоколу, команда завершается с
+кодом 1 и пишет, на каком шаге сломалось (`initialize: HTTP 405 …`,
+`initialize: cannot reach …`).

@@ -11,6 +11,7 @@ use crate::auth::{self, CheckResult, Provider};
 use crate::billing;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
 use crate::isolation;
+use crate::mcp;
 use crate::memory;
 use crate::profile;
 use crate::render;
@@ -46,6 +47,7 @@ use crate::verify;
         ask --todo \"...\"                      run the answer through the task state machine\n  \
         ask --verify-todo all                 prove the task state machine holds and survives a pause\n  \
         ask --verify-lifecycle all            prove the task lifecycle is gated: no execute before an approved plan\n  \
+        ask --mcp-tools [URL]                 connect to an MCP server and list its tools (default: DeepWiki)\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -183,6 +185,13 @@ pub struct Cli {
     /// `offline` or `all`. Exits after printing.
     #[arg(long, value_name = "WHICH")]
     pub verify_lifecycle: Option<String>,
+
+    /// Connect to an MCP server over Streamable HTTP (initialize +
+    /// notifications/initialized) and print the tools it exposes
+    /// (`tools/list`). Without a URL, the public DeepWiki server is used.
+    /// Exits after printing.
+    #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = mcp::DEFAULT_URL)]
+    pub mcp_tools: Option<String>,
 
     /// Live proof for the task state machine: `machine` (legal transitions
     /// pass, illegal ones are refused — no network), `wire` (what the state
@@ -529,6 +538,25 @@ pub fn run() -> Res<()> {
         println!("живых вызовов всего: {calls}");
         if let Some(bad) = reports.iter().find(|r| !r.confirmed()) {
             return Err(format!("memory model not confirmed: {}", bad.status_line()));
+        }
+        return Ok(());
+    }
+
+    if let Some(url) = cli.mcp_tools.as_deref() {
+        println!("MCP: подключаюсь к {url}");
+        let mut conn = mcp::Connection::connect(url)?;
+        println!(
+            "соединение установлено: {} {} (протокол {})",
+            conn.server_name, conn.server_version, conn.protocol_version
+        );
+        let tools = conn.list_tools()?;
+        println!("инструментов: {}", tools.len());
+        for t in &tools {
+            println!("\n• {}({})", t.name, t.params.join(", "));
+            let first = t.description.lines().next().unwrap_or("");
+            if !first.is_empty() {
+                println!("  {first}");
+            }
         }
         return Ok(());
     }
