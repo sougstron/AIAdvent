@@ -5,8 +5,17 @@
 ## Текущая задача
 
 - **Task 17** — путь: `tree/task-17/`
-- Задача 17 ещё не начата: `tree/task-17/` — дословная копия `tree/task-16/`,
-  функционально это состояние задачи 16.
+- Задача 17: **свой MCP-инструмент**. `src/mcp_server.rs` — собственный
+  MCP-сервер вокруг git (Streamable HTTP на `std::net`, 127.0.0.1): три
+  инструмента `git_log` / `git_show` / `git_status` с JSON Schema входа и
+  результатом `content` + `structuredContent`. Клиент (`src/mcp.rs`) умеет
+  `tools/call`, а `src/mcp_agent.rs` отдаёт инструменты модели как функции
+  и крутит цикл `tool_calls` → `tools/call` → `role: tool`. Команды:
+  `ask --mcp-serve --repo .`, `ask --mcp-call TOOL --mcp-args JSON`,
+  `ask --mcp URL "вопрос"`. Причинная проверка `ask --verify-mcp`
+  (временный репо со случайным кодовым именем в HEAD, контроль без
+  инструментов) — Confirmed на `glm-5.3-flash`. Подробности — раздел
+  «Свой MCP-сервер вокруг git» в `tree/task-17/README.md`.
 - Задача 16: **подключение MCP**. `src/mcp.rs` — минимальный клиент по
   Streamable HTTP (`initialize` → `notifications/initialized` →
   `tools/list`, ответы JSON или SSE). `ask --mcp-tools [URL]` подключается
