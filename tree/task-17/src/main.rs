@@ -11,6 +11,8 @@ mod context;
 mod facts;
 mod isolation;
 mod mcp;
+mod mcp_agent;
+mod mcp_server;
 mod invariants;
 mod memory;
 mod profile;

@@ -12,6 +12,8 @@ use crate::billing;
 use crate::config::{self, Effort, JsonMode, Res, Settings};
 use crate::isolation;
 use crate::mcp;
+use crate::mcp_agent;
+use crate::mcp_server;
 use crate::memory;
 use crate::profile;
 use crate::render;
@@ -48,6 +50,10 @@ use crate::verify;
         ask --verify-todo all                 prove the task state machine holds and survives a pause\n  \
         ask --verify-lifecycle all            prove the task lifecycle is gated: no execute before an approved plan\n  \
         ask --mcp-tools [URL]                 connect to an MCP server and list its tools (default: DeepWiki)\n  \
+        ask --mcp-serve --repo .              run the own git MCP server on 127.0.0.1:8765/mcp\n  \
+        ask --mcp-call git_log --mcp-args '{\"limit\":3}'   call one MCP tool directly, no model\n  \
+        ask --mcp http://127.0.0.1:8765/mcp \"кто автор последнего коммита?\"   agent answers via MCP tools\n  \
+        ask --verify-mcp                      prove the agent calls the MCP tool and uses its result\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -192,6 +198,40 @@ pub struct Cli {
     /// Exits after printing.
     #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = mcp::DEFAULT_URL)]
     pub mcp_tools: Option<String>,
+
+    /// Run the own MCP server (task 17) around the git repository `--repo`
+    /// on 127.0.0.1:`--mcp-port`, in the foreground, logging every request.
+    #[arg(long)]
+    pub mcp_serve: bool,
+
+    /// Repository served by `--mcp-serve`.
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    pub repo: String,
+
+    /// Port for `--mcp-serve`.
+    #[arg(long, value_name = "PORT", default_value_t = crate::mcp_server::DEFAULT_PORT)]
+    pub mcp_port: u16,
+
+    /// Answer the question as an agent that can call the tools of this MCP
+    /// server (`tools/list` → model function calling → `tools/call`).
+    #[arg(long, value_name = "URL")]
+    pub mcp: Option<String>,
+
+    /// Call one MCP tool directly (no model) on `--mcp` URL, or the local
+    /// git server if `--mcp` is not given, and print the result.
+    #[arg(long, value_name = "TOOL")]
+    pub mcp_call: Option<String>,
+
+    /// JSON arguments for `--mcp-call`.
+    #[arg(long, value_name = "JSON", default_value = "{}")]
+    pub mcp_args: String,
+
+    /// Causal proof for task 17: a throwaway repository whose last commit
+    /// carries a random codename, served by the own MCP server; Confirmed
+    /// only if the agent calls the tool and answers with the codename while
+    /// the same question without tools does not.
+    #[arg(long)]
+    pub verify_mcp: bool,
 
     /// Live proof for the task state machine: `machine` (legal transitions
     /// pass, illegal ones are refused — no network), `wire` (what the state
@@ -558,6 +598,70 @@ pub fn run() -> Res<()> {
                 println!("  {first}");
             }
         }
+        return Ok(());
+    }
+
+    if cli.mcp_serve {
+        let server = mcp_server::Server::new(std::path::Path::new(&cli.repo), true)?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", cli.mcp_port))
+            .map_err(|e| format!("bind 127.0.0.1:{}: {e}", cli.mcp_port))?;
+        println!("git MCP-сервер: http://127.0.0.1:{}/mcp", cli.mcp_port);
+        println!("репозиторий: {}", server.repo().display());
+        println!(
+            "инструменты: {}",
+            mcp_server::tool_specs()
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("Ctrl+C — остановить");
+        server.serve(listener);
+        return Ok(());
+    }
+
+    if let Some(tool) = cli.mcp_call.as_deref() {
+        let url = mcp_url(&cli);
+        let args: Value = serde_json::from_str(&cli.mcp_args)
+            .map_err(|e| format!("--mcp-args is not JSON: {e}"))?;
+        let mut conn = mcp::Connection::connect(&url)?;
+        let r = conn.call_tool(tool, args)?;
+        println!("{}", r.text);
+        if r.is_error {
+            return Err(format!("tool {tool} reported an error"));
+        }
+        return Ok(());
+    }
+
+    if cli.verify_mcp {
+        let settings = cli.to_settings()?;
+        println!("проверяю MCP-инструмент на модели {}", settings.model);
+        return if mcp_agent::verify(&settings)? {
+            Ok(())
+        } else {
+            Err("MCP tool use not confirmed".into())
+        };
+    }
+
+    if let Some(url) = cli.mcp.as_deref() {
+        let settings = cli.to_settings()?;
+        let question = read_question(&cli.question)?;
+        let ep = Endpoint::for_model(&settings.model)?;
+        let mut conn = mcp::Connection::connect(url)?;
+        let tools = conn.list_tools()?;
+        eprintln!(
+            "MCP: {} {} — инструменты: {}",
+            conn.server_name,
+            conn.server_version,
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        let mut on_step = |s: &mcp_agent::ToolStep| {
+            eprintln!("→ {} {}", s.name, s.args);
+            eprintln!("← {}{}", if s.is_error { "ERROR " } else { "" }, mcp_agent::preview(&s.result));
+        };
+        let run = mcp_agent::run(&ep, &settings, &mut conn, &tools, &question, &mut on_step)?;
+        println!("{}", if run.answer.is_empty() { "(no content)" } else { &run.answer });
+        eprintln!("{}", run.footer());
         return Ok(());
     }
 
@@ -1229,6 +1333,13 @@ fn prompt_key(provider: Provider) -> Res<String> {
 
 /// Positional args, or stdin when it is piped in. Empty (and a TTY) means
 /// "open the chat TUI" — same convention as before.
+/// `--mcp` if given, else the default address of `--mcp-serve`.
+fn mcp_url(cli: &Cli) -> String {
+    cli.mcp
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}/mcp", cli.mcp_port))
+}
+
 fn read_question(args: &[String]) -> Res<String> {
     if !args.is_empty() {
         return Ok(args.join(" "));

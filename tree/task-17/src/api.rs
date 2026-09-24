@@ -324,6 +324,29 @@ pub fn chat(
     post_completion(ep, body)
 }
 
+/// Function-calling variant of [`chat`] (task 17): `messages` are raw
+/// OpenAI-shaped objects, because tool rounds need `tool_calls` on assistant
+/// messages and `role: "tool"` replies, which [`ChatMessage`] cannot carry.
+/// The rest of the body (model, thinking, effort, sampling) is built by
+/// [`build_body`] exactly as for a plain chat.
+pub fn chat_with_tools(
+    ep: &Endpoint,
+    settings: &Settings,
+    system: &str,
+    messages: &[Value],
+    tools: &[Value],
+) -> Res<Outcome> {
+    guard_live_model(ep.provider, &settings.model)?;
+    let mut body = build_body(ep.provider, &settings.model, settings, system, &[], None);
+    let wire = body["messages"].as_array_mut().ok_or("body has no messages")?;
+    wire.extend(messages.iter().cloned());
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!("auto");
+    }
+    post_completion(ep, body)
+}
+
 fn post_completion(ep: &Endpoint, body: Value) -> Res<Outcome> {
     let url = format!("{}/chat/completions", ep.base_url);
     let started = Instant::now();

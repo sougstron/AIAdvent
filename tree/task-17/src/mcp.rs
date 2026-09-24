@@ -1,12 +1,12 @@
-//! Minimal MCP client (task 16): open a session with a remote MCP server
-//! over Streamable HTTP and ask it for its tool list. Nothing is called yet —
-//! the only goal is "the connection comes up and `tools/list` answers".
+//! Minimal MCP client: open a session with an MCP server over Streamable
+//! HTTP, list its tools (task 16) and call them (task 17, `tools/call`).
 //!
 //! Wire protocol (MCP 2025-06-18, JSON-RPC 2.0 over HTTP POST):
 //! 1. `initialize` → server replies with its info and capabilities, and may
 //!    hand out an `Mcp-Session-Id` header that every later request echoes;
 //! 2. `notifications/initialized` (no id, no reply — server answers 202);
-//! 3. `tools/list` (paginated via `nextCursor`).
+//! 3. `tools/list` (paginated via `nextCursor`);
+//! 4. `tools/call` with `{name, arguments}` → `{content[], isError}`.
 //!
 //! The server may answer either with plain JSON or with an SSE stream
 //! (`text/event-stream`); both are handled by [`parse_body`].
@@ -24,6 +24,18 @@ pub struct Tool {
     pub description: String,
     /// Names of the input-schema properties, required ones marked with `*`.
     pub params: Vec<String>,
+    /// The JSON Schema as the server sent it; the agent hands it to the model
+    /// verbatim as the function's `parameters`.
+    pub input_schema: Value,
+}
+
+/// Result of one `tools/call`.
+pub struct CallResult {
+    /// All `text` content blocks joined; other block types are summarized.
+    pub text: String,
+    /// The tool itself failed (bad arguments, git error…). Protocol errors
+    /// are `Err` instead.
+    pub is_error: bool,
 }
 
 pub struct Connection {
@@ -81,6 +93,29 @@ impl Connection {
                 return Ok(tools);
             }
         }
+    }
+
+    /// `tools/call`: run one tool with JSON arguments.
+    pub fn call_tool(&mut self, name: &str, arguments: Value) -> Res<CallResult> {
+        let result = self.request("tools/call", json!({"name": name, "arguments": arguments}))?;
+        let text = result["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .map(|b| match b["type"].as_str() {
+                        Some("text") => b["text"].as_str().unwrap_or("").to_string(),
+                        Some(other) => format!("[{other} content]"),
+                        None => b.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .ok_or("tools/call: no `content` array in the result")?;
+        Ok(CallResult {
+            text,
+            is_error: result["isError"].as_bool().unwrap_or(false),
+        })
     }
 
     fn post(&self, method: &str, body: &Value) -> Res<ureq::Response> {
@@ -185,6 +220,11 @@ fn parse_tool(v: &Value) -> Tool {
         name: v["name"].as_str().unwrap_or("?").to_string(),
         description: v["description"].as_str().unwrap_or("").trim().to_string(),
         params,
+        input_schema: if schema.is_object() {
+            schema.clone()
+        } else {
+            json!({"type": "object", "properties": {}})
+        },
     }
 }
 
