@@ -5,11 +5,19 @@
 ## Текущая задача
 
 - **Task 20** — путь: `tree/task-20/`
-- Задача 20: **подготовка** — дословная копия `tree/task-19/` на момент
-  TASK-095: `src/`, `Cargo.toml`/`Cargo.lock`, `invariants.json`, `memory/`
-  и свежий релизный бинарник перенесены как есть. Новая функциональность
-  задачи 20 ещё не вносилась, поэтому всё описание ниже — унаследованное
-  состояние задач 19 и раньше. Подробности — в `tree/task-20/README.md`.
+- Задача 20: **оркестрация MCP**. `src/orchestra.rs` — ещё два своих
+  MCP-сервера: `ask-tracker-mcp` (задачи в SQLite `~/.ask6/tracker.db`:
+  `issue_create` / `issue_list` / `issue_close`) и `ask-notify-mcp`
+  (уведомления команды в `~/.ask6/notify/outbox.jsonl`). Чат поднимает все
+  четыре (git, pipeline, tracker, notify); `Toolbox` маршрутизирует каждый
+  вызов на сервер-владелец (при коллизии имён — `pipeline__search`). Флоу
+  «триаж TODO»: search → git_log по файлу → issue_create → issue_list →
+  saveToFile → notify_send; `/triage` / `ask --triage` — автоматически,
+  обычным текстом — собирает модель. Вызовы рисуются дорожками серверов
+  (живьём во время хода) с аудитом маршрутов и порядка по данным.
+  `ask --orchestra-demo DIR` — демо-репо; `ask --verify-orchestra
+  offline|live|all` — обе Confirmed на `glm-5.3-flash`. Подробности —
+  раздел «Оркестрация MCP» в `tree/task-20/README.md`.
 - Задача 19: **композиция MCP-инструментов**. `src/toolchain.rs` — третий
   свой MCP-сервер `ask-pipeline-mcp` (127.0.0.1:8767): `search` (файлы или
   Википедия) → `summarize` (детерминированная сводка) → `saveToFile`

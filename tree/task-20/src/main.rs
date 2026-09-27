@@ -13,6 +13,7 @@ mod isolation;
 mod mcp;
 mod mcp_agent;
 mod mcp_server;
+mod orchestra;
 mod invariants;
 mod memory;
 mod profile;

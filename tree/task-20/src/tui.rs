@@ -197,6 +197,10 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
     // Задача 19: рядом — сервер пайплайна search → summarize → saveToFile,
     // чтобы «найди, сверни и сохрани» тоже работало без настройки.
     app.cmd_mcp("pipeline");
+    // Задача 20: ещё два сервера — трекер задач и уведомления команды, чтобы
+    // «разбери TODO, заведи задачи, сохрани отчёт и сообщи» шло через все четыре.
+    app.cmd_mcp("tracker");
+    app.cmd_mcp("notify");
     if let Some(msg) = boot {
         app.start_keyless(&msg);
     } else {
@@ -241,6 +245,9 @@ enum Entry {
     User(String),
     Assistant { text: String, note: Option<String> },
     Info(String),
+    /// Задача 20: картина вызовов MCP по дорожкам серверов и аудит флоу —
+    /// строки с ✓ зелёные, с ✗ красные, строки вызовов (●) яркие.
+    Flow(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -312,6 +319,9 @@ struct App {
     /// rendered as the last line of the transcript, replacing the old
     /// full-screen "working" overlay.
     spinner: Option<(String, &'static str)>,
+    /// Лента вызовов MCP текущего хода (`Toolbox::live`) и шапка дорожек:
+    /// пока крутится спиннер, строки появляются над ним по мере вызовов.
+    flow_feed: Option<(std::sync::Arc<std::sync::Mutex<Vec<String>>>, String)>,
     /// Прогон задачи (`run.rs`): этап, фаза запроса, попытка, журнал
     /// переходов и подписи под планом. Вся лестница в TUI двигается
     /// **только** через `run.apply(...)` — прямых вызовов `TaskState::advance`
@@ -426,6 +436,7 @@ impl App {
             tokens: TokenMeter::new(),
             sent_shape: Shape::default(),
             spinner: None,
+            flow_feed: None,
             run: crate::run::TaskRun::default(),
             stage_contract: None,
         };
@@ -1166,6 +1177,7 @@ impl App {
             "personas" => self.cmd_personas(rest, terminal),
             "mcp" => self.cmd_mcp(rest),
             "pipeline" | "пайплайн" => self.cmd_pipeline(rest, terminal),
+            "triage" | "триаж" => self.cmd_triage(rest, terminal),
             "help" => self.entries.push(Entry::Info(HELP.to_string())),
             "quit" | "exit" => self.quit = true,
             "" => {}
@@ -3198,7 +3210,18 @@ impl App {
     /// One info line per MCP `tools/call` the model made during the turn:
     /// the proof in the transcript that the answer went through the tool.
     fn show_mcp_steps(&mut self) {
+        self.flow_feed = None;
         let steps = self.take_mcp_steps();
+        // Задача 20: ход задел несколько серверов (или трекер/уведомления) —
+        // рисуем дорожки серверов и аудит маршрутов и порядка вместо списка.
+        if crate::orchestra::is_orchestrated(&steps) {
+            let lanes = self.mcp_lanes();
+            let checks = crate::orchestra::check_flow(&steps);
+            let mut lines = crate::orchestra::render(&steps, &lanes);
+            lines.extend(crate::orchestra::audit_lines(&steps, &checks));
+            self.entries.push(Entry::Flow(lines.join("\n")));
+            return;
+        }
         for step in &steps {
             self.entries.push(Entry::Info(format!(
                 "MCP → {} {}  ← {}{}",
@@ -3214,6 +3237,86 @@ impl App {
         if !audit.is_empty() {
             self.entries.push(Entry::Info(audit.join("\n")));
         }
+    }
+
+    /// Короткие имена подключённых серверов — дорожки картины вызовов.
+    fn mcp_lanes(&self) -> Vec<String> {
+        match self.agent.mcp().map(|tb| tb.lock()) {
+            Some(Ok(tb)) => tb.lanes(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Перед ходом с MCP: очистить ленту `Toolbox::live` и показывать её под
+    /// спиннером, пока ход идёт (снимается в `show_mcp_steps`).
+    fn arm_flow_feed(&mut self) {
+        self.flow_feed = match self.agent.mcp().map(|tb| tb.lock()) {
+            Some(Ok(tb)) => {
+                if let Ok(mut l) = tb.live.lock() {
+                    l.clear();
+                }
+                Some((tb.live.clone(), crate::orchestra::lane_header(&tb.lanes())))
+            }
+            _ => None,
+        };
+    }
+
+    /// `/triage [метка] [> файл.md]` — задача 20: автоматический флоу через
+    /// четыре MCP-сервера: search (pipeline) → git_log по каждому файлу (git)
+    /// → issue_create по каждой метке и issue_list (tracker) → saveToFile
+    /// (pipeline) → notify_send (notify). Строки-дорожки появляются по мере
+    /// вызовов, в конце — аудит маршрутов и порядка.
+    fn cmd_triage(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
+        let (marker, file) = match rest.rsplit_once('>') {
+            Some((q, f)) => (q.trim(), Some(f.trim().to_string()).filter(|f| !f.is_empty())),
+            None => (rest.trim(), None),
+        };
+        for srv in ["git", "pipeline", "tracker", "notify"] {
+            let name = format!("ask-{srv}-mcp");
+            let attached = self
+                .agent
+                .mcp()
+                .is_some_and(|tb| tb.lock().is_ok_and(|mut tb| tb.server(&name).is_some()));
+            if !attached {
+                self.cmd_mcp(srv);
+            }
+        }
+        let Some(toolbox) = self.agent.mcp().cloned() else { return };
+        let req = crate::orchestra::TriageRequest::new(Some(marker), file.as_deref());
+        self.entries.push(Entry::User(format!("/triage {rest}").trim_end().to_string()));
+        self.arm_flow_feed();
+        let feed = self.flow_feed.as_ref().map(|(f, _)| f.clone()).unwrap_or_default();
+        let lanes = self.mcp_lanes();
+        let result = self.with_spinner(terminal, "оркестрация: pipeline → git → tracker → pipeline → notify", move || {
+            let mut tb = toolbox.lock().map_err(|e| format!("MCP: {e}"))?;
+            let report = crate::orchestra::run_triage(&mut *tb, &req, &lanes, &mut |l| {
+                // В ленту под спиннером — только строки вызовов.
+                if l.starts_with(|c: char| c == ' ' || c.is_ascii_digit()) && l.contains('\u{25cf}') {
+                    if let Ok(mut f) = feed.lock() {
+                        f.push(l);
+                    }
+                }
+            });
+            Ok::<_, String>((report, lanes))
+        });
+        self.flow_feed = None;
+        match result {
+            Some(Ok((Ok(rep), lanes))) => {
+                let mut lines = crate::orchestra::render(&rep.steps, &lanes);
+                lines.extend(crate::orchestra::audit_lines(&rep.steps, &rep.checks));
+                self.entries.push(Entry::Flow(lines.join("\n")));
+                self.entries.push(Entry::Info(format!("сохранено в {}:\n{}", rep.path, rep.table.trim_end())));
+                self.status = if rep.ok() {
+                    format!("оркестрация: ok, отчёт {}", rep.path)
+                } else {
+                    "оркестрация: аудит нашёл ✗ — см. выше".into()
+                };
+            }
+            Some(Ok((Err(e), _))) => self.status = format!("оркестрация остановлена: {e}"),
+            Some(Err(e)) => self.status = format!("оркестрация: {e}"),
+            None => self.status = "оркестрация отменена".into(),
+        }
+        self.follow = true;
     }
 
     /// `/pipeline [wiki] <запрос> [> файл.md]` — автоматическая цепочка
@@ -3300,12 +3403,14 @@ impl App {
                         }
                         lines.push(
                             "Спросите обычным текстом: «глянь, что там в гите», «найди в проекте всё про MCP, \
-                             сверни и сохрани в mcp.md»; или /pipeline <запрос>. /mcp off — выключить."
+                             сверни и сохрани в mcp.md», «разбери TODO в проекте, заведи задачи на авторов, \
+                             сохрани список в triage.md и сообщи команде»; или /pipeline <запрос>, /triage. \
+                             /mcp off — выключить."
                                 .into(),
                         );
                         lines.join("\n")
                     }
-                    _ => "MCP: off — /mcp git [путь], /mcp pipeline [папка] или /mcp <url>".into(),
+                    _ => "MCP: off — /mcp git [путь], /mcp pipeline [папка], /mcp tracker, /mcp notify или /mcp <url>".into(),
                 };
                 self.entries.push(Entry::Info(text));
                 return;
@@ -3331,11 +3436,29 @@ impl App {
                 };
                 crate::mcp_agent::Toolbox::local_pipeline(&root, &crate::toolchain::default_out())
             }
+            "tracker" => {
+                let db = if arg.trim().is_empty() {
+                    crate::orchestra::default_tracker_db()
+                } else {
+                    std::path::PathBuf::from(arg.trim())
+                };
+                crate::mcp_agent::Toolbox::local_tracker(&db)
+            }
+            "notify" => {
+                let dir = if arg.trim().is_empty() {
+                    crate::orchestra::default_notify_dir()
+                } else {
+                    std::path::PathBuf::from(arg.trim())
+                };
+                crate::mcp_agent::Toolbox::local_notify(&dir)
+            }
             url if url.starts_with("http://") || url.starts_with("https://") => {
                 crate::mcp_agent::Toolbox::connect(url, url.to_string())
             }
             other => {
-                self.status = format!("unknown /mcp {other} — /mcp [show|off|git [path]|pipeline [dir]|<url>]");
+                self.status = format!(
+                    "unknown /mcp {other} — /mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|<url>]"
+                );
                 return;
             }
         };
@@ -3421,6 +3544,7 @@ impl App {
                 Some(st) => format!("этап `{}`: проверяю ответ", st.id()),
                 None => "проверяю инварианты".to_string(),
             };
+            self.arm_flow_feed();
             let result = self.with_spinner(terminal, &label, move || {
                 crate::pipeline::run_stage_with(&set, inv_on, stage, &invariant_query, |_, retry_note| {
                     let mut attempt = hist.clone();
@@ -3485,6 +3609,7 @@ impl App {
             } else {
                 "model is thinking"
             };
+            self.arm_flow_feed();
             let result = self.with_spinner(terminal, label, move || {
                 agent.complete_outcome(&hist)
             });
@@ -4030,6 +4155,16 @@ impl App {
                     out.extend(marked_lines("\u{00b7} ", muted(), text, muted()));
                     out.push(Line::raw(""));
                 }
+                Entry::Flow(text) => {
+                    out.extend(flow_lines(text));
+                    out.push(Line::raw(""));
+                }
+            }
+        }
+        if let (Some(_), Some((feed, header))) = (&self.spinner, &self.flow_feed) {
+            let rows = feed.lock().map(|f| f.clone()).unwrap_or_default();
+            if !rows.is_empty() {
+                out.extend(flow_lines(&format!("{header}\n{}", rows.join("\n"))));
             }
         }
         if let Some((label, frame)) = &self.spinner {
@@ -4585,8 +4720,9 @@ const HELP: &str = "\
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
-/mcp [show|off|git [path]|pipeline [dir]|<url>]  MCP servers the chat may call (git + pipeline on by default)
+/mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|<url>]  MCP servers the chat may call (all four on by default)
 /pipeline [wiki] <query> [> file.md]  run search → summarize → saveToFile over MCP, every step shown
+/triage [marker] [> file.md]  TODO triage over 4 MCP servers: search → git_log → issue_create → issue_list → saveToFile → notify_send
 /checkpoint [name]        mark the current point so branches can fork from it
 /branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
 /settings                 open the settings panel (Tab on an empty input)
@@ -4656,6 +4792,32 @@ fn marked_lines(
         rows.push(Line::from(Span::styled(marker, marker_style)));
     }
     rows
+}
+
+/// Строки `Entry::Flow`: ✗ — красным, ✓ — зелёным, вызов (●) — обычным
+/// цветом с акцентной точкой, остальное (шапка, путь, покрытие) — приглушённо.
+fn flow_lines(text: &str) -> Vec<Line<'static>> {
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let mark = Span::styled(if i == 0 { "\u{21c4} " } else { "  " }, accent());
+            if line.contains('\u{2717}') {
+                return Line::from(vec![mark, Span::styled(line.to_string(), Style::default().fg(Color::Red))]);
+            }
+            if line.trim_start().starts_with('\u{2713}') {
+                return Line::from(vec![mark, Span::styled(line.to_string(), Style::default().fg(Color::Green))]);
+            }
+            match line.split_once('\u{25cf}') {
+                Some((lead, rest)) => Line::from(vec![
+                    mark,
+                    Span::styled(lead.to_string(), muted()),
+                    Span::styled("\u{25cf}".to_string(), accent()),
+                    Span::raw(rest.to_string()),
+                ]),
+                None => Line::from(vec![mark, Span::styled(line.to_string(), muted())]),
+            }
+        })
+        .collect()
 }
 
 fn entries_from_session(s: &Session) -> Vec<Entry> {

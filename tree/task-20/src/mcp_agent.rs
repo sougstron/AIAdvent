@@ -16,13 +16,21 @@ use crate::config::{Res, Settings};
 use crate::mcp::{self, Connection};
 use crate::mcp_server::{self, Server};
 
-/// A model that keeps calling tools forever is a bug, not a long answer.
-const MAX_ROUNDS: usize = 6;
+/// A model that keeps calling tools forever is a bug, not a long answer. The
+/// orchestrated flow of task 20 (search → git_log ×N → issue_create ×N →
+/// issue_list → saveToFile → notify_send) needs ~7 rounds on its own, so the
+/// cap leaves room for that and a retry or two, not for an endless loop.
+const MAX_ROUNDS: usize = 16;
 /// Tool output fed back to the model is capped (DeepWiki pages are huge).
 const MAX_TOOL_CHARS: usize = 12_000;
 
 pub struct ToolStep {
+    /// The tool's own name on its server (`search`), even when the model saw
+    /// it under a qualified name (`pipeline__search`, see [`Toolbox`]).
     pub name: String,
+    /// `serverInfo.name` of the server the call was routed to — the
+    /// orchestration audit (task 20) checks it against the tool's owner.
+    pub server: String,
     pub args: Value,
     pub result: String,
     pub is_error: bool,
@@ -35,11 +43,20 @@ pub struct ToolStep {
 /// [`Toolbox`] that routes each tool to the server it came from.
 pub trait ToolCaller {
     fn call_tool(&mut self, name: &str, args: Value) -> Res<mcp::CallResult>;
+
+    /// `(server, tool)` a function name the model used is routed to.
+    fn resolve(&self, name: &str) -> (String, String) {
+        (String::new(), name.to_string())
+    }
 }
 
 impl ToolCaller for Connection {
     fn call_tool(&mut self, name: &str, args: Value) -> Res<mcp::CallResult> {
         Connection::call_tool(self, name, args)
+    }
+
+    fn resolve(&self, name: &str) -> (String, String) {
+        (self.server_name.clone(), name.to_string())
     }
 }
 
@@ -75,10 +92,15 @@ impl AgentRun {
 
 /// MCP `tools/list` entry → `tools[]` entry of a chat completion.
 pub fn to_function(tool: &mcp::Tool) -> Value {
+    named_function(tool, &tool.name)
+}
+
+/// Same, under the name the model will see (a qualified one on collision).
+fn named_function(tool: &mcp::Tool, name: &str) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": name,
             "description": tool.description,
             "parameters": tool.input_schema,
         },
@@ -153,18 +175,19 @@ pub fn tool_loop(
         // model sees its own request next to the answers.
         messages.push(message);
         for call in calls {
-            let name = call["function"]["name"].as_str().unwrap_or("").to_string();
+            let called = call["function"]["name"].as_str().unwrap_or("");
+            let (server, name) = conn.resolve(called);
             let args = match &call["function"]["arguments"] {
                 Value::String(s) if s.trim().is_empty() => json!({}),
                 Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
                 Value::Null => json!({}),
                 v => v.clone(),
             };
-            let (result, is_error, structured) = match conn.call_tool(&name, args.clone()) {
+            let (result, is_error, structured) = match conn.call_tool(called, args.clone()) {
                 Ok(r) => (r.text, r.is_error, r.structured),
                 Err(e) => (e, true, Value::Null),
             };
-            let step = ToolStep { name, args, result, is_error, structured };
+            let step = ToolStep { name, server, args, result, is_error, structured };
             on_step(&step);
             let mut content: String = step.result.chars().take(MAX_TOOL_CHARS).collect();
             if step.is_error {
@@ -189,16 +212,31 @@ pub struct Attached {
     pub label: String,
 }
 
+/// Where a function the model sees goes: server index and the tool's own
+/// name there.
+pub struct Route {
+    pub exposed: String,
+    pub server: usize,
+    pub tool: String,
+}
+
 /// The MCP servers the chat agent carries between turns (task 17 started
-/// with one; task 19 composes several — git and the pipeline — so the
-/// model can chain tools of different servers in one turn). Each tool call
-/// is routed to the server that listed the tool.
+/// with one; task 19 composes several; task 20 registers four — git,
+/// pipeline, tracker, notify — and runs long flows across them). Every
+/// function the model sees has a route to exactly one server: a tool name
+/// only one server has is exposed as is, a name two servers share becomes
+/// `<alias>__<tool>` on both, so a call can never land on the wrong one.
 pub struct Toolbox {
     pub servers: Vec<Attached>,
     /// Every tool of every server, converted to chat-completion functions.
     pub functions: Vec<Value>,
+    pub routes: Vec<Route>,
     /// Every `tools/call` since the last [`Toolbox::take_log`].
     pub log: Vec<ToolStep>,
+    /// Rendered lines of the calls of the turn in flight, for the chat to
+    /// show while the model is still working (task 20). Its own lock, so the
+    /// UI can read it while the turn holds the toolbox.
+    pub live: Arc<Mutex<Vec<String>>>,
 }
 
 pub type SharedToolbox = Arc<Mutex<Toolbox>>;
@@ -207,8 +245,51 @@ impl Toolbox {
     pub fn connect(url: &str, label: String) -> Res<Toolbox> {
         let mut conn = Connection::connect(url)?;
         let tools = conn.list_tools()?;
-        let functions = tools.iter().map(to_function).collect();
-        Ok(Toolbox { servers: vec![Attached { conn, tools, label }], functions, log: Vec::new() })
+        let mut tb = Toolbox {
+            servers: vec![Attached { conn, tools, label }],
+            functions: Vec::new(),
+            routes: Vec::new(),
+            log: Vec::new(),
+            live: Arc::default(),
+        };
+        tb.rebuild();
+        Ok(tb)
+    }
+
+    /// Task 20: the tracker server (issues in SQLite at `db`).
+    pub fn local_tracker(db: &Path) -> Res<Toolbox> {
+        let server = crate::orchestra::Tracker::open(db, false)?;
+        let url = server.spawn(0)?;
+        Toolbox::connect(&url, format!("tracker: задачи в {} ({url})", db.display()))
+    }
+
+    /// Task 20: the notify server (outbox of team messages in `dir`).
+    pub fn local_notify(dir: &Path) -> Res<Toolbox> {
+        let server = crate::orchestra::Notify::new(dir, false)?;
+        let url = server.spawn(0)?;
+        Toolbox::connect(&url, format!("notify: исходящие в {} ({url})", server.outbox().display()))
+    }
+
+    /// Recompute routes and functions after the set of servers changed.
+    pub fn rebuild(&mut self) {
+        let mut aliases: Vec<String> = Vec::new();
+        for s in &self.servers {
+            let base = crate::orchestra::alias(&s.conn.server_name).to_string();
+            let taken = aliases.iter().filter(|a| a.trim_end_matches(char::is_numeric) == base).count();
+            aliases.push(if taken == 0 { base } else { format!("{base}{}", taken + 1) });
+        }
+        let mut routes = Vec::new();
+        let mut functions = Vec::new();
+        for (i, s) in self.servers.iter().enumerate() {
+            for t in &s.tools {
+                let shared = self.tools().filter(|o| o.name == t.name).count() > 1;
+                let exposed = if shared { format!("{}__{}", aliases[i], t.name) } else { t.name.clone() };
+                functions.push(named_function(t, &exposed));
+                routes.push(Route { exposed, server: i, tool: t.name.clone() });
+            }
+        }
+        self.routes = routes;
+        self.functions = functions;
     }
 
     /// Start the own git MCP server for `repo` on a free local port (in this
@@ -232,21 +313,33 @@ impl Toolbox {
     }
 
     /// Attach the servers of `other`; a server with the same name as one
-    /// already attached replaces it (`/mcp git other/repo`).
+    /// already attached replaces it in place (`/mcp git other/repo`), so the
+    /// lanes of the flow picture keep their order.
     pub fn merge(&mut self, other: Toolbox) {
         for srv in other.servers {
-            self.servers.retain(|s| s.conn.server_name != srv.conn.server_name);
-            self.servers.push(srv);
+            match self.servers.iter().position(|s| s.conn.server_name == srv.conn.server_name) {
+                Some(i) => self.servers[i] = srv,
+                None => self.servers.push(srv),
+            }
         }
-        self.functions = self.tools().map(to_function).collect();
+        self.rebuild();
     }
 
     pub fn tools(&self) -> impl Iterator<Item = &mcp::Tool> {
         self.servers.iter().flat_map(|s| s.tools.iter())
     }
 
+    /// The names the model sees (qualified where two servers share a name).
     pub fn tool_names(&self) -> String {
-        self.tools().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+        self.routes.iter().map(|r| r.exposed.as_str()).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Short server names in attach order — the lanes of the flow picture.
+    pub fn lanes(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .map(|s| crate::orchestra::alias(&s.conn.server_name).to_string())
+            .collect()
     }
 
     pub fn labels(&self) -> String {
@@ -268,12 +361,28 @@ impl Toolbox {
 
 impl ToolCaller for Toolbox {
     fn call_tool(&mut self, name: &str, args: Value) -> Res<mcp::CallResult> {
-        let srv = self
-            .servers
-            .iter_mut()
-            .find(|s| s.tools.iter().any(|t| t.name == name))
-            .ok_or_else(|| format!("no attached MCP server has the tool `{name}`"))?;
-        srv.conn.call_tool(name, args)
+        let route = self.routes.iter().find(|r| r.exposed == name).ok_or_else(|| {
+            let shared: Vec<&str> = self
+                .routes
+                .iter()
+                .filter(|r| r.tool == name)
+                .map(|r| r.exposed.as_str())
+                .collect();
+            if shared.is_empty() {
+                format!("no attached MCP server has the tool `{name}`")
+            } else {
+                format!("`{name}` exists on several servers — call one of: {}", shared.join(", "))
+            }
+        })?;
+        let (server, tool) = (route.server, route.tool.clone());
+        self.servers[server].conn.call_tool(&tool, args)
+    }
+
+    fn resolve(&self, name: &str) -> (String, String) {
+        match self.routes.iter().find(|r| r.exposed == name) {
+            Some(r) => (self.servers[r.server].conn.server_name.clone(), r.tool.clone()),
+            None => (String::new(), name.to_string()),
+        }
     }
 }
 
@@ -289,7 +398,13 @@ pub fn chat_note(toolbox: &Toolbox) -> String {
             format!(
                 "<mcp-server name=\"{}\" tools=\"{}\">connected to {}. {}</mcp-server>",
                 s.conn.server_name,
-                s.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
+                toolbox
+                    .routes
+                    .iter()
+                    .filter(|r| toolbox.servers[r.server].conn.server_name == s.conn.server_name)
+                    .map(|r| r.exposed.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 s.label,
                 s.conn.instructions
             )
