@@ -194,6 +194,9 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
     // Задача 17: свой git MCP-сервер поднимается вместе с чатом на репозиторий
     // текущей папки, чтобы «глянь, что там в гите» работало без настройки.
     app.cmd_mcp("git");
+    // Задача 19: рядом — сервер пайплайна search → summarize → saveToFile,
+    // чтобы «найди, сверни и сохрани» тоже работало без настройки.
+    app.cmd_mcp("pipeline");
     if let Some(msg) = boot {
         app.start_keyless(&msg);
     } else {
@@ -1162,6 +1165,7 @@ impl App {
             "verify" => self.cmd_verify(rest, terminal),
             "personas" => self.cmd_personas(rest, terminal),
             "mcp" => self.cmd_mcp(rest),
+            "pipeline" | "пайплайн" => self.cmd_pipeline(rest, terminal),
             "help" => self.entries.push(Entry::Info(HELP.to_string())),
             "quit" | "exit" => self.quit = true,
             "" => {}
@@ -3194,15 +3198,84 @@ impl App {
     /// One info line per MCP `tools/call` the model made during the turn:
     /// the proof in the transcript that the answer went through the tool.
     fn show_mcp_steps(&mut self) {
-        for step in self.take_mcp_steps() {
+        let steps = self.take_mcp_steps();
+        for step in &steps {
             self.entries.push(Entry::Info(format!(
                 "MCP → {} {}  ← {}{}",
                 step.name,
-                step.args,
+                crate::toolchain::shown_args(&step.args),
                 if step.is_error { "ERROR " } else { "" },
                 crate::mcp_agent::preview(&step.result)
             )));
         }
+        // Задача 19: если модель сама собрала цепочку из инструментов
+        // пайплайна — сверяем, что каждый получил ровно выход предыдущего.
+        let audit = crate::toolchain::audit(&steps);
+        if !audit.is_empty() {
+            self.entries.push(Entry::Info(audit.join("\n")));
+        }
+    }
+
+    /// `/pipeline [wiki] <запрос> [> файл.md]` — автоматическая цепочка
+    /// search → summarize → saveToFile через MCP-сервер пайплайна: каждый
+    /// шаг и каждая передача данных видны строкой в транскрипте.
+    fn cmd_pipeline(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
+        let (rest, file) = match rest.rsplit_once('>') {
+            Some((q, f)) => (q.trim(), Some(f.trim().to_string()).filter(|f| !f.is_empty())),
+            None => (rest.trim(), None),
+        };
+        let (source, query) = match rest.split_once(char::is_whitespace) {
+            Some(("wiki" | "wikipedia" | "вики", q)) => ("wikipedia", q.trim()),
+            _ => ("files", rest),
+        };
+        if query.is_empty() {
+            self.entries.push(Entry::Info(
+                "/pipeline [wiki] <запрос> [> файл.md] — search → summarize → saveToFile\n\
+                 примеры: /pipeline MCP   ·   /pipeline wiki квазар > kvazar.md"
+                    .into(),
+            ));
+            return;
+        }
+        let has_pipeline = |app: &Self| {
+            app.agent.mcp().is_some_and(|tb| {
+                tb.lock()
+                    .is_ok_and(|mut tb| tb.server(crate::toolchain::SERVER_NAME).is_some())
+            })
+        };
+        if !has_pipeline(self) {
+            self.cmd_mcp("pipeline");
+            if !has_pipeline(self) {
+                return;
+            }
+        }
+        let Some(toolbox) = self.agent.mcp().cloned() else { return };
+        let req = crate::toolchain::ChainRequest::new(query, source, file.as_deref());
+        self.entries.push(Entry::User(format!("/pipeline {rest}{}", file.as_deref().map(|f| format!(" > {f}")).unwrap_or_default())));
+        let result = self.with_spinner(terminal, "пайплайн: search → summarize → saveToFile", move || {
+            let mut tb = toolbox.lock().map_err(|e| format!("MCP: {e}"))?;
+            let mut lines = Vec::new();
+            let report = crate::toolchain::run_chain(&mut *tb, &req, &mut |l| lines.push(l));
+            Ok::<_, String>((lines, report))
+        });
+        match result {
+            Some(Ok((lines, report))) => {
+                self.entries.push(Entry::Info(lines.join("\n")));
+                match report {
+                    Ok(rep) => {
+                        self.entries.push(Entry::Info(format!("сохранено в {}:\n{}", rep.path, rep.summary)));
+                        self.status = if rep.ok() {
+                            format!("пайплайн: ok, файл {}", rep.path)
+                        } else {
+                            "пайплайн: передача данных не сошлась".into()
+                        };
+                    }
+                    Err(e) => self.status = format!("пайплайн остановлен: {e}"),
+                }
+            }
+            Some(Err(e)) => self.status = format!("пайплайн: {e}"),
+            None => self.status = "пайплайн отменён".into(),
+        }
+        self.follow = true;
     }
 
     /// `/mcp` — which MCP server the chat's tools come from.
@@ -3215,17 +3288,24 @@ impl App {
             "" | "show" => {
                 let text = match self.agent.mcp().map(|tb| tb.lock()) {
                     Some(Ok(tb)) => {
-                        let mut lines = vec![format!(
-                            "MCP: {} {} — {}",
-                            tb.conn.server_name, tb.conn.server_version, tb.label
-                        )];
-                        for t in &tb.tools {
-                            lines.push(format!("  {}({})  {}", t.name, t.params.join(", "), t.description));
+                        let mut lines = Vec::new();
+                        for srv in &tb.servers {
+                            lines.push(format!(
+                                "MCP: {} {} — {}",
+                                srv.conn.server_name, srv.conn.server_version, srv.label
+                            ));
+                            for t in &srv.tools {
+                                lines.push(format!("  {}({})  {}", t.name, t.params.join(", "), t.description));
+                            }
                         }
-                        lines.push("Спросите обычным текстом, например: «глянь, что там в гите». /mcp off — выключить.".into());
+                        lines.push(
+                            "Спросите обычным текстом: «глянь, что там в гите», «найди в проекте всё про MCP, \
+                             сверни и сохрани в mcp.md»; или /pipeline <запрос>. /mcp off — выключить."
+                                .into(),
+                        );
                         lines.join("\n")
                     }
-                    _ => "MCP: off — /mcp git [путь] или /mcp <url>".into(),
+                    _ => "MCP: off — /mcp git [путь], /mcp pipeline [папка] или /mcp <url>".into(),
                 };
                 self.entries.push(Entry::Info(text));
                 return;
@@ -3243,11 +3323,19 @@ impl App {
                 };
                 crate::mcp_agent::Toolbox::local_git(&repo)
             }
+            "pipeline" => {
+                let root = if arg.trim().is_empty() {
+                    self.agent.cwd().to_path_buf()
+                } else {
+                    std::path::PathBuf::from(arg.trim())
+                };
+                crate::mcp_agent::Toolbox::local_pipeline(&root, &crate::toolchain::default_out())
+            }
             url if url.starts_with("http://") || url.starts_with("https://") => {
                 crate::mcp_agent::Toolbox::connect(url, url.to_string())
             }
             other => {
-                self.status = format!("unknown /mcp {other} — /mcp [show|off|git [path]|<url>]");
+                self.status = format!("unknown /mcp {other} — /mcp [show|off|git [path]|pipeline [dir]|<url>]");
                 return;
             }
         };
@@ -3255,10 +3343,23 @@ impl App {
             Ok(tb) => {
                 self.entries.push(Entry::Info(format!(
                     "MCP: {} — инструменты: {}",
-                    tb.label,
+                    tb.labels(),
                     tb.tool_names()
                 )));
-                self.agent.set_mcp(Some(std::sync::Arc::new(std::sync::Mutex::new(tb))));
+                // Серверы копятся: git и пайплайн работают в одном ходе.
+                let tb = match self.agent.mcp().cloned() {
+                    Some(shared) => match shared.lock() {
+                        Ok(mut current) => {
+                            current.merge(tb);
+                            None
+                        }
+                        Err(_) => Some(tb),
+                    },
+                    None => Some(tb),
+                };
+                if let Some(tb) = tb {
+                    self.agent.set_mcp(Some(std::sync::Arc::new(std::sync::Mutex::new(tb))));
+                }
             }
             Err(e) => self.status = format!("MCP not attached: {e}"),
         }
@@ -4484,7 +4585,8 @@ const HELP: &str = "\
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
-/mcp [show|off|git [path]|<url>]  MCP tools the chat may call (own git server on by default)
+/mcp [show|off|git [path]|pipeline [dir]|<url>]  MCP servers the chat may call (git + pipeline on by default)
+/pipeline [wiki] <query> [> file.md]  run search → summarize → saveToFile over MCP, every step shown
 /checkpoint [name]        mark the current point so branches can fork from it
 /branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
 /settings                 open the settings panel (Tab on an empty input)

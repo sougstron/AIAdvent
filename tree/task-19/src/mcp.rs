@@ -36,6 +36,9 @@ pub struct CallResult {
     /// The tool itself failed (bad arguments, git error…). Protocol errors
     /// are `Err` instead.
     pub is_error: bool,
+    /// `structuredContent` as the server sent it (`Null` if absent) — the
+    /// pipeline (task 19) reads digests and ids from here, not from text.
+    pub structured: Value,
 }
 
 pub struct Connection {
@@ -45,6 +48,9 @@ pub struct Connection {
     pub server_name: String,
     pub server_version: String,
     pub protocol_version: String,
+    /// `instructions` from `initialize`: the server's own hint on when to
+    /// use it; the chat puts it next to the tool list for the model.
+    pub instructions: String,
 }
 
 impl Connection {
@@ -57,6 +63,7 @@ impl Connection {
             server_name: String::new(),
             server_version: String::new(),
             protocol_version: String::new(),
+            instructions: String::new(),
         };
         let result = conn.request(
             "initialize",
@@ -70,6 +77,7 @@ impl Connection {
         conn.server_name = info["name"].as_str().unwrap_or("?").to_string();
         conn.server_version = info["version"].as_str().unwrap_or("?").to_string();
         conn.protocol_version = result["protocolVersion"].as_str().unwrap_or("?").to_string();
+        conn.instructions = result["instructions"].as_str().unwrap_or("").to_string();
         conn.notify("notifications/initialized")?;
         Ok(conn)
     }
@@ -115,6 +123,7 @@ impl Connection {
         Ok(CallResult {
             text,
             is_error: result["isError"].as_bool().unwrap_or(false),
+            structured: result["structuredContent"].clone(),
         })
     }
 

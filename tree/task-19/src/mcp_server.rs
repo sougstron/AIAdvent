@@ -89,7 +89,11 @@ impl Server {
     pub fn handle(&self, msg: &Value) -> Option<Value> {
         let info = ServerInfo {
             name: "ask-git-mcp",
-            instructions: format!("Read-only access to the git repository at {}.", self.repo.display()),
+            instructions: format!(
+                "Read-only access to the git repository at {}. Use it when the user asks about the \
+                 repository, commits, changes or \"what's in git\".",
+                self.repo.display()
+            ),
         };
         dispatch(msg, &info, &tool_specs(), &self.calls, &|name, args| self.call(name, args))
     }

@@ -26,6 +26,21 @@ pub struct ToolStep {
     pub args: Value,
     pub result: String,
     pub is_error: bool,
+    /// `structuredContent` of the result — the pipeline audit (task 19)
+    /// checks the hand-offs between tools by the digests in it.
+    pub structured: Value,
+}
+
+/// Whatever can execute a `tools/call`: one MCP connection, or the chat's
+/// [`Toolbox`] that routes each tool to the server it came from.
+pub trait ToolCaller {
+    fn call_tool(&mut self, name: &str, args: Value) -> Res<mcp::CallResult>;
+}
+
+impl ToolCaller for Connection {
+    fn call_tool(&mut self, name: &str, args: Value) -> Res<mcp::CallResult> {
+        Connection::call_tool(self, name, args)
+    }
 }
 
 pub struct Round {
@@ -110,7 +125,7 @@ pub fn tool_loop(
     settings: &Settings,
     system: &str,
     mut messages: Vec<Value>,
-    conn: &mut Connection,
+    conn: &mut dyn ToolCaller,
     functions: &[Value],
     on_step: &mut dyn FnMut(&ToolStep),
 ) -> Res<(api::Outcome, Vec<ToolStep>, Vec<Round>)> {
@@ -145,11 +160,11 @@ pub fn tool_loop(
                 Value::Null => json!({}),
                 v => v.clone(),
             };
-            let (result, is_error) = match conn.call_tool(&name, args.clone()) {
-                Ok(r) => (r.text, r.is_error),
-                Err(e) => (e, true),
+            let (result, is_error, structured) = match conn.call_tool(&name, args.clone()) {
+                Ok(r) => (r.text, r.is_error, r.structured),
+                Err(e) => (e, true, Value::Null),
             };
-            let step = ToolStep { name, args, result, is_error };
+            let step = ToolStep { name, args, result, is_error, structured };
             on_step(&step);
             let mut content: String = step.result.chars().take(MAX_TOOL_CHARS).collect();
             if step.is_error {
@@ -166,15 +181,22 @@ pub fn tool_loop(
     Err(format!("the model was still calling tools after {MAX_ROUNDS} rounds"))
 }
 
-/// An MCP connection the chat agent carries between turns (task 17, chat
-/// side): the session with the server, its tools already converted to
-/// functions, and the calls made since the TUI last looked.
-pub struct Toolbox {
+/// One MCP server attached to the chat: the session and its tools.
+pub struct Attached {
     pub conn: Connection,
     pub tools: Vec<mcp::Tool>,
-    pub functions: Vec<Value>,
     /// What is connected, for `/mcp` and the startup line.
     pub label: String,
+}
+
+/// The MCP servers the chat agent carries between turns (task 17 started
+/// with one; task 19 composes several — git and the pipeline — so the
+/// model can chain tools of different servers in one turn). Each tool call
+/// is routed to the server that listed the tool.
+pub struct Toolbox {
+    pub servers: Vec<Attached>,
+    /// Every tool of every server, converted to chat-completion functions.
+    pub functions: Vec<Value>,
     /// Every `tools/call` since the last [`Toolbox::take_log`].
     pub log: Vec<ToolStep>,
 }
@@ -186,7 +208,7 @@ impl Toolbox {
         let mut conn = Connection::connect(url)?;
         let tools = conn.list_tools()?;
         let functions = tools.iter().map(to_function).collect();
-        Ok(Toolbox { conn, tools, functions, label, log: Vec::new() })
+        Ok(Toolbox { servers: vec![Attached { conn, tools, label }], functions, log: Vec::new() })
     }
 
     /// Start the own git MCP server for `repo` on a free local port (in this
@@ -198,8 +220,45 @@ impl Toolbox {
         Toolbox::connect(&url, format!("git {} ({url})", server.repo().display()))
     }
 
+    /// Same for the pipeline server of task 19: `search` over files under
+    /// `root` (or Wikipedia), `summarize`, `saveToFile` into `out`.
+    pub fn local_pipeline(root: &Path, out: &Path) -> Res<Toolbox> {
+        let server = crate::toolchain::Server::new(root, out, false)?;
+        let url = server.spawn(0)?;
+        Toolbox::connect(
+            &url,
+            format!("pipeline: поиск в {}, файлы в {} ({url})", server.root().display(), server.out().display()),
+        )
+    }
+
+    /// Attach the servers of `other`; a server with the same name as one
+    /// already attached replaces it (`/mcp git other/repo`).
+    pub fn merge(&mut self, other: Toolbox) {
+        for srv in other.servers {
+            self.servers.retain(|s| s.conn.server_name != srv.conn.server_name);
+            self.servers.push(srv);
+        }
+        self.functions = self.tools().map(to_function).collect();
+    }
+
+    pub fn tools(&self) -> impl Iterator<Item = &mcp::Tool> {
+        self.servers.iter().flat_map(|s| s.tools.iter())
+    }
+
     pub fn tool_names(&self) -> String {
-        self.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+        self.tools().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+
+    pub fn labels(&self) -> String {
+        self.servers.iter().map(|s| s.label.as_str()).collect::<Vec<_>>().join("; ")
+    }
+
+    /// The connection of the server named `server_name` (`ask-pipeline-mcp`).
+    pub fn server(&mut self, server_name: &str) -> Option<&mut Connection> {
+        self.servers
+            .iter_mut()
+            .find(|s| s.conn.server_name == server_name)
+            .map(|s| &mut s.conn)
     }
 
     pub fn take_log(&mut self) -> Vec<ToolStep> {
@@ -207,17 +266,39 @@ impl Toolbox {
     }
 }
 
+impl ToolCaller for Toolbox {
+    fn call_tool(&mut self, name: &str, args: Value) -> Res<mcp::CallResult> {
+        let srv = self
+            .servers
+            .iter_mut()
+            .find(|s| s.tools.iter().any(|t| t.name == name))
+            .ok_or_else(|| format!("no attached MCP server has the tool `{name}`"))?;
+        srv.conn.call_tool(name, args)
+    }
+}
+
 /// Appended to the chat's own system prompt when tools are attached, so a
-/// casual "глянь что там в гите" is read as a reason to call them.
+/// casual "глянь что там в гите" or "найди, сверни и сохрани" is read as a
+/// reason to call them. Each server speaks for itself via its MCP
+/// `instructions`.
 pub fn chat_note(toolbox: &Toolbox) -> String {
+    let servers: Vec<String> = toolbox
+        .servers
+        .iter()
+        .map(|s| {
+            format!(
+                "<mcp-server name=\"{}\" tools=\"{}\">connected to {}. {}</mcp-server>",
+                s.conn.server_name,
+                s.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
+                s.label,
+                s.conn.instructions
+            )
+        })
+        .collect();
     format!(
-        "<mcp-tools server=\"{}\">You can call the tools of this MCP server ({}); it is \
-         connected to {}. When the user asks about the repository, commits, changes or \
-         \"what's in git\", call the tools instead of guessing, then answer from their \
-         results.</mcp-tools>",
-        toolbox.conn.server_name,
-        toolbox.tool_names(),
-        toolbox.label
+        "<mcp-tools>You can call the tools of these MCP servers. When the request needs what \
+         they provide, call the tools instead of guessing, then answer from their results.\n{}\n</mcp-tools>",
+        servers.join("\n")
     )
 }
 
@@ -375,7 +456,7 @@ mod tests {
         assert_eq!(tb.functions.len(), 3);
         let note = chat_note(&tb);
         assert!(note.contains("git_log") && note.contains(&dir.canonicalize().unwrap().display().to_string()));
-        let r = tb.conn.call_tool("git_log", json!({"limit": 1})).unwrap();
+        let r = ToolCaller::call_tool(&mut tb, "git_log", json!({"limit": 1})).unwrap();
         assert!(!r.is_error && r.text.contains("toolbox marker") && r.text.contains("Dana"));
         assert!(tb.take_log().is_empty());
     }

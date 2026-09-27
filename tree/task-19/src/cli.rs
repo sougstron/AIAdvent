@@ -19,6 +19,7 @@ use crate::profile;
 use crate::render;
 use crate::runtime::{BoxSpec, Runtime};
 use crate::scheduler;
+use crate::toolchain;
 use crate::session;
 use crate::verify;
 
@@ -58,6 +59,10 @@ use crate::verify;
         ask --scheduler                       24/7 scheduler: MCP server + jobs + Telegram (TELEGRAM_BOT_TOKEN)\n  \
         ask --mcp http://127.0.0.1:8766/mcp \"напомни через минуту\"   agent over the scheduler MCP tools\n  \
         ask --verify-scheduler                prove schedule / aggregate / reminder work through MCP\n  \
+        ask --pipeline \"MCP\"                   search → summarize → saveToFile over the own pipeline MCP server\n  \
+        ask --pipeline квазар --pipeline-source wikipedia --pipeline-file kvazar.md\n  \
+        ask --pipeline-serve                  run the pipeline MCP server on 127.0.0.1:8767/mcp\n  \
+        ask --verify-pipeline [offline|live|all]   prove the chain runs and hands data over intact\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -279,6 +284,43 @@ pub struct Cli {
     /// becomes a job and fires when due.
     #[arg(long)]
     pub verify_scheduler: bool,
+
+    /// Run the automatic pipeline of task 19 for this query: `search` →
+    /// `summarize` → `saveToFile`, each a `tools/call` to the own pipeline
+    /// MCP server, with every step and hand-off printed.
+    #[arg(long, value_name = "QUERY")]
+    pub pipeline: Option<String>,
+
+    /// Where `search` looks: `files` (under `--pipeline-root`) or `wikipedia`.
+    #[arg(long, value_name = "SOURCE", default_value = "files")]
+    pub pipeline_source: String,
+
+    /// Folder searched by `search` with source `files`.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub pipeline_root: String,
+
+    /// Folder `saveToFile` writes into. Default: `~/.ask6/pipeline/`.
+    #[arg(long, value_name = "DIR")]
+    pub pipeline_out: Option<String>,
+
+    /// File name for the result. Default: `pipeline-<query>.md`.
+    #[arg(long, value_name = "NAME")]
+    pub pipeline_file: Option<String>,
+
+    /// Run the pipeline MCP server on 127.0.0.1:`--pipeline-port` in the
+    /// foreground, logging every request.
+    #[arg(long)]
+    pub pipeline_serve: bool,
+
+    #[arg(long, value_name = "PORT", default_value_t = crate::toolchain::DEFAULT_PORT)]
+    pub pipeline_port: u16,
+
+    /// Causal proof for task 19: `offline` (the automatic chain on a corpus
+    /// with a random codename, hand-offs checked by digest, two controls
+    /// that must fail), `live` (the model assembles the chain from one
+    /// sentence) or `all`.
+    #[arg(long, value_name = "WHICH", num_args = 0..=1, default_missing_value = "all")]
+    pub verify_pipeline: Option<String>,
 
     /// Live proof for the task state machine: `machine` (legal transitions
     /// pass, illegal ones are refused — no network), `wire` (what the state
@@ -698,6 +740,43 @@ pub fn run() -> Res<()> {
         } else {
             Err("scheduler not confirmed".into())
         };
+    }
+
+    if let Some(which) = cli.verify_pipeline.as_deref() {
+        let settings = cli.to_settings()?;
+        println!("проверяю пайплайн MCP-инструментов ({which}) на модели {}", settings.model);
+        return if toolchain::verify(which, &settings)? {
+            Ok(())
+        } else {
+            Err("pipeline not confirmed".into())
+        };
+    }
+
+    if cli.pipeline.is_some() || cli.pipeline_serve {
+        let out = cli
+            .pipeline_out
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(toolchain::default_out);
+        let server = toolchain::Server::new(std::path::Path::new(&cli.pipeline_root), &out, cli.pipeline_serve)?;
+        if cli.pipeline_serve {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", cli.pipeline_port))
+                .map_err(|e| format!("bind 127.0.0.1:{}: {e}", cli.pipeline_port))?;
+            println!("pipeline MCP-сервер: http://127.0.0.1:{}/mcp", cli.pipeline_port);
+            println!("поиск в: {}\nфайлы в: {}", server.root().display(), server.out().display());
+            println!("инструменты: {}", toolchain::TOOLS.join(", "));
+            println!("Ctrl+C — остановить");
+            server.serve(listener);
+            return Ok(());
+        }
+        let url = server.spawn(0)?;
+        let mut conn = mcp::Connection::connect(&url)?;
+        println!("MCP: {} {} на {url}", conn.server_name, conn.server_version);
+        let query = cli.pipeline.as_deref().unwrap_or_default();
+        let req = toolchain::ChainRequest::new(query, &cli.pipeline_source, cli.pipeline_file.as_deref());
+        let rep = toolchain::run_chain(&mut conn, &req, &mut |l| println!("{l}"))?;
+        println!("\n--- {} ---\n{}", rep.path, rep.summary);
+        return if rep.ok() { Ok(()) } else { Err("pipeline hand-off mismatch".into()) };
     }
 
     if cli.scheduler {
