@@ -8,7 +8,8 @@
 //! tools and once without.
 
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::api::{self, Endpoint};
 use crate::config::{Res, Settings};
@@ -89,26 +90,49 @@ pub fn run(
 ) -> Res<AgentRun> {
     let functions: Vec<Value> = tools.iter().map(to_function).collect();
     let system = system_prompt(&conn.server_name);
-    let mut messages = vec![json!({"role": "user", "content": question})];
-    let mut run = AgentRun {
-        answer: String::new(),
-        steps: Vec::new(),
-        rounds: Vec::new(),
-        model: String::new(),
-    };
+    let messages = vec![json!({"role": "user", "content": question})];
+    let (last, steps, rounds) = tool_loop(ep, settings, &system, messages, conn, &functions, on_step)?;
+    Ok(AgentRun {
+        answer: last.text().to_string(),
+        steps,
+        rounds,
+        model: last.model.unwrap_or_default(),
+    })
+}
+
+/// The loop itself, shared by the CLI (`run`) and the chat (`Agent` with a
+/// [`Toolbox`]): ask the model with `functions`, execute every `tool_calls`
+/// entry as MCP `tools/call`, feed the results back as `role: "tool"`, and
+/// stop at the first answer without tool calls. The returned outcome is that
+/// last answer, with `usage` summed over every round.
+pub fn tool_loop(
+    ep: &Endpoint,
+    settings: &Settings,
+    system: &str,
+    mut messages: Vec<Value>,
+    conn: &mut Connection,
+    functions: &[Value],
+    on_step: &mut dyn FnMut(&ToolStep),
+) -> Res<(api::Outcome, Vec<ToolStep>, Vec<Round>)> {
+    let mut steps = Vec::new();
+    let mut rounds = Vec::new();
+    let mut usage = api::Usage::default();
     for _ in 0..MAX_ROUNDS {
-        let out = api::chat_with_tools(ep, settings, &system, &messages, &functions)?;
-        run.model = out.model.clone().unwrap_or_default();
-        run.rounds.push(Round {
+        let mut out = api::chat_with_tools(ep, settings, system, &messages, functions)?;
+        rounds.push(Round {
             finish_reason: out.finish_reason.clone().unwrap_or_else(|| "?".into()),
             prompt_tokens: out.usage.prompt_tokens,
             completion_tokens: out.usage.completion_tokens,
         });
+        usage.prompt_tokens += out.usage.prompt_tokens;
+        usage.completion_tokens += out.usage.completion_tokens;
+        usage.reasoning_tokens += out.usage.reasoning_tokens;
+        usage.total_tokens += out.usage.total_tokens;
         let message = out.raw["choices"][0]["message"].clone();
         let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
         if calls.is_empty() {
-            run.answer = out.text().to_string();
-            return Ok(run);
+            out.usage = usage;
+            return Ok((out, steps, rounds));
         }
         // The assistant turn goes back as-is (tool_calls + reasoning), so the
         // model sees its own request next to the answers.
@@ -136,10 +160,65 @@ pub fn run(
                 "tool_call_id": call["id"],
                 "content": content,
             }));
-            run.steps.push(step);
+            steps.push(step);
         }
     }
     Err(format!("the model was still calling tools after {MAX_ROUNDS} rounds"))
+}
+
+/// An MCP connection the chat agent carries between turns (task 17, chat
+/// side): the session with the server, its tools already converted to
+/// functions, and the calls made since the TUI last looked.
+pub struct Toolbox {
+    pub conn: Connection,
+    pub tools: Vec<mcp::Tool>,
+    pub functions: Vec<Value>,
+    /// What is connected, for `/mcp` and the startup line.
+    pub label: String,
+    /// Every `tools/call` since the last [`Toolbox::take_log`].
+    pub log: Vec<ToolStep>,
+}
+
+pub type SharedToolbox = Arc<Mutex<Toolbox>>;
+
+impl Toolbox {
+    pub fn connect(url: &str, label: String) -> Res<Toolbox> {
+        let mut conn = Connection::connect(url)?;
+        let tools = conn.list_tools()?;
+        let functions = tools.iter().map(to_function).collect();
+        Ok(Toolbox { conn, tools, functions, label, log: Vec::new() })
+    }
+
+    /// Start the own git MCP server for `repo` on a free local port (in this
+    /// process, on a background thread) and connect to it over HTTP — the
+    /// chat talks to it exactly as it would to a remote server.
+    pub fn local_git(repo: &Path) -> Res<Toolbox> {
+        let server = Server::new(repo, false)?;
+        let url = server.spawn(0)?;
+        Toolbox::connect(&url, format!("git {} ({url})", server.repo().display()))
+    }
+
+    pub fn tool_names(&self) -> String {
+        self.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+
+    pub fn take_log(&mut self) -> Vec<ToolStep> {
+        std::mem::take(&mut self.log)
+    }
+}
+
+/// Appended to the chat's own system prompt when tools are attached, so a
+/// casual "глянь что там в гите" is read as a reason to call them.
+pub fn chat_note(toolbox: &Toolbox) -> String {
+    format!(
+        "<mcp-tools server=\"{}\">You can call the tools of this MCP server ({}); it is \
+         connected to {}. When the user asks about the repository, commits, changes or \
+         \"what's in git\", call the tools instead of guessing, then answer from their \
+         results.</mcp-tools>",
+        toolbox.conn.server_name,
+        toolbox.tool_names(),
+        toolbox.label
+    )
 }
 
 /// Short one-line preview of a tool result for the console.
@@ -284,5 +363,20 @@ mod tests {
         assert_eq!(f["type"], "function");
         assert_eq!(f["function"]["name"], "git_show");
         assert_eq!(f["function"]["parameters"]["required"], json!(["rev"]));
+    }
+
+    #[test]
+    fn local_git_toolbox_serves_the_repo_over_http() {
+        let dir = std::env::temp_dir().join(format!("ask-toolbox-{}", std::process::id()));
+        let _guard = TempRepo(dir.clone());
+        mcp_server::fixture_repo(&dir, "feat: toolbox marker", "Dana <dana@example.com>").unwrap();
+        let mut tb = Toolbox::local_git(&dir).unwrap();
+        assert_eq!(tb.tool_names(), "git_log, git_show, git_status");
+        assert_eq!(tb.functions.len(), 3);
+        let note = chat_note(&tb);
+        assert!(note.contains("git_log") && note.contains(&dir.canonicalize().unwrap().display().to_string()));
+        let r = tb.conn.call_tool("git_log", json!({"limit": 1})).unwrap();
+        assert!(!r.is_error && r.text.contains("toolbox marker") && r.text.contains("Dana"));
+        assert!(tb.take_log().is_empty());
     }
 }

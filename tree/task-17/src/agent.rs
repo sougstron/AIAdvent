@@ -13,6 +13,7 @@ use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
 use crate::facts::{self, FactStore, FactsDelta};
 use crate::memory::{self, Layer, MemoryStore};
 use crate::invariants::InvariantSet;
+use crate::mcp_agent::{self, SharedToolbox};
 use crate::profile::{self, Profile, ProfileSet};
 use crate::todo::TaskState;
 use crate::session::Session;
@@ -103,6 +104,10 @@ pub struct Agent {
     /// Project invariants are loaded from their own file, never serialized
     /// into the dialogue session.
     invariants: InvariantSet,
+    /// Подключённый MCP-сервер (задача 17): пока он есть, обычный ход идёт
+    /// через цикл `tool_calls` → `tools/call` (см. `mcp_agent::tool_loop`).
+    /// Общий на все клоны агента — сессия с сервером одна.
+    mcp: Option<SharedToolbox>,
 }
 
 impl Agent {
@@ -144,6 +149,7 @@ impl Agent {
             } else {
                 InvariantSet::load_default()
             },
+            mcp: None,
         };
         agent.refresh_context();
         agent
@@ -623,8 +629,43 @@ impl Agent {
         }
     }
 
+    pub fn mcp(&self) -> Option<&SharedToolbox> {
+        self.mcp.as_ref()
+    }
+
+    pub fn set_mcp(&mut self, toolbox: Option<SharedToolbox>) {
+        self.mcp = toolbox;
+    }
+
+    /// Ход через MCP-инструменты идёт только там, где ответ — свободный
+    /// текст: JSON-режим сам диктует форму ответа и остаётся без них.
+    pub fn uses_mcp(&self) -> bool {
+        self.mcp.is_some() && !self.settings.json_mode.enabled
+    }
+
     pub fn complete_outcome(&self, history: &[ChatMessage]) -> Res<Outcome> {
         let settings = self.effective_settings();
+        if let (true, Some(toolbox)) = (self.uses_mcp(), &self.mcp) {
+            let mut tb = toolbox.lock().map_err(|e| format!("MCP: {e}"))?;
+            let system = format!("{}\n\n{}", self.system_for_request(), mcp_agent::chat_note(&tb));
+            let messages: Vec<serde_json::Value> = self
+                .wire_history(history)
+                .iter()
+                .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+                .collect();
+            let functions = tb.functions.clone();
+            let (outcome, steps, _) = mcp_agent::tool_loop(
+                &self.endpoint,
+                &settings,
+                system.trim(),
+                messages,
+                &mut tb.conn,
+                &functions,
+                &mut |_| {},
+            )?;
+            tb.log.extend(steps);
+            return Ok(outcome);
+        }
         let schema = settings
             .json_mode
             .enabled

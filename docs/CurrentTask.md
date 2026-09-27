@@ -12,7 +12,10 @@
   `tools/call`, а `src/mcp_agent.rs` отдаёт инструменты модели как функции
   и крутит цикл `tool_calls` → `tools/call` → `role: tool`. Команды:
   `ask --mcp-serve --repo .`, `ask --mcp-call TOOL --mcp-args JSON`,
-  `ask --mcp URL "вопрос"`. Причинная проверка `ask --verify-mcp`
+  `ask --mcp URL "вопрос"`. В чате git-сервер подключается сам при
+  старте (репозиторий текущей папки): «глянь, что там в гите» — и модель
+  вызывает `git_log`/`git_status`, вызовы видны строками `MCP → …`;
+  `/mcp [show|off|git [путь]|<url>]`. Причинная проверка `ask --verify-mcp`
   (временный репо со случайным кодовым именем в HEAD, контроль без
   инструментов) — Confirmed на `glm-5.3-flash`. Подробности — раздел
   «Свой MCP-сервер вокруг git» в `tree/task-17/README.md`.

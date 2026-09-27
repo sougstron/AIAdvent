@@ -173,6 +173,16 @@ pub const ROOT: &[Node] = &[
     ),
     leaf("login"),
     lit("max-tokens", "off|1-131072", &[leaf("off"), free("N")]),
+    lit(
+        "mcp",
+        "command|url",
+        &[
+            leaf("show"),
+            leaf("off"),
+            lit("git", "[repo path]", &[free("")]),
+            free("http://…/mcp"),
+        ],
+    ),
     Node {
         token: "model",
         hint: "id",
