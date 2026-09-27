@@ -123,9 +123,10 @@ impl Server {
         if let Some(a) = opt_str(args, "author")? {
             cmd.push(format!("--author={a}"));
         }
-        if let Some(p) = opt_str(args, "path")? {
+        let path = opt_str(args, "path")?.map(|p| no_dash(p, "path")).transpose()?;
+        if let Some(p) = path {
             cmd.push("--".into());
-            cmd.push(no_dash(p, "path")?.to_string());
+            cmd.push(p.to_string());
         }
         let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
         let out = git(&self.repo, &refs)?;
@@ -138,8 +139,17 @@ impl Server {
                 })
             })
             .collect();
+        // "No commits" for a path has very different causes: a folder that was
+        // never committed on this branch is not the same as a typo. Say which.
+        let state = match path {
+            Some(p) if commits.is_empty() => Some(self.path_state(p)),
+            _ => None,
+        };
         let text = if commits.is_empty() {
-            "no commits match".to_string()
+            match &state {
+                Some(s) => format!("no commits match: {}", s["why"].as_str().unwrap_or("")),
+                None => "no commits match".to_string(),
+            }
         } else {
             commits
                 .iter()
@@ -156,7 +166,39 @@ impl Server {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        Ok((text, json!({"commits": commits})))
+        let mut structured = json!({"commits": commits});
+        if let Some(s) = state {
+            structured["path_state"] = s;
+        }
+        Ok((text, structured))
+    }
+
+    /// Why a `path` has no commits: `untracked` (files on disk that were
+    /// never committed on this branch), `ignored`, `missing`, or `tracked`
+    /// (it is in git, only the filters matched nothing).
+    fn path_state(&self, path: &str) -> Value {
+        let count = |args: &[&str]| git(&self.repo, args).map(|o| o.lines().count()).unwrap_or(0);
+        let branch = git(&self.repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|b| b.trim().to_string())
+            .unwrap_or_else(|_| "?".into());
+        let tracked = count(&["ls-files", "--", path]);
+        let untracked = count(&["ls-files", "--others", "--exclude-standard", "--", path]);
+        let (state, why) = if tracked > 0 {
+            ("tracked", format!("{path} is in git on branch {branch}, but no commit matches the filters"))
+        } else if untracked > 0 {
+            (
+                "untracked",
+                format!(
+                    "{path} is not committed on branch {branch} — {untracked} untracked file(s), git has no history \
+                     for them (commit first: git add {path} && git commit)"
+                ),
+            )
+        } else if self.repo.join(path).exists() {
+            ("ignored", format!("{path} exists but is ignored by .gitignore — git has no history for it"))
+        } else {
+            ("missing", format!("{path} does not exist in {}", self.repo.display()))
+        };
+        json!({"state": state, "branch": branch, "tracked_files": tracked, "untracked_files": untracked, "why": why})
     }
 
     fn git_show(&self, args: &Value) -> Res<(String, Value)> {
@@ -230,7 +272,7 @@ pub fn tool_specs() -> Vec<Value> {
     vec![
         json!({
             "name": "git_log",
-            "description": "List recent commits of the repository, newest first: short hash, author date, author and subject.",
+            "description": "List recent commits of the repository, newest first: short hash, author date, author and subject. When nothing matches a `path`, says why (untracked — never committed on this branch, ignored, missing).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -380,6 +422,7 @@ pub fn handle_connection(
 
     let mut content_length = 0usize;
     let mut origin: Option<String> = None;
+    let mut accept = String::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).map_err(|e| e.to_string())? == 0 {
@@ -393,6 +436,7 @@ pub fn handle_connection(
             match k.trim().to_ascii_lowercase().as_str() {
                 "content-length" => content_length = v.trim().parse().unwrap_or(0),
                 "origin" => origin = Some(v.trim().to_string()),
+                "accept" => accept = v.trim().to_ascii_lowercase(),
                 _ => {}
             }
         }
@@ -413,6 +457,9 @@ pub fn handle_connection(
     }
     match method.as_str() {
         "POST" => {}
+        // A person opening the URL in a browser: say what this is instead of
+        // a blank 405. An MCP client asking for an SSE stream still gets 405.
+        "GET" if !accept.contains("text/event-stream") => return about_page(&mut stream, handle),
         // No server-initiated SSE stream; session teardown is a no-op.
         "DELETE" => return respond(&mut stream, "200 OK", None, ""),
         _ => return respond(&mut stream, "405 Method Not Allowed", None, ""),
@@ -447,6 +494,46 @@ pub fn handle_connection(
         // Notifications get no JSON-RPC reply.
         None => respond(&mut stream, "202 Accepted", None, ""),
     }
+}
+
+/// Plain-text page for `GET /mcp` from a browser: the server, its tools, and
+/// that it is spoken to by POSTing JSON-RPC, not browsed.
+fn about_page(stream: &mut TcpStream, handle: &dyn Fn(&Value) -> Option<Value>) -> Res<()> {
+    let init = handle(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}))
+        .map(|r| r["result"].clone())
+        .unwrap_or_default();
+    let list = handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .map(|r| r["result"]["tools"].clone())
+        .unwrap_or_default();
+    let mut text = format!(
+        "{} {} — MCP server (Streamable HTTP)\n\n\
+         This URL is an API endpoint, not a web page: MCP clients send JSON-RPC to it with POST\n\
+         (initialize → tools/list → tools/call). The ask chat does that for you; it lives only while\n\
+         the process that started it runs.\n\n{}\n\nTools:\n",
+        init["serverInfo"]["name"].as_str().unwrap_or("?"),
+        init["serverInfo"]["version"].as_str().unwrap_or(""),
+        init["instructions"].as_str().unwrap_or("")
+    );
+    for t in list.as_array().into_iter().flatten() {
+        text.push_str(&format!(
+            "  {:<14} {}\n",
+            t["name"].as_str().unwrap_or("?"),
+            t["description"].as_str().unwrap_or("")
+        ));
+    }
+    text.push_str(
+        "\nTry it from a terminal:\n  ask --mcp-tools <this URL>\n  \
+         curl -s <this URL> -H 'Content-Type: application/json' \\\n    \
+         -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'\n",
+    );
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        text.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.write_all(text.as_bytes()))
+        .map_err(|e| e.to_string())
 }
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
@@ -543,6 +630,51 @@ mod tests {
         let r = call("nope", json!({}));
         assert_eq!(r["error"]["code"], -32602);
         assert_eq!(s.calls.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A browser GET gets a readable page; an MCP client asking for an SSE
+    /// stream still gets 405 (no server-initiated stream here).
+    #[test]
+    fn browser_get_shows_an_about_page() {
+        let dir = temp_repo("get");
+        let url = Server::new(&dir, false).unwrap().spawn(0).unwrap();
+        let addr = url.trim_start_matches("http://").trim_end_matches("/mcp").to_string();
+        let get = |accept: &str| {
+            let mut s = TcpStream::connect(&addr).unwrap();
+            write!(s, "GET /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: {accept}\r\n\r\n").unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        let page = get("text/html,application/xhtml+xml,*/*;q=0.8");
+        assert!(page.starts_with("HTTP/1.1 200 OK") && page.contains("text/plain"), "{page}");
+        assert!(page.contains("ask-git-mcp") && page.contains("git_show") && page.contains("POST"), "{page}");
+        assert!(get("text/event-stream").starts_with("HTTP/1.1 405"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_log_says_why_a_path_has_no_commits() {
+        let dir = temp_repo("why");
+        std::fs::create_dir_all(dir.join("wip")).unwrap();
+        std::fs::write(dir.join("wip/a.rs"), "x\n").unwrap();
+        let s = Server::new(&dir, false).unwrap();
+        let log = |path: &str| {
+            s.handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                             "params": {"name": "git_log", "arguments": {"path": path}}}))
+                .unwrap()["result"]
+                .clone()
+        };
+        let r = log("wip");
+        assert_eq!(r["structuredContent"]["path_state"]["state"], "untracked");
+        assert_eq!(r["structuredContent"]["path_state"]["untracked_files"], 1);
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not committed on branch main") && text.contains("git add wip"), "{text}");
+        assert_eq!(log("nope")["structuredContent"]["path_state"]["state"], "missing");
+        let tracked = log("README.md");
+        assert!(tracked["structuredContent"]["path_state"].is_null());
+        assert!(!tracked["structuredContent"]["commits"].as_array().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
