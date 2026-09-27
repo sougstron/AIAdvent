@@ -113,6 +113,31 @@ git fetch origin                                # refresh the tracking ref
 If the fast-forward is rejected, `main` has diverged: report it and ask the
 human whether to merge. Do not force.
 
+### 5b. Advance the *local* `main` too
+
+The human runs `ask` from `~/Github/tests/homework`, and its git tools read
+that checkout's own `main`. kanban (`land: worktree`) copies landed files into
+it but never moves the ref, so `tree/task-N` shows up as untracked and
+`git_log -- tree/task-N/src` says «нет коммитов» even though `origin/main` has
+everything (TASK-097: local `main` was stuck at TASK-087 while task-18..20
+were landed).
+
+Move it only when that checkout's files are already byte-identical to the
+target — then only the ref and the index change, no file on disk:
+
+```sh
+wt=~/Github/tests/homework; target=$(git rev-parse origin/main)
+export GIT_INDEX_FILE=$(mktemp)
+git -C $wt read-tree $target && git -C $wt update-index -q --refresh
+git -C $wt diff-files --quiet && [ -z "$(git -C $wt ls-files -o --exclude-standard)" ] && echo identical
+unset GIT_INDEX_FILE
+# only if it printed "identical":
+git -C $wt update-ref refs/heads/main $target $(git -C $wt rev-parse main) && git -C $wt reset -q
+```
+
+If the files differ, leave it and report which ones. `push_all.sh` does this
+step for you.
+
 ### 6. Verify against the remote, not against the push output
 
 ```sh
@@ -161,7 +186,7 @@ Print URLs the human can click, derived from `git remote get-url origin`:
 
 ## Helper
 
-`push_all.sh` in this folder does steps 1–6 in one go and refuses to claim
+`push_all.sh` in this folder does steps 1–6 (including 5b) in one go and refuses to claim
 success unless the verification in step 6 passes.
 
 ```sh
