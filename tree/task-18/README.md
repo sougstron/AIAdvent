@@ -2195,6 +2195,10 @@ open-meteo обновляет «текущую погоду» раз в 15 ми�
   расписания, хранится в базе), `/help`.
 * `409` от `getUpdates` значит, что тот же токен опрашивает другой процесс:
   демон пишет это в журнал один раз и продолжает отправлять уведомления.
+* Режим «только отправка» (`--telegram-send-only`): демон вообще не зовёт
+  `getUpdates`, а сводки и напоминания шлёт в `--telegram-chat`. Нужен,
+  когда токен уже опрашивает другой бот — свой опрос отбирал бы у него
+  апдейты. Писать агенту тогда можно только через MCP/CLI (см. ниже).
 
 ### Флаги
 
@@ -2205,6 +2209,7 @@ open-meteo обновляет «текущую погоду» раз в 15 ми�
 | `--sched-port N` | | порт MCP (8766) |
 | `--telegram-token` | `TELEGRAM_BOT_TOKEN` | без него демон работает без Telegram |
 | `--telegram-chat ID` | `TELEGRAM_CHAT_ID` | владелец без `/start` |
+| `--telegram-send-only` | `TELEGRAM_SEND_ONLY=true` | не опрашивать `getUpdates`, только отправлять (нужен `--telegram-chat`) |
 | `--sched-proxy URL` | `ASK_SCHED_PROXY` | HTTP-прокси для погоды и Telegram (модель ходит напрямую) |
 | `--verify-scheduler` | | причинная проверка, см. ниже |
 
@@ -2247,9 +2252,9 @@ Scheduler: Confirmed — расписание исполняется, данны
 | --- | --- |
 | контейнер | CT **101** `ask-agent`, Debian 13, 1 ядро, 512 МБ, `onboot: 0` (с хостом сам не стартует) |
 | сервис | `ask-scheduler.service` (пользователь `ask`, `Restart=always`) |
-| бинарник | `/usr/local/bin/ask` — собран в Debian (сборка на CachyOS помечена x86-64-v4 и на Ryzen 6800U не запускается) |
+| бинарник | `/usr/local/bin/ask` — собран в Debian (сборка на CachyOS помечена x86-64-v4 и на Ryzen 6800U не запускается); на хосте: `cargo vendor` локально + `docker run --security-opt seccomp=unconfined --security-opt apparmor=unconfined rust:1-trixie cargo build --release --offline` (без этих опций rustc в контейнере не запускается, сеть cargo там падает) |
 | ключ модели | `/home/ask/.ask6/auth.json` (0600): ключ z.ai Coding Plan из omp, `base_url` coding-плана |
-| токен бота, прокси | `/etc/ask-scheduler/env` (0600, root) |
+| токен бота, чат, прокси | `/etc/ask-scheduler/env` (0600, root): `TELEGRAM_CHAT_ID=7049385224`, `TELEGRAM_SEND_ONLY=true` — токен уже опрашивает `multica-tg-bot` на хосте, поэтому только отправка |
 | база | `/home/ask/.ask6/scheduler.db` |
 
 Напрямую из CT недоступны Telegram и open-meteo, поэтому их запросы идут
@@ -2258,6 +2263,7 @@ z.ai — напрямую.
 
 ```sh
 ssh root@192.168.0.128 'pct exec 101 -- journalctl -u ask-scheduler -f -o cat'   # журнал
+ssh root@192.168.0.128 'pct exec 101 -- su ask -s /bin/sh -c "cd && /usr/local/bin/ask --mcp http://127.0.0.1:8766/mcp \"напомни через минуту выпить чай\""'  # задание агенту
 ssh root@192.168.0.128 'pct stop 101'                                              # выключить всё
 ssh root@192.168.0.128 'pct exec 101 -- systemctl disable --now ask-scheduler'     # только сервис
 ```

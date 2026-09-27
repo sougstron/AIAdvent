@@ -909,6 +909,8 @@ pub struct DaemonOpts {
     pub settings: Settings,
     pub telegram_token: Option<String>,
     pub owner: Option<i64>,
+    /// Never poll `getUpdates`: notifications only, to `owner`.
+    pub send_only: bool,
     /// HTTP proxy for weather and Telegram (see [`set_proxy`]).
     pub proxy: Option<String>,
 }
@@ -941,6 +943,9 @@ pub fn run_daemon(opts: DaemonOpts) -> Res<()> {
     if let Some(chat) = opts.owner {
         store.set("tg_owner", &chat.to_string())?;
     }
+    if opts.send_only && opts.telegram_token.is_some() && opts.owner.is_none() {
+        return Err("--telegram-send-only needs --telegram-chat (there is no /start to bind a chat)".into());
+    }
     let server = Server::new(store.clone(), false);
     let url = server.spawn(opts.port)?;
     let ep = Endpoint::for_model(&opts.settings.model)?;
@@ -949,7 +954,11 @@ pub fn run_daemon(opts: DaemonOpts) -> Res<()> {
         opts.db.display(),
         opts.settings.model,
         ep.base_url,
-        if opts.telegram_token.is_some() { "да" } else { "нет" },
+        match (&opts.telegram_token, opts.send_only) {
+            (None, _) => "нет",
+            (Some(_), true) => "только отправка",
+            (Some(_), false) => "да",
+        },
         opts.proxy.as_deref().unwrap_or("нет")
     ));
     for j in store.jobs(true)? {
@@ -992,8 +1001,8 @@ pub fn run_daemon(opts: DaemonOpts) -> Res<()> {
     });
 
     match tg {
-        Some(tg) => telegram_loop(&tg, &store, &agent),
-        None => loop {
+        Some(tg) if !opts.send_only => telegram_loop(&tg, &store, &agent),
+        _ => loop {
             std::thread::sleep(Duration::from_secs(3600));
         },
     }

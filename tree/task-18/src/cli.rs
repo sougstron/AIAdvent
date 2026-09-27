@@ -262,6 +262,12 @@ pub struct Cli {
     #[arg(long, env = "TELEGRAM_CHAT_ID", value_name = "ID")]
     pub telegram_chat: Option<i64>,
 
+    /// Only send to `--telegram-chat`, never call `getUpdates` — for a bot
+    /// token that another process already polls (polling it here would
+    /// steal that process's updates). Incoming chat is off.
+    #[arg(long, env = "TELEGRAM_SEND_ONLY")]
+    pub telegram_send_only: bool,
+
     /// HTTP proxy for the scheduler's weather and Telegram requests (the
     /// model endpoint stays direct), e.g. `http://192.168.0.128:8118`.
     #[arg(long, env = "ASK_SCHED_PROXY", value_name = "URL")]
@@ -706,6 +712,7 @@ pub fn run() -> Res<()> {
             settings: cli.to_settings()?,
             telegram_token: cli.telegram_token.clone().filter(|t| !t.trim().is_empty()),
             owner: cli.telegram_chat,
+            send_only: cli.telegram_send_only,
             proxy: cli.sched_proxy.clone().filter(|p| !p.trim().is_empty()),
         });
     }
