@@ -659,7 +659,7 @@ impl Agent {
                 &settings,
                 system.trim(),
                 messages,
-                &mut tb.conn,
+                &mut *tb,
                 &functions,
                 &mut |_| {},
             )?;

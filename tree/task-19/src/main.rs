@@ -25,6 +25,7 @@ mod session;
 mod strategy;
 mod todo;
 mod tokens;
+mod toolchain;
 mod tui;
 mod verify;
 
