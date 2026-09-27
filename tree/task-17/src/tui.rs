@@ -191,6 +191,9 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     let mut app = App::new(agent, settings, loaded);
+    // Задача 17: свой git MCP-сервер поднимается вместе с чатом на репозиторий
+    // текущей папки, чтобы «глянь, что там в гите» работало без настройки.
+    app.cmd_mcp("git");
     if let Some(msg) = boot {
         app.start_keyless(&msg);
     } else {
@@ -1158,6 +1161,7 @@ impl App {
             "stop" => self.cmd_stop(rest),
             "verify" => self.cmd_verify(rest, terminal),
             "personas" => self.cmd_personas(rest, terminal),
+            "mcp" => self.cmd_mcp(rest),
             "help" => self.entries.push(Entry::Info(HELP.to_string())),
             "quit" | "exit" => self.quit = true,
             "" => {}
@@ -3180,6 +3184,86 @@ impl App {
         }
     }
 
+    fn take_mcp_steps(&mut self) -> Vec<crate::mcp_agent::ToolStep> {
+        match self.agent.mcp().map(|tb| tb.lock()) {
+            Some(Ok(mut tb)) => tb.take_log(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One info line per MCP `tools/call` the model made during the turn:
+    /// the proof in the transcript that the answer went through the tool.
+    fn show_mcp_steps(&mut self) {
+        for step in self.take_mcp_steps() {
+            self.entries.push(Entry::Info(format!(
+                "MCP → {} {}  ← {}{}",
+                step.name,
+                step.args,
+                if step.is_error { "ERROR " } else { "" },
+                crate::mcp_agent::preview(&step.result)
+            )));
+        }
+    }
+
+    /// `/mcp` — which MCP server the chat's tools come from.
+    /// `show` (default), `off`, `git [path]` (own git server, cwd by
+    /// default), or an `http(s)://…` URL of any Streamable HTTP server.
+    fn cmd_mcp(&mut self, rest: &str) {
+        let rest = rest.trim();
+        let (verb, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let attach = match verb {
+            "" | "show" => {
+                let text = match self.agent.mcp().map(|tb| tb.lock()) {
+                    Some(Ok(tb)) => {
+                        let mut lines = vec![format!(
+                            "MCP: {} {} — {}",
+                            tb.conn.server_name, tb.conn.server_version, tb.label
+                        )];
+                        for t in &tb.tools {
+                            lines.push(format!("  {}({})  {}", t.name, t.params.join(", "), t.description));
+                        }
+                        lines.push("Спросите обычным текстом, например: «глянь, что там в гите». /mcp off — выключить.".into());
+                        lines.join("\n")
+                    }
+                    _ => "MCP: off — /mcp git [путь] или /mcp <url>".into(),
+                };
+                self.entries.push(Entry::Info(text));
+                return;
+            }
+            "off" => {
+                self.agent.set_mcp(None);
+                self.status = "MCP off — chat answers without tools".into();
+                return;
+            }
+            "git" => {
+                let repo = if arg.trim().is_empty() {
+                    self.agent.cwd().to_path_buf()
+                } else {
+                    std::path::PathBuf::from(arg.trim())
+                };
+                crate::mcp_agent::Toolbox::local_git(&repo)
+            }
+            url if url.starts_with("http://") || url.starts_with("https://") => {
+                crate::mcp_agent::Toolbox::connect(url, url.to_string())
+            }
+            other => {
+                self.status = format!("unknown /mcp {other} — /mcp [show|off|git [path]|<url>]");
+                return;
+            }
+        };
+        match attach {
+            Ok(tb) => {
+                self.entries.push(Entry::Info(format!(
+                    "MCP: {} — инструменты: {}",
+                    tb.label,
+                    tb.tool_names()
+                )));
+                self.agent.set_mcp(Some(std::sync::Arc::new(std::sync::Mutex::new(tb))));
+            }
+            Err(e) => self.status = format!("MCP not attached: {e}"),
+        }
+    }
+
     fn send_message(&mut self, question: String, terminal: &mut DefaultTerminal) {
         self.send_turn(question, None, terminal);
     }
@@ -3194,6 +3278,8 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) {
         let invariant_query = question.clone();
+        // Calls left over from a turn cancelled with Esc belong to that turn.
+        self.take_mcp_steps();
         self.session.push_user(question.clone());
         match echo {
             Some(text) => self.entries.push(Entry::Info(text)),
@@ -3243,6 +3329,7 @@ impl App {
                     agent.complete(&attempt)
                 })
             });
+            self.show_mcp_steps();
             match result {
                 Some(Ok(result)) => {
                     let outcome = match result.decision {
@@ -3285,12 +3372,22 @@ impl App {
         // object aren't valid JSON until the last token, so there's nothing
         // meaningful to render live, and `render_json_reply` needs the whole
         // body to flatten anyway.
-        if self.settings.json_mode.enabled {
+        //
+        // With MCP tools attached the turn is a loop of whole completions
+        // (tool_calls → tools/call → role:tool → …), so it takes the same
+        // blocking path; the calls show up as info lines before the answer.
+        if self.settings.json_mode.enabled || self.agent.mcp().is_some() {
             let agent = self.prepared_agent();
             let hist = history.clone();
-            let result = self.with_spinner(terminal, "model is thinking", move || {
+            let label = if agent.uses_mcp() {
+                "model is thinking (MCP tools on)"
+            } else {
+                "model is thinking"
+            };
+            let result = self.with_spinner(terminal, label, move || {
                 agent.complete_outcome(&hist)
             });
+            self.show_mcp_steps();
             match result {
                 Some(Ok(outcome)) => self.finish_reply(outcome, terminal),
                 Some(Err(e)) => {
@@ -4387,6 +4484,7 @@ const HELP: &str = "\
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
+/mcp [show|off|git [path]|<url>]  MCP tools the chat may call (own git server on by default)
 /checkpoint [name]        mark the current point so branches can fork from it
 /branch [show|new <name>|switch <name|n>|rename <n> <new>|delete <n>]  conversation branches
 /settings                 open the settings panel (Tab on an empty input)
@@ -4706,6 +4804,28 @@ fn move_cursor_line(lines: &[(usize, String)], cursor: usize, delta: i32) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_command_attaches_git_tools_and_turns_them_off() {
+        let dir = std::env::temp_dir().join(format!("ask-tui-mcp-{}", std::process::id()));
+        crate::mcp_server::fixture_repo(&dir, "chore: tui mcp", "Eve <eve@example.com>").unwrap();
+        let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        app.cmd_mcp(&format!("git {}", dir.display()));
+        assert!(app.agent.uses_mcp(), "status: {}", app.status);
+        assert!(app.prepared_agent().mcp().is_some(), "turn agents share the connection");
+        app.cmd_mcp("show");
+        match app.entries.last() {
+            Some(Entry::Info(t)) => assert!(t.contains("git_log(") && t.contains("git_status(")),
+            _ => panic!("no /mcp listing"),
+        }
+        app.settings.json_mode.enabled = true;
+        assert!(!app.prepared_agent().uses_mcp(), "JSON mode keeps its own answer shape");
+        app.cmd_mcp("off");
+        assert!(app.agent.mcp().is_none());
+        app.cmd_mcp("nonsense");
+        assert!(app.status.starts_with("unknown /mcp"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn token_meters_start_as_estimates_and_name_all_four_stats() {
