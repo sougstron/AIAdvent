@@ -1,0 +1,22 @@
+[package]
+name = "ask"
+version = "0.5.0"
+edition = "2021"
+description = "рабочий агент — чат-TUI поверх z.ai"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+crossterm = "0.29.0"
+# default features drag in reqwest+tokio+aws-lc-sys for remote $ref resolution;
+# our schemas are local, so validation-only is enough.
+jsonschema = { version = "0.52.1", default-features = false }
+
+[profile.release]
+strip = true
+
+# standalone snapshot: empty [workspace] detaches this copy from the repo-root workspace
+[workspace]
