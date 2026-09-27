@@ -180,6 +180,7 @@ pub const ROOT: &[Node] = &[
             leaf("show"),
             leaf("off"),
             lit("git", "[repo path]", &[free("")]),
+            lit("pipeline", "[search dir]", &[free("")]),
             free("http://…/mcp"),
         ],
     ),
@@ -192,6 +193,13 @@ pub const ROOT: &[Node] = &[
     },
     leaf("new"),
     lit("personas", "[cast:] question", &[free("")]),
+    Node {
+        token: "pipeline",
+        hint: "[wiki] query [> file.md]",
+        alts: &["пайплайн"],
+        next: &[leaf("wiki"), free("query")],
+        sources: &[],
+    },
     Node {
         token: "todo",
         hint: "command",
@@ -545,6 +553,15 @@ mod tests {
         assert_eq!(hint("/branch "), "command");
         // Точное совпадение литерала без пробела — путь уже пройден.
         assert_eq!(hint("/branch"), "command");
+    }
+
+    #[test]
+    fn pipeline_is_offered_at_root_and_under_mcp() {
+        let v = values();
+        assert_eq!(candidates("/pip", &v), vec!["pipeline"]);
+        assert_eq!(candidates("/pipeline ", &v), vec!["wiki"]);
+        assert_eq!(hint("/pipeline "), "[wiki] query [> file.md]");
+        assert_eq!(candidates("/mcp pi", &v), vec!["pipeline"]);
     }
 
     #[test]
