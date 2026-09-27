@@ -100,3 +100,9 @@ tree/task-19/target/*
 !tree/task-19/target/release/
 tree/task-19/target/release/*
 !tree/task-19/target/release/ask
+
+!tree/task-20/target/
+tree/task-20/target/*
+!tree/task-20/target/release/
+tree/task-20/target/release/*
+!tree/task-20/target/release/ask

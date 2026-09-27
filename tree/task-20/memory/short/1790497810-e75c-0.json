@@ -1,0 +1,17 @@
+{
+  "layer": "short",
+  "scope": "1790497810-e75c-0",
+  "records": [],
+  "dialog": [
+    {
+      "n": 1,
+      "role": "user",
+      "text": "Глянь, что там в гите"
+    },
+    {
+      "n": 2,
+      "role": "assistant",
+      "text": "Состояние репозитория:\n\n**Ветка:** `main`, отстаёт от `origin/main` на 193 коммита.\n\n**Незакоммиченное:**\n- Изменены: `.gitignore`, `AGENTS.md`, `docs/CurrentTask.md`\n- Небходимо добавить (untracked): папки `tree/task-6` … `tree/task-17` (весь снапшот-дерево задач) и `.claude/`\n\n**Последние коммиты (все — Evgeniy Sigitov):**\n| Хэш | Дата | Сообщение |\n|---|---|---|\n| f0c59ed | 06.09 18:55 | kanban: live snapshot before TASK-023 |\n| 640488d | 06.09 18:54 | kanban: land TASK-023 |\n| 4bd9ee7 | 06.09 18:50 | kanban: live snapshot before TASK-023 |\n| 2b1b8c1 | 06.09 18:48 | kanban: land TASK-022 |\n| 0b7f377 | 06.09 18:48 | task-5: Model Ladder — один запрос на слабой, средней и сильной модели |\n| 367ecf7 | 06.09 14:03 | kanban: live snapshot before TASK-022 |\n| f222af7 | 05.09 10:14 | kanban: land TASK-021 |\n| baa84d7 | 05.09 10:14 | task-5: дословная копия task-4 … |\n| 678419e | 05.09 10:09 | kanban: live snapshot before TASK-021 |\n| 4091bc6 | 04.09 19:56 | kanban: land TASK-020 |\n\nЗаметно: локальная ветка сильно отстала от origin (193 коммита), а всё дерево `tree/` с задачами 6–17 ещё не закоммичено — стоит сделать коммит или как минимум `git pull` аккуратно. Хотите, посмотрю конкретный коммит подробнее?"
+    }
+  ]
+}
