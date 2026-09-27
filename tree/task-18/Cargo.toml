@@ -14,6 +14,7 @@ crossterm = "0.29.0"
 # default features drag in reqwest+tokio+aws-lc-sys for remote $ref resolution;
 # our schemas are local, so validation-only is enough.
 jsonschema = { version = "0.52.1", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 strip = true

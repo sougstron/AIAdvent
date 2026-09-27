@@ -30,6 +30,9 @@ const MAX_BODY: usize = 1 << 20;
 /// "the model guessed".
 pub type CallLog = Arc<Mutex<Vec<String>>>;
 
+/// A server's tool implementation: `(name, arguments)` → `(text, structuredContent)`.
+pub type ToolFn<'a> = &'a dyn Fn(&str, &Value) -> Res<(String, Value)>;
+
 #[derive(Clone)]
 pub struct Server {
     repo: PathBuf,
@@ -78,133 +81,17 @@ impl Server {
         Ok(format!("http://{addr}/mcp"))
     }
 
-    fn handle_connection(&self, mut stream: TcpStream) -> Res<()> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-        let mut line = String::new();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_string();
-        let path = parts.next().unwrap_or("").to_string();
-
-        let mut content_length = 0usize;
-        let mut origin: Option<String> = None;
-        loop {
-            let mut h = String::new();
-            if reader.read_line(&mut h).map_err(|e| e.to_string())? == 0 {
-                break;
-            }
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                match k.trim().to_ascii_lowercase().as_str() {
-                    "content-length" => content_length = v.trim().parse().unwrap_or(0),
-                    "origin" => origin = Some(v.trim().to_string()),
-                    _ => {}
-                }
-            }
-        }
-
-        // DNS-rebinding guard from the MCP transport spec: a browser page
-        // from another origin must not reach a localhost server.
-        if let Some(o) = &origin {
-            let local = ["http://127.0.0.1", "http://localhost"]
-                .iter()
-                .any(|p| o.starts_with(p));
-            if !local {
-                return respond(&mut stream, "403 Forbidden", None, "");
-            }
-        }
-        if path != "/mcp" && path != "/" {
-            return respond(&mut stream, "404 Not Found", None, "");
-        }
-        match method.as_str() {
-            "POST" => {}
-            // No server-initiated SSE stream; session teardown is a no-op.
-            "DELETE" => return respond(&mut stream, "200 OK", None, ""),
-            _ => return respond(&mut stream, "405 Method Not Allowed", None, ""),
-        }
-        if content_length > MAX_BODY {
-            return respond(&mut stream, "413 Payload Too Large", None, "");
-        }
-        let mut body = vec![0u8; content_length];
-        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
-
-        let msg: Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
-            Err(e) => {
-                let err = rpc_error(Value::Null, -32700, &format!("parse error: {e}"));
-                return respond(&mut stream, "400 Bad Request", Some(&err), "");
-            }
-        };
-        if self.verbose {
-            let m = msg["method"].as_str().unwrap_or("?");
-            match m {
-                "tools/call" => eprintln!(
-                    "[mcp-git] tools/call {} {}",
-                    msg["params"]["name"].as_str().unwrap_or("?"),
-                    msg["params"]["arguments"]
-                ),
-                _ => eprintln!("[mcp-git] {m}"),
-            }
-        }
-        let session = (msg["method"] == "initialize").then(|| format!("git-{}", std::process::id()));
-        match self.handle(&msg) {
-            Some(reply) => respond(&mut stream, "200 OK", Some(&reply), session.as_deref().unwrap_or("")),
-            // Notifications get no JSON-RPC reply.
-            None => respond(&mut stream, "202 Accepted", None, ""),
-        }
+    fn handle_connection(&self, stream: TcpStream) -> Res<()> {
+        handle_connection(stream, "mcp-git", self.verbose, &|msg| self.handle(msg))
     }
 
     /// JSON-RPC dispatch. `None` for notifications.
     pub fn handle(&self, msg: &Value) -> Option<Value> {
-        let id = msg.get("id").cloned()?;
-        let method = msg["method"].as_str().unwrap_or("");
-        let params = &msg["params"];
-        Some(match method {
-            "initialize" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "ask-git-mcp", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": format!("Read-only access to the git repository at {}.", self.repo.display()),
-                },
-            }),
-            "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tool_specs()}}),
-            "tools/call" => {
-                let name = params["name"].as_str().unwrap_or("");
-                let args = match &params["arguments"] {
-                    Value::Null => json!({}),
-                    v => v.clone(),
-                };
-                if !tool_specs().iter().any(|t| t["name"] == name) {
-                    return Some(rpc_error(id, -32602, &format!("unknown tool: {name}")));
-                }
-                if let Ok(mut log) = self.calls.lock() {
-                    log.push(format!("{name} {args}"));
-                }
-                let result = match self.call(name, &args) {
-                    Ok((text, structured)) => json!({
-                        "content": [{"type": "text", "text": text}],
-                        "structuredContent": structured,
-                        "isError": false,
-                    }),
-                    Err(e) => json!({
-                        "content": [{"type": "text", "text": e}],
-                        "isError": true,
-                    }),
-                };
-                json!({"jsonrpc": "2.0", "id": id, "result": result})
-            }
-            other => rpc_error(id, -32601, &format!("method not found: {other}")),
-        })
+        let info = ServerInfo {
+            name: "ask-git-mcp",
+            instructions: format!("Read-only access to the git repository at {}.", self.repo.display()),
+        };
+        dispatch(msg, &info, &tool_specs(), &self.calls, &|name, args| self.call(name, args))
     }
 
     fn call(&self, name: &str, args: &Value) -> Res<(String, Value)> {
@@ -368,6 +255,159 @@ pub fn git(repo: &Path, args: &[&str]) -> Res<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Who answers `initialize`. Shared by every own MCP server in this binary
+/// (the git one here, the scheduler in `scheduler.rs`).
+pub struct ServerInfo {
+    pub name: &'static str,
+    pub instructions: String,
+}
+
+/// JSON-RPC dispatch common to the own MCP servers: `initialize`, `ping`,
+/// `tools/list` from `specs`, `tools/call` through `call` (logged in
+/// `calls`). A tool failure is an `isError` result, not a protocol error.
+/// `None` for notifications.
+pub fn dispatch(
+    msg: &Value,
+    info: &ServerInfo,
+    specs: &[Value],
+    calls: &CallLog,
+    call: ToolFn,
+) -> Option<Value> {
+    let id = msg.get("id").cloned()?;
+    let method = msg["method"].as_str().unwrap_or("");
+    let params = &msg["params"];
+    Some(match method {
+        "initialize" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": info.name, "version": env!("CARGO_PKG_VERSION")},
+                "instructions": info.instructions,
+            },
+        }),
+        "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+        "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": specs}}),
+        "tools/call" => {
+            let name = params["name"].as_str().unwrap_or("");
+            let args = match &params["arguments"] {
+                Value::Null => json!({}),
+                v => v.clone(),
+            };
+            if !specs.iter().any(|t| t["name"] == name) {
+                return Some(rpc_error(id, -32602, &format!("unknown tool: {name}")));
+            }
+            if let Ok(mut log) = calls.lock() {
+                log.push(format!("{name} {args}"));
+            }
+            let result = match call(name, &args) {
+                Ok((text, structured)) => json!({
+                    "content": [{"type": "text", "text": text}],
+                    "structuredContent": structured,
+                    "isError": false,
+                }),
+                Err(e) => json!({
+                    "content": [{"type": "text", "text": e}],
+                    "isError": true,
+                }),
+            };
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        }
+        other => rpc_error(id, -32601, &format!("method not found: {other}")),
+    })
+}
+
+/// One HTTP request of the Streamable HTTP transport: parse the POST, run
+/// `handle` on the JSON-RPC message, write the reply. `tag` prefixes the
+/// verbose request log.
+pub fn handle_connection(
+    mut stream: TcpStream,
+    tag: &str,
+    verbose: bool,
+    handle: &dyn Fn(&Value) -> Option<Value>,
+) -> Res<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+
+    let mut content_length = 0usize;
+    let mut origin: Option<String> = None;
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        let h = h.trim_end();
+        if h.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "content-length" => content_length = v.trim().parse().unwrap_or(0),
+                "origin" => origin = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    // DNS-rebinding guard from the MCP transport spec: a browser page
+    // from another origin must not reach a localhost server.
+    if let Some(o) = &origin {
+        let local = ["http://127.0.0.1", "http://localhost"]
+            .iter()
+            .any(|p| o.starts_with(p));
+        if !local {
+            return respond(&mut stream, "403 Forbidden", None, "");
+        }
+    }
+    if path != "/mcp" && path != "/" {
+        return respond(&mut stream, "404 Not Found", None, "");
+    }
+    match method.as_str() {
+        "POST" => {}
+        // No server-initiated SSE stream; session teardown is a no-op.
+        "DELETE" => return respond(&mut stream, "200 OK", None, ""),
+        _ => return respond(&mut stream, "405 Method Not Allowed", None, ""),
+    }
+    if content_length > MAX_BODY {
+        return respond(&mut stream, "413 Payload Too Large", None, "");
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+
+    let msg: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = rpc_error(Value::Null, -32700, &format!("parse error: {e}"));
+            return respond(&mut stream, "400 Bad Request", Some(&err), "");
+        }
+    };
+    if verbose {
+        let m = msg["method"].as_str().unwrap_or("?");
+        match m {
+            "tools/call" => eprintln!(
+                "[{tag}] tools/call {} {}",
+                msg["params"]["name"].as_str().unwrap_or("?"),
+                msg["params"]["arguments"]
+            ),
+            _ => eprintln!("[{tag}] {m}"),
+        }
+    }
+    let session = (msg["method"] == "initialize").then(|| format!("{tag}-{}", std::process::id()));
+    match handle(&msg) {
+        Some(reply) => respond(&mut stream, "200 OK", Some(&reply), session.as_deref().unwrap_or("")),
+        // Notifications get no JSON-RPC reply.
+        None => respond(&mut stream, "202 Accepted", None, ""),
+    }
 }
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
