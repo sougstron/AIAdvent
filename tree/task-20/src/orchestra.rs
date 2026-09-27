@@ -728,6 +728,26 @@ fn author_of(step: &ToolStep) -> Option<&str> {
     step.structured["commits"][0]["author"].as_str()
 }
 
+/// Why a `git_log{path}` came back empty, in words: the git server's
+/// `path_state` (task 20 fix) — a folder never committed on this branch is
+/// not "no commits" by accident, and the flows must say so.
+fn no_commits(step: &ToolStep) -> String {
+    let st = &step.structured["path_state"];
+    let branch = st["branch"].as_str().unwrap_or("?");
+    match st["state"].as_str() {
+        Some("untracked") => format!("не закоммичен на ветке {branch}"),
+        Some("ignored") => "в .gitignore — в git его нет".into(),
+        Some("missing") => "такого пути нет".into(),
+        _ => "нет коммитов".into(),
+    }
+}
+
+/// The file has no history at all (untracked / ignored), so it has no author
+/// either — an empty assignee is then the right answer, not a mistake.
+fn never_committed(step: &ToolStep) -> bool {
+    matches!(step.structured["path_state"]["state"].as_str(), Some("untracked" | "ignored"))
+}
+
 /// Who reviews a file that `author` changed, by the file's `git_log`: the
 /// most recent *other* author, or `author` when nobody else ever touched
 /// it. `None` when the log has no commits at all.
@@ -861,6 +881,16 @@ pub fn run_triage(
         let i = call(caller, lanes, &mut steps, emit, "git_log", json!({"path": file, "limit": 1}));
         authors.insert(file, author_of(&steps[i]).unwrap_or("").to_string());
     }
+    let orphans: Vec<&ToolStep> = steps.iter().filter(|s| s.name == "git_log" && never_committed(s)).collect();
+    if let Some(first) = orphans.first() {
+        emit(format!(
+            "внимание: у {} из {} файлов нет истории в git ({}) — авторов нет, задачи по ним заводятся без \
+             исполнителя. Закоммитьте их, и исполнителем станет автор последнего коммита файла",
+            orphans.len(),
+            authors.len(),
+            no_commits(first)
+        ));
+    }
     for (place, text) in &hits {
         call(
             caller,
@@ -953,7 +983,20 @@ pub fn run_review(
             let i = call(caller, lanes, &mut steps, emit, "git_log", a);
             match steps[i].structured["commits"][0]["hash"].as_str() {
                 Some(h) if !steps[i].is_error => h.to_string(),
-                _ => return Err(format!("git_log: нет коммитов — {}", one_line(&steps[i].result, 80))),
+                _ if never_committed(&steps[i]) => {
+                    let st = &steps[i].structured["path_state"];
+                    let p = req.path.as_deref().unwrap_or("");
+                    emit(format!(
+                        "итог: {p} {} ({} файлов вне git) — у этих файлов нет ни одного коммита, ревьюить нечего. \
+                         Ревью смотрит закоммиченную историю: закоммитьте папку (git add {p} && git commit) и \
+                         повторите /review in {p}; или /review без in — последний коммит всего репозитория; \
+                         по незакоммиченному коду работает /triage <что искать> in {p}",
+                        no_commits(&steps[i]),
+                        st["untracked_files"].as_u64().unwrap_or(0)
+                    ));
+                    return Err(format!("{p}: {}, истории нет", no_commits(&steps[i])));
+                }
+                _ => return Err(format!("git_log: нет коммитов — {}", one_line(&steps[i].result, 120))),
             }
         }
     };
@@ -1178,8 +1221,14 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                     Some(k) => format!("источник {source} из search (шаг {})", k + 1),
                     None => format!("источник «{source}» не из выдачи предыдущего search"),
                 };
+                let orphan = git.is_some_and(|k| never_committed(&steps[k])) && author.is_none() && assignee.is_empty();
                 let who = match (git, author) {
                     (Some(k), Some(a)) if a == assignee => format!("исполнитель {a} = автор файла по git_log (шаг {})", k + 1),
+                    (Some(k), None) if orphan => format!(
+                        "без исполнителя: файл {} по git_log (шаг {}), автора нет",
+                        no_commits(&steps[k]),
+                        k + 1
+                    ),
                     (Some(k), a) => format!(
                         "исполнитель «{}», а git_log (шаг {}) говорит «{}»",
                         assignee,
@@ -1190,7 +1239,7 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                 };
                 out.push(Check {
                     soft: false,
-                    ok: from.is_some() && author.is_some_and(|a| a == assignee),
+                    ok: from.is_some() && (orphan || author.is_some_and(|a| a == assignee)),
                     text: format!("шаг {n} issue_create {id}: {src}; {who}"),
                 });
             }
@@ -1417,7 +1466,7 @@ fn brief(step: &ToolStep) -> String {
             let head = s["commits"][0]["hash"].as_str().map(short_hash).unwrap_or("");
             match step.args["path"].as_str() {
                 Some(p) if n > 1 => format!("{p}: {n} комм., последний {}", author_of(step).unwrap_or("?")),
-                Some(p) => format!("{p} → {}", author_of(step).unwrap_or("нет коммитов")),
+                Some(p) => format!("{p} → {}", author_of(step).map(String::from).unwrap_or_else(|| no_commits(step))),
                 None => format!("{head} {} ({n} комм.)", author_of(step).unwrap_or("нет коммитов")),
             }
         }
@@ -2193,6 +2242,45 @@ mod tests {
         assert!(!tamper(&|t| {
             t.remove(1);
         }));
+    }
+
+    /// The real-checkout case: a folder on disk that was never committed on
+    /// the current branch. Review stops and says why; triage files tasks
+    /// without an assignee and the audit accepts exactly that.
+    #[test]
+    fn flows_explain_a_folder_that_was_never_committed() {
+        let base = TempDir(std::env::temp_dir().join(format!("ask-orchestra-wip-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&base.0);
+        let repo = base.0.join("repo");
+        fixture_repo(&repo, "W").unwrap();
+        std::fs::create_dir_all(repo.join("wip")).unwrap();
+        std::fs::write(repo.join("wip/new.rs"), "pub fn f() {}\n// TODO: новая фича\n").unwrap();
+        let rig = Rig::new(&repo, &base.0, "w").unwrap();
+        let mut tb = rig.tb;
+        let lanes = tb.lanes();
+
+        let mut seen = Vec::new();
+        let err = run_review(&mut tb, &ReviewRequest::new(None, Some("wip"), None), &lanes, &mut |l| seen.push(l))
+            .err()
+            .unwrap();
+        assert!(err.contains("не закоммичен на ветке main"), "{err}");
+        assert!(seen.iter().any(|l| l.starts_with("итог: wip не закоммичен") && l.contains("git add wip")), "{seen:#?}");
+        assert!(seen.iter().any(|l| l.contains("wip → не закоммичен на ветке main")), "{seen:#?}");
+        let missing = run_review(&mut tb, &ReviewRequest::new(None, Some("nope"), None), &[], &mut |_| {}).err().unwrap();
+        assert!(missing.contains("no commits match: nope does not exist"), "{missing}");
+
+        let mut seen = Vec::new();
+        let mut req = TriageRequest::new(None, Some("w.md"));
+        req.path = Some("wip".into());
+        let rep = run_triage(&mut tb, &req, &lanes, &mut |l| seen.push(l)).unwrap();
+        assert!(rep.ok(), "{seen:#?}");
+        assert_eq!(rep.steps[1].structured["path_state"]["state"], "untracked");
+        assert!(seen.iter().any(|l| l.starts_with("внимание: у 1 из 1 файлов нет истории")), "{seen:#?}");
+        assert!(seen.iter().any(|l| l.contains("без исполнителя: файл не закоммичен")), "{seen:#?}");
+        // An assignee invented for a file with no history is still caught.
+        let mut t: Vec<ToolStep> = rep.steps.iter().map(clone_step).collect();
+        t[2].args["assignee"] = json!("AdaW");
+        assert!(check_flow(&t).iter().any(|c| !c.ok));
     }
 
     #[test]
