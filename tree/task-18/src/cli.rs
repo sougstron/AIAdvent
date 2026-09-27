@@ -18,6 +18,7 @@ use crate::memory;
 use crate::profile;
 use crate::render;
 use crate::runtime::{BoxSpec, Runtime};
+use crate::scheduler;
 use crate::session;
 use crate::verify;
 
@@ -54,6 +55,9 @@ use crate::verify;
         ask --mcp-call git_log --mcp-args '{\"limit\":3}'   call one MCP tool directly, no model\n  \
         ask --mcp http://127.0.0.1:8765/mcp \"кто автор последнего коммита?\"   agent answers via MCP tools\n  \
         ask --verify-mcp                      prove the agent calls the MCP tool and uses its result\n  \
+        ask --scheduler                       24/7 scheduler: MCP server + jobs + Telegram (TELEGRAM_BOT_TOKEN)\n  \
+        ask --mcp http://127.0.0.1:8766/mcp \"напомни через минуту\"   agent over the scheduler MCP tools\n  \
+        ask --verify-scheduler                prove schedule / aggregate / reminder work through MCP\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -232,6 +236,49 @@ pub struct Cli {
     /// the same question without tools does not.
     #[arg(long)]
     pub verify_mcp: bool,
+
+    /// Run the scheduler daemon (task 18) in the foreground: MCP server
+    /// `ask-scheduler-mcp` on 127.0.0.1:`--sched-port`, the job loop, and —
+    /// with `TELEGRAM_BOT_TOKEN` set — the Telegram bot, where every message
+    /// goes to the agent with the scheduler's tools.
+    #[arg(long)]
+    pub scheduler: bool,
+
+    /// SQLite database of the scheduler (jobs, samples, notifications).
+    /// Default: `~/.ask6/scheduler.db`.
+    #[arg(long, value_name = "PATH")]
+    pub sched_db: Option<String>,
+
+    /// Port of the scheduler MCP server.
+    #[arg(long, value_name = "PORT", default_value_t = crate::scheduler::DEFAULT_PORT)]
+    pub sched_port: u16,
+
+    /// Telegram bot token for `--scheduler`.
+    #[arg(long, env = "TELEGRAM_BOT_TOKEN", hide_env_values = true, value_name = "TOKEN")]
+    pub telegram_token: Option<String>,
+
+    /// Telegram chat that receives notifications. Without it, the first
+    /// chat that sends /start is bound as the owner.
+    #[arg(long, env = "TELEGRAM_CHAT_ID", value_name = "ID")]
+    pub telegram_chat: Option<i64>,
+
+    /// Only send to `--telegram-chat`, never call `getUpdates` — for a bot
+    /// token that another process already polls (polling it here would
+    /// steal that process's updates). Incoming chat is off.
+    #[arg(long, env = "TELEGRAM_SEND_ONLY")]
+    pub telegram_send_only: bool,
+
+    /// HTTP proxy for the scheduler's weather and Telegram requests (the
+    /// model endpoint stays direct), e.g. `http://192.168.0.128:8118`.
+    #[arg(long, env = "ASK_SCHED_PROXY", value_name = "URL")]
+    pub sched_proxy: Option<String>,
+
+    /// Causal proof for task 18: the schedule on a fake clock (offline),
+    /// aggregate numbers that exist only in SQLite reached by the agent over
+    /// MCP (with a no-tools control), and a natural-language reminder that
+    /// becomes a job and fires when due.
+    #[arg(long)]
+    pub verify_scheduler: bool,
 
     /// Live proof for the task state machine: `machine` (legal transitions
     /// pass, illegal ones are refused — no network), `wire` (what the state
@@ -641,6 +688,33 @@ pub fn run() -> Res<()> {
         } else {
             Err("MCP tool use not confirmed".into())
         };
+    }
+
+    if cli.verify_scheduler {
+        let settings = cli.to_settings()?;
+        println!("проверяю планировщик на модели {}", settings.model);
+        return if scheduler::verify(&settings)? {
+            Ok(())
+        } else {
+            Err("scheduler not confirmed".into())
+        };
+    }
+
+    if cli.scheduler {
+        let db = match cli.sched_db.as_deref() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => std::path::PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?)
+                .join(".ask6/scheduler.db"),
+        };
+        return scheduler::run_daemon(scheduler::DaemonOpts {
+            db,
+            port: cli.sched_port,
+            settings: cli.to_settings()?,
+            telegram_token: cli.telegram_token.clone().filter(|t| !t.trim().is_empty()),
+            owner: cli.telegram_chat,
+            send_only: cli.telegram_send_only,
+            proxy: cli.sched_proxy.clone().filter(|p| !p.trim().is_empty()),
+        });
     }
 
     if let Some(url) = cli.mcp.as_deref() {

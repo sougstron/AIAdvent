@@ -172,6 +172,18 @@ state machine with their corner cases and real verify output, and the live lever
 top_k unsupported). It started as a verbatim copy of `tree/task-10/`, which
 came from `tree/task-9/` and, before that, `tree/task-8/` / `tree/task-7/`
 (task 7 already met the requirements, so it stayed frozen); `tree/task-5/`
+Task 18 added `scheduler.rs`: a second own MCP server (`ask-scheduler-mcp`,
+reminders / periodic weather collection / periodic summaries / the
+`weather_summary` aggregate, SQLite storage) and `ask --scheduler`, a 24/7
+daemon (job loop + Telegram bot, model via the z.ai Coding Plan endpoint).
+It runs in CT 101 `ask-agent` on the home Proxmox (`ask-scheduler.service`,
+`onboot: 0`). Two deploy traps: a release build from this CachyOS machine is
+tagged x86-64-v4 and refuses to start on the server — build it inside Debian;
+and from the CT Telegram and open-meteo are only reachable through the host's
+HTTP proxy `192.168.0.128:8118` (`ASK_SCHED_PROXY`). Proof:
+`ask --verify-scheduler` (fake-clock schedule, random aggregate with a
+no-tools control, natural-language reminder that must fire when due).
+
 before that was the *Model Ladder* state. Everything below in this file describes the older TUI that still
 lives in the repo root `src/`.
 

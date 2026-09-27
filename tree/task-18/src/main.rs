@@ -19,6 +19,7 @@ mod profile;
 mod render;
 mod run;
 mod runtime;
+mod scheduler;
 mod pipeline;
 mod session;
 mod strategy;
