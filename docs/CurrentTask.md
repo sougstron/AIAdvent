@@ -7,17 +7,24 @@
 - **Task 20** — путь: `tree/task-20/`
 - Задача 20: **оркестрация MCP**. `src/orchestra.rs` — ещё два своих
   MCP-сервера: `ask-tracker-mcp` (задачи в SQLite `~/.ask6/tracker.db`:
-  `issue_create` / `issue_list` / `issue_close`) и `ask-notify-mcp`
-  (уведомления команды в `~/.ask6/notify/outbox.jsonl`). Чат поднимает все
-  четыре (git, pipeline, tracker, notify); `Toolbox` маршрутизирует каждый
-  вызов на сервер-владелец (при коллизии имён — `pipeline__search`). Флоу
-  «триаж TODO»: search → git_log по файлу → issue_create → issue_list →
-  saveToFile → notify_send; `/triage` / `ask --triage` — автоматически,
-  обычным текстом — собирает модель. Вызовы рисуются дорожками серверов
-  (живьём во время хода) с аудитом маршрутов и порядка по данным.
-  `ask --orchestra-demo DIR` — демо-репо; `ask --verify-orchestra
-  offline|live|all` — обе Confirmed на `glm-5.3-flash`. Подробности —
-  раздел «Оркестрация MCP» в `tree/task-20/README.md`.
+  `issue_create` / `issue_list` / `issue_close`, метки прогонов) и
+  `ask-notify-mcp` (уведомления команды в `~/.ask6/notify/outbox.jsonl`).
+  Чат поднимает все четыре (git, pipeline, tracker, notify) на **корне
+  git-репозитория** текущей папки (запуск из `target/release` видит весь
+  проект); `Toolbox` маршрутизирует каждый вызов на сервер-владелец (при
+  коллизии имён — `pipeline__search`). Два флоу на настоящих данных:
+  `/review [коммит] [in папка]` — git_log → git_show → git_log по каждому
+  файлу → issue_create на ревьюера (последний *другой* автор файла) →
+  issue_list → saveToFile → notify_send; `/triage [что искать] [in папка]`
+  — search{path} → git_log → issue_create → issue_list → saveToFile →
+  notify_send (метки `TODO:` — только в комментариях; в этом репо их нет, и
+  флоу так и говорит). Обычным текстом те же цепочки собирает модель.
+  Вызовы рисуются дорожками серверов (живьём во время хода) с аудитом
+  маршрутов и порядка по данным. `ask --orchestra-demo DIR` — демо-репо с
+  тремя авторами; `ask --verify-orchestra offline|live|all` — обе
+  Confirmed на `glm-5.3-flash` (триаж и ревью, 7 контролей). Подробности и
+  проверенные фразы для чата — раздел «Оркестрация MCP» в
+  `tree/task-20/README.md`.
 - Задача 19: **композиция MCP-инструментов**. `src/toolchain.rs` — третий
   свой MCP-сервер `ask-pipeline-mcp` (127.0.0.1:8767): `search` (файлы или
   Википедия) → `summarize` (детерминированная сводка) → `saveToFile`

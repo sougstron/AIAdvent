@@ -203,8 +203,15 @@ pub const ROOT: &[Node] = &[
         sources: &[],
     },
     Node {
+        token: "review",
+        hint: "[rev] [in dir] [> file.md]",
+        alts: &["ревью"],
+        next: &[leaf("HEAD"), leaf("in")],
+        sources: &[],
+    },
+    Node {
         token: "triage",
-        hint: "[marker] [> file.md]",
+        hint: "[marker] [in dir] [> file.md]",
         alts: &["триаж"],
         next: &[free("TODO:")],
         sources: &[],

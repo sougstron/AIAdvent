@@ -167,9 +167,32 @@ impl Server {
         let rev = no_dash(rev, "rev")?;
         let out = git(
             &self.repo,
-            &["show", "--stat", "--format=commit %H%nAuthor: %an <%ae>%nDate:   %aI%n%n%B", rev, "--"],
+            &["show", "--stat=300,250", "--first-parent", "--format=commit %H%nAuthor: %an <%ae>%nDate:   %aI%n%n%B", rev, "--"],
         )?;
-        Ok((out.trim_end().to_string(), json!({"rev": rev, "show": out.trim_end()})))
+        // Task 20: the same commit once more, machine-readable — the files a
+        // review flow walks over and the author a review must not go back to.
+        // `--first-parent` so a merge lists what it brought in, not nothing.
+        let raw = git(
+            &self.repo,
+            &["show", "--numstat", "--first-parent", "--format=%H%x1f%an%x1f%s", rev, "--"],
+        )?;
+        let mut lines = raw.lines();
+        let head: Vec<&str> = lines.next().unwrap_or("").split('\u{1f}').collect();
+        let files: Vec<Value> = lines
+            .filter_map(|l| {
+                let mut f = l.splitn(3, '\t');
+                let (a, d, path) = (f.next()?, f.next()?, f.next()?);
+                let binary = a == "-" || d == "-";
+                Some(json!({"path": path, "added": a.parse::<u64>().unwrap_or(0),
+                            "deleted": d.parse::<u64>().unwrap_or(0), "binary": binary}))
+            })
+            .collect();
+        Ok((
+            out.trim_end().to_string(),
+            json!({"rev": rev, "hash": head.first().copied().unwrap_or(""),
+                   "author": head.get(1).copied().unwrap_or(""), "subject": head.get(2).copied().unwrap_or(""),
+                   "files": files, "show": out.trim_end()}),
+        ))
     }
 
     fn git_status(&self) -> Res<(String, Value)> {
@@ -190,6 +213,18 @@ impl Server {
     }
 }
 
+/// Task 20: the root of the git work tree `dir` is in, or `dir` itself when
+/// it is not in one. The chat's servers start there, so running `ask` from
+/// `target/release` still searches and logs the whole project, and every
+/// `path` a server returns is relative to the same place.
+pub fn toplevel(dir: &Path) -> PathBuf {
+    git(dir, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| dir.to_path_buf())
+}
+
 /// What `tools/list` returns: name, description and JSON Schema of the input.
 pub fn tool_specs() -> Vec<Value> {
     vec![
@@ -208,7 +243,7 @@ pub fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "git_show",
-            "description": "Show one commit: full hash, author, date, the whole commit message and the list of changed files.",
+            "description": "Show one commit: full hash, author, date, the whole commit message and the list of changed files (with added/deleted line counts; binary files marked).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -531,6 +566,9 @@ mod tests {
 
         let r = conn.call_tool("git_show", json!({"rev": "HEAD~2"})).unwrap();
         assert!(r.text.contains("initial commit") && r.text.contains("README.md"), "{}", r.text);
+        assert_eq!(r.structured["files"][0]["path"], "README.md");
+        assert_eq!(r.structured["files"][0]["binary"], false);
+        assert!(r.structured["hash"].as_str().unwrap().len() == 40 && r.structured["author"].is_string());
 
         let r = conn.call_tool("git_status", json!({})).unwrap();
         assert!(r.text.contains("branch: main") && r.text.contains("clean"), "{}", r.text);

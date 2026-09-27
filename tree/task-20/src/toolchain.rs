@@ -207,7 +207,8 @@ impl Server {
             "files" => {
                 let limit = limit_arg(args, 20, 50)?;
                 let exact = args["case_sensitive"].as_bool().unwrap_or(false);
-                search_files(&self.root, &self.out, query, limit, exact)?
+                let start = self.scope(args)?;
+                search_files(&self.root, &start, &self.out, query, limit, exact)?
             }
             "wikipedia" => {
                 let limit = limit_arg(args, 3, 10)?;
@@ -251,6 +252,25 @@ impl Server {
             json!({"id": id, "tool": "search", "query": query, "source": source, "count": hits.len(),
                    "truncated": truncated, "hits": hits, "chars": data.chars().count(), "digest": d}),
         ))
+    }
+
+    /// Task 20: `path` narrows a files search to one folder or file under the
+    /// root (the repository), e.g. the code of one task instead of every
+    /// snapshot; hits stay relative to the root so `git_log{path}` takes them
+    /// as they are. Nothing outside the root is reachable.
+    fn scope(&self, args: &Value) -> Res<PathBuf> {
+        let Some(p) = args["path"].as_str().map(str::trim).filter(|p| !p.is_empty() && *p != ".") else {
+            return Ok(self.root.clone());
+        };
+        let full = self
+            .root
+            .join(p.trim_start_matches("./"))
+            .canonicalize()
+            .map_err(|_| format!("`path` {p:?}: no such folder or file under {}", self.root.display()))?;
+        if !full.starts_with(&self.root) {
+            return Err(format!("`path` {p:?} is outside {}", self.root.display()));
+        }
+        Ok(full)
     }
 
     fn summarize(&self, args: &Value) -> Res<(String, Value)> {
@@ -349,6 +369,7 @@ pub fn tool_specs() -> Vec<Value> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Max hits: files default 20 (≤50), wikipedia default 3 (≤10)."},
                     "lang": {"type": "string", "description": "Wikipedia language code (default ru)."},
                     "case_sensitive": {"type": "boolean", "description": "files only: match the words case-sensitively (default false), e.g. to find `TODO:` markers but not the word todo."},
+                    "path": {"type": "string", "description": "files only: search just this folder or file, relative to the root (e.g. tree/task-20/src). Hits keep paths relative to the root."},
                 },
                 "required": ["query"],
                 "additionalProperties": false,
@@ -386,12 +407,14 @@ pub fn tool_specs() -> Vec<Value> {
 
 // ---------------------------------------------------------------- search
 
-/// Lines of text files under `root` containing every word of `query`
-/// (case-insensitive unless `exact`), as `(path:line, text)`. Hidden entries, `target`,
-/// `node_modules`, the output folder and binary / large files are skipped.
-/// Returns the hits and whether `limit` cut the scan short.
+/// Lines of text files under `start` (a folder or one file inside `root`)
+/// containing every word of `query` (case-insensitive unless `exact`), as
+/// `(path:line, text)` with the path relative to `root`. Hidden entries,
+/// `target`, `node_modules`, the output folder and binary / large files are
+/// skipped. Returns the hits and whether `limit` cut the scan short.
 pub fn search_files(
     root: &Path,
+    start: &Path,
     skip: &Path,
     query: &str,
     limit: usize,
@@ -400,11 +423,15 @@ pub fn search_files(
     let fold = |s: &str| if exact { s.to_string() } else { s.to_lowercase() };
     let words: Vec<String> = query.split_whitespace().map(fold).collect();
     let mut hits = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![start.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
-            Err(_) => continue,
+        let mut entries: Vec<PathBuf> = if dir.is_file() {
+            vec![dir.clone()]
+        } else {
+            match std::fs::read_dir(&dir) {
+                Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+                Err(_) => continue,
+            }
         };
         entries.sort();
         let mut subdirs = Vec::new();
@@ -1092,6 +1119,14 @@ mod tests {
         assert_eq!(r["structuredContent"]["truncated"], true);
         let r = call(&s, "search", json!({"query": "x", "source": "ftp"}));
         assert_eq!(r["isError"], true);
+        // `path` narrows to a folder or one file; hits stay relative to the root.
+        let r = call(&s, "search", json!({"query": "квазар", "path": "notes"}));
+        let hits = r["structuredContent"]["hits"].as_array().unwrap().clone();
+        assert!(!hits.is_empty() && hits.iter().all(|h| h["where"].as_str().unwrap().starts_with("notes/")), "{hits:?}");
+        let r = call(&s, "search", json!({"query": "квазар", "path": "./notes/obs.txt"}));
+        assert_eq!(r["structuredContent"]["hits"][0]["where"], "notes/obs.txt:1");
+        assert_eq!(call(&s, "search", json!({"query": "x", "path": "../"}))["isError"], true);
+        assert_eq!(call(&s, "search", json!({"query": "x", "path": "nope"}))["isError"], true);
     }
 
     #[test]

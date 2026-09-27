@@ -45,6 +45,21 @@ pub const TRACKER_TOOLS: [&str; 3] = ["issue_create", "issue_list", "issue_close
 pub const NOTIFY_TOOLS: [&str; 2] = ["notify_send", "notify_list"];
 /// The triage flow, in the order its data dependencies force.
 pub const FLOW: [&str; 6] = ["search", "git_log", "issue_create", "issue_list", "saveToFile", "notify_send"];
+/// The commit review flow: which commit, what it changed, who reviews each file.
+pub const REVIEW_FLOW: [&str; 6] = ["git_log", "git_show", "issue_create", "issue_list", "saveToFile", "notify_send"];
+
+/// A named flow: what the coverage line counts and what "complete" means.
+pub struct Flow {
+    pub name: &'static str,
+    pub tools: &'static [&'static str],
+}
+
+pub const TRIAGE: Flow = Flow { name: "триаж", tools: &FLOW };
+pub const REVIEW: Flow = Flow { name: "ревью", tools: &REVIEW_FLOW };
+/// How many changed files one review walks at most.
+const REVIEW_MAX_FILES: usize = 12;
+/// Lines changed from which a file's review is `high` priority.
+const REVIEW_BIG: u64 = 300;
 const LANE_W: usize = 15;
 
 /// `ask-pipeline-mcp` → `pipeline`: lane titles and qualified tool names.
@@ -121,12 +136,15 @@ pub struct Issue {
     pub assignee: String,
     pub priority: String,
     pub status: String,
+    /// Which run filed it (`triage:TODO:`, `review:68b003e`) — so one run's
+    /// report lists its own tasks, not everything open in the tracker.
+    pub label: String,
 }
 
 impl Issue {
     fn json(&self) -> Value {
         json!({"id": format!("T-{}", self.id), "title": self.title, "source": self.source,
-               "assignee": self.assignee, "priority": self.priority, "status": self.status})
+               "assignee": self.assignee, "priority": self.priority, "status": self.status, "label": self.label})
     }
 
     fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Issue> {
@@ -137,11 +155,12 @@ impl Issue {
             assignee: r.get(3)?,
             priority: r.get(4)?,
             status: r.get(5)?,
+            label: r.get(6)?,
         })
     }
 }
 
-const ISSUE_COLS: &str = "id, title, source, assignee, priority, status";
+const ISSUE_COLS: &str = "id, title, source, assignee, priority, status, label";
 
 #[derive(Clone)]
 pub struct Tracker {
@@ -178,6 +197,9 @@ impl Tracker {
              );",
         )
         .map_err(|e| format!("tracker db: {e}"))?;
+        // Trackers made before labels existed get the column; on newer ones
+        // this fails with "duplicate column", which is the state we want.
+        let _ = db.execute("ALTER TABLE issues ADD COLUMN label TEXT NOT NULL DEFAULT ''", []);
         Ok(Tracker { db: Arc::new(Mutex::new(db)), place, calls: Arc::default(), verbose })
     }
 
@@ -207,7 +229,16 @@ impl Tracker {
                  `issue_create` for every hit with `source` = the hit's `path:line` exactly and that \
                  assignee; (4) `issue_list`; (5) `saveToFile` on the pipeline server with `content` = \
                  the issue_list output verbatim; (6) `notify_send` on the notify server with the saved \
-                 file path. Never invent an assignee — take it from git.",
+                 file path. Second flow — review of a commit: (1) `git_log` (limit 1, `path` = the \
+                 folder if the user named one) gives the commit, or the user names it; (2) `git_show` \
+                 with that hash lists the changed files and the author; (3) for every non-binary \
+                 changed file `git_log` with `path` = that file — the reviewer is the most recent \
+                 author of that file other than the commit's author (the author only if nobody else \
+                 ever touched it); (4) `issue_create` per file with `source` = `path@<7-char hash>`, \
+                 that reviewer and `label` = `review:<7-char hash>`; (5) `issue_list` with that \
+                 `label`; (6) \
+                 `saveToFile` with the issue_list output verbatim; (7) `notify_send` (channel dev) \
+                 with the saved path. Never invent an assignee — take it from git.",
                 self.place
             ),
         };
@@ -240,6 +271,7 @@ impl Tracker {
         let title = one_line(req_str(args, "title")?, 200);
         let source = req_str(args, "source")?;
         let assignee = args["assignee"].as_str().unwrap_or("").trim();
+        let label = one_line(args["label"].as_str().unwrap_or(""), 60);
         let priority = match args["priority"].as_str().unwrap_or("normal") {
             p @ ("low" | "normal" | "high") => p,
             other => return Err(format!("`priority` must be low, normal or high, not {other:?}")),
@@ -267,8 +299,8 @@ impl Tracker {
             ));
         }
         db.execute(
-            "INSERT INTO issues (title, source, assignee, priority, status, created) VALUES (?1, ?2, ?3, ?4, 'open', ?5)",
-            params![title, source, assignee, priority, now()],
+            "INSERT INTO issues (title, source, assignee, priority, status, created, label) VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6)",
+            params![title, source, assignee, priority, now(), label],
         )
         .map_err(|e| e.to_string())?;
         let issue = Issue {
@@ -278,6 +310,7 @@ impl Tracker {
             assignee: assignee.to_string(),
             priority: priority.to_string(),
             status: "open".into(),
+            label,
         };
         Ok((
             format!(
@@ -298,12 +331,16 @@ impl Tracker {
             other => return Err(format!("`status` must be open, closed or all, not {other:?}")),
         };
         let who = args["assignee"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let from = args["source"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let label = args["label"].as_str().map(str::trim).filter(|s| !s.is_empty());
         let issues: Vec<Issue> = self
             .issues(status)?
             .into_iter()
             .filter(|i| who.is_none_or(|w| i.assignee == w))
+            .filter(|i| from.is_none_or(|f| i.source.contains(f)))
+            .filter(|i| label.is_none_or(|l| i.label == l))
             .collect();
-        let text = issue_table(status, &issues);
+        let text = issue_table(&label.map_or(status.to_string(), |l| format!("{status}, {l}")), &issues);
         let d = digest(&text);
         let list: Vec<Value> = issues.iter().map(Issue::json).collect();
         Ok((text, json!({"status": status, "count": issues.len(), "issues": list, "digest": d})))
@@ -366,9 +403,10 @@ pub fn tracker_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "What has to be done, one line."},
-                    "source": {"type": "string", "description": "Where it comes from, `path:line` exactly as `search` returned it."},
-                    "assignee": {"type": "string", "description": "Who does it — the author from git_log of that file."},
+                    "source": {"type": "string", "description": "Where it comes from: `path:line` exactly as `search` returned it, or `path@<7-char commit hash>` for a review of that file in that commit."},
+                    "assignee": {"type": "string", "description": "Who does it — taken from git_log of that file, never invented."},
                     "priority": {"type": "string", "enum": ["low", "normal", "high"], "description": "Default normal."},
+                    "label": {"type": "string", "description": "Which run files it, e.g. `review:68b003e` or `triage:TODO:` — issue_list can then list just this run."},
                 },
                 "required": ["title", "source"],
                 "additionalProperties": false,
@@ -382,6 +420,8 @@ pub fn tracker_specs() -> Vec<Value> {
                 "properties": {
                     "status": {"type": "string", "enum": ["open", "closed", "all"], "description": "Default open."},
                     "assignee": {"type": "string", "description": "Only this person's tasks."},
+                    "source": {"type": "string", "description": "Only tasks whose source contains this text, e.g. `@68b003e` for one commit's review or `src/` for one folder."},
+                    "label": {"type": "string", "description": "Only tasks with exactly this label (as given to issue_create)."},
                 },
                 "additionalProperties": false,
             },
@@ -555,10 +595,12 @@ pub fn notify_specs() -> Vec<Value> {
     ]
 }
 
-/// The chat's four servers over `root` (a git repository): git, pipeline
-/// (search under `root`, files into `~/.ask6/pipeline/`), tracker
+/// The chat's four servers over the repository `root` is in (its top level,
+/// so a run from `target/release` still sees the whole project): git,
+/// pipeline (search there, files into `~/.ask6/pipeline/`), tracker
 /// (`~/.ask6/tracker.db`) and notify (`~/.ask6/notify/`).
 pub fn local_toolbox(root: &Path) -> Res<Toolbox> {
+    let root = &mcp_server::toplevel(root);
     let mut tb = Toolbox::local_git(root)?;
     tb.merge(Toolbox::local_pipeline(root, &toolchain::default_out())?);
     tb.merge(Toolbox::local_tracker(&default_tracker_db())?);
@@ -570,6 +612,8 @@ pub fn local_toolbox(root: &Path) -> Res<Toolbox> {
 
 pub struct TriageRequest {
     pub query: String,
+    /// Folder or file to search in, relative to the repository root.
+    pub path: Option<String>,
     pub limit: usize,
     pub filename: String,
     pub channel: String,
@@ -579,6 +623,7 @@ impl TriageRequest {
     pub fn new(query: Option<&str>, filename: Option<&str>) -> TriageRequest {
         TriageRequest {
             query: query.map(str::trim).filter(|q| !q.is_empty()).unwrap_or("TODO:").to_string(),
+            path: None,
             limit: 10,
             filename: filename.map(String::from).unwrap_or_else(|| "triage.md".into()),
             channel: "team".into(),
@@ -586,7 +631,9 @@ impl TriageRequest {
     }
 }
 
+/// What an automatic flow (triage or review) leaves behind.
 pub struct TriageReport {
+    pub flow: &'static Flow,
     pub steps: Vec<ToolStep>,
     pub checks: Vec<Check>,
     pub path: String,
@@ -595,25 +642,67 @@ pub struct TriageReport {
 
 impl TriageReport {
     pub fn ok(&self) -> bool {
-        self.checks.iter().all(|c| c.ok) && coverage(&self.steps).1
+        self.checks.iter().all(|c| c.ok) && coverage(&self.steps, self.flow).1
     }
 }
 
-/// One line of the audit: ✓ or ✗ and why.
+/// `/triage` and `/review` arguments: `<main> [in <path>] [> <file>]`.
+pub fn split_flow_args(rest: &str) -> (String, Option<String>, Option<String>) {
+    let (rest, file) = match rest.rsplit_once('>') {
+        Some((q, f)) => (q, Some(f.trim().to_string()).filter(|f| !f.is_empty())),
+        None => (rest, None),
+    };
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match words.iter().rposition(|w| *w == "in" || *w == "в") {
+        Some(k) if k + 1 < words.len() => (words[..k].join(" "), Some(words[k + 1..].join(" ")), file),
+        _ => (words.join(" "), None, file),
+    }
+}
+
+/// One line of the audit: ✓ or ✗ and why. `soft` marks a failed check
+/// that is a fact, not necessarily a fault — a file holding the model's own
+/// text instead of a tool's output — shown as ≈; it still is not ✓.
 pub struct Check {
     pub ok: bool,
+    pub soft: bool,
     pub text: String,
 }
 
 impl Check {
     pub fn line(&self) -> String {
-        format!("{} {}", if self.ok { "✓" } else { "✗" }, self.text)
+        let mark = match (self.ok, self.soft) {
+            (true, _) => "✓",
+            (false, true) => "≈",
+            (false, false) => "✗",
+        };
+        format!("{mark} {}", self.text)
     }
 }
 
-/// Title of the task for a hit: what follows the marker, comment
-/// punctuation trimmed.
+/// A marker like `TODO:` or `FIXME:` (ends with a colon) — a note left in
+/// a comment, not a piece of code like `panic!`.
+fn is_marker(query: &str) -> bool {
+    query.ends_with(':')
+}
+
+/// Whether a `marker` hit is a real note: the line is a comment (or a list
+/// item) that *starts* with the marker — `// TODO: x`, `# FIXME: y`,
+/// `- TODO: z` — not a sentence or a string that merely mentions it.
+fn marker_in_comment(text: &str, marker: &str) -> bool {
+    let t = text.trim_start();
+    ["<!--", "//", "/*", "--", "#", "*", ";", "-"].iter().any(|open| {
+        t.strip_prefix(open)
+            .map(|r| r.trim_start_matches(['/', '!', '*', '-', '#']).trim_start())
+            .is_some_and(|r| r.starts_with(marker))
+    })
+}
+
+/// Title of the task for a hit: for a marker what follows it, comment
+/// punctuation trimmed; for anything else (`panic!`) the line itself.
 fn todo_title(text: &str, marker: &str) -> String {
+    if !is_marker(marker) {
+        return one_line(text, 120);
+    }
     let t = text.split_once(marker).map(|(_, t)| t).unwrap_or(text);
     let t = t.trim().trim_start_matches([':', '-', ' ']).trim();
     one_line(if t.is_empty() { text } else { t }, 120)
@@ -637,6 +726,49 @@ fn hits_of(step: &ToolStep) -> Vec<String> {
 
 fn author_of(step: &ToolStep) -> Option<&str> {
     step.structured["commits"][0]["author"].as_str()
+}
+
+/// Who reviews a file that `author` changed, by the file's `git_log`: the
+/// most recent *other* author, or `author` when nobody else ever touched
+/// it. `None` when the log has no commits at all.
+fn reviewer_of(log: &ToolStep, author: &str) -> Option<String> {
+    let commits = log.structured["commits"].as_array().filter(|c| !c.is_empty())?;
+    let other = commits.iter().filter_map(|c| c["author"].as_str()).find(|a| *a != author);
+    Some(other.unwrap_or(author).to_string())
+}
+
+/// `path@abc1234` → `("path", "abc1234")`: the source of a review issue.
+fn review_source(source: &str) -> Option<(&str, &str)> {
+    let (file, hash) = source.rsplit_once('@')?;
+    (hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit()) && !file.is_empty()).then_some((file, hash))
+}
+
+/// `T-6` named in `text` as itself, not as the start of `T-60`.
+fn mentions_id(text: &str, id: &str) -> bool {
+    text.match_indices(id).any(|(k, _)| !text[k + id.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+fn short_hash(hash: &str) -> &str {
+    &hash[..hash.len().min(7)]
+}
+
+/// Changed files of a `git_show` step: `(path, added, deleted, binary)`.
+fn files_of(step: &ToolStep) -> Vec<(String, u64, u64, bool)> {
+    step.structured["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| {
+                    Some((
+                        f["path"].as_str()?.to_string(),
+                        f["added"].as_u64().unwrap_or(0),
+                        f["deleted"].as_u64().unwrap_or(0),
+                        f["binary"].as_bool().unwrap_or(false),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn call(
@@ -680,12 +812,20 @@ pub fn run_triage(
         &mut steps,
         emit,
         "search",
-        json!({"query": req.query, "source": "files", "limit": req.limit, "case_sensitive": true}),
+        {
+            // A marker is filtered to comments below, so ask for more lines.
+            let limit = if is_marker(&req.query) { 50 } else { req.limit };
+            let mut a = json!({"query": req.query, "source": "files", "limit": limit, "case_sensitive": true});
+            if let Some(p) = &req.path {
+                a["path"] = json!(p);
+            }
+            a
+        },
     );
     if steps[found].is_error {
         return Err(format!("search: {}", steps[found].result));
     }
-    let hits: Vec<(String, String)> = steps[found].structured["hits"]
+    let found_all: Vec<(String, String)> = steps[found].structured["hits"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -693,10 +833,25 @@ pub fn run_triage(
                 .collect()
         })
         .unwrap_or_default();
+    let hits: Vec<(String, String)> = found_all
+        .iter()
+        .filter(|(_, t)| !is_marker(&req.query) || marker_in_comment(t, &req.query))
+        .take(req.limit)
+        .cloned()
+        .collect();
     if hits.is_empty() {
-        emit("итог: search ничего не нашёл — заводить нечего, флоу остановлен на шаге 1".into());
-        return Err(format!("no «{}» markers found", req.query));
+        let mentions = found_all.len();
+        emit(format!(
+            "итог: меток «{}» нет{}{} — заводить нечего, флоу остановлен на шаге 1. \
+             На реальной истории репозитория работает /review [коммит] [in папка]; \
+             по коду — /triage <что искать> in <папка>, например /triage panic! in tree/task-20/src",
+            req.query,
+            req.path.as_deref().map(|p| format!(" в {p}")).unwrap_or_default(),
+            if mentions > 0 { format!(" (строк с «{}»: {mentions}, но ни одна не метка в комментарии)", req.query) } else { String::new() }
+        ));
+        return Err(format!("меток «{}» нет — попробуйте /review или /triage <что искать> in <папка>", req.query));
     }
+    let label = format!("triage:{}", req.query);
     let mut authors: BTreeMap<String, String> = BTreeMap::new();
     for (place, _) in &hits {
         let file = file_of(place).to_string();
@@ -713,10 +868,10 @@ pub fn run_triage(
             &mut steps,
             emit,
             "issue_create",
-            json!({"title": todo_title(text, &req.query), "source": place, "assignee": authors[file_of(place)]}),
+            json!({"title": todo_title(text, &req.query), "source": place, "assignee": authors[file_of(place)], "label": label}),
         );
     }
-    let listed = call(caller, lanes, &mut steps, emit, "issue_list", json!({"status": "open"}));
+    let listed = call(caller, lanes, &mut steps, emit, "issue_list", json!({"status": "open", "label": label}));
     let table = steps[listed].result.clone();
     let saved = call(
         caller,
@@ -740,7 +895,137 @@ pub fn run_triage(
     for l in audit_lines(&steps, &checks) {
         emit(l);
     }
-    Ok(TriageReport { steps, checks, path, table })
+    Ok(TriageReport { flow: &TRIAGE, steps, checks, path, table })
+}
+
+pub struct ReviewRequest {
+    /// Commit to review; `None` = the latest one (touching `path`, if given).
+    pub rev: Option<String>,
+    /// Folder the latest commit is looked up in, relative to the repository.
+    pub path: Option<String>,
+    pub filename: Option<String>,
+    pub channel: String,
+}
+
+impl ReviewRequest {
+    pub fn new(rev: Option<&str>, path: Option<&str>, filename: Option<&str>) -> ReviewRequest {
+        let some = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        ReviewRequest { rev: some(rev), path: some(path), filename: some(filename), channel: "dev".into() }
+    }
+}
+
+/// The automatic review of one commit across the four servers, every input
+/// taken from an earlier output:
+///
+/// ```text
+/// git.git_log{path, limit 1} → git.git_show{hash} → git.git_log{file} ×files
+///   → tracker.issue_create{file@hash, reviewer} ×files → tracker.issue_list{@hash}
+///   → pipeline.saveToFile{issue_list} → notify.notify_send{path}
+/// ```
+///
+/// The reviewer of a file is the latest other person in that file's
+/// history — so the author never reviews themselves unless nobody else is
+/// there.
+pub fn run_review(
+    caller: &mut dyn ToolCaller,
+    req: &ReviewRequest,
+    lanes: &[String],
+    emit: &mut dyn FnMut(String),
+) -> Res<TriageReport> {
+    emit(format!(
+        "оркестрация «ревью»: git_log → git_show → git_log×файлы → issue_create×файлы → issue_list → saveToFile → notify_send · коммит {} · канал #{}",
+        match (&req.rev, &req.path) {
+            (Some(r), _) => r.clone(),
+            (None, Some(p)) => format!("последний в {p}"),
+            (None, None) => "последний".into(),
+        },
+        req.channel
+    ));
+    emit(lane_header(lanes));
+    let mut steps = Vec::new();
+    let rev = match &req.rev {
+        Some(r) => r.clone(),
+        None => {
+            let mut a = json!({"limit": 1});
+            if let Some(p) = &req.path {
+                a["path"] = json!(p);
+            }
+            let i = call(caller, lanes, &mut steps, emit, "git_log", a);
+            match steps[i].structured["commits"][0]["hash"].as_str() {
+                Some(h) if !steps[i].is_error => h.to_string(),
+                _ => return Err(format!("git_log: нет коммитов — {}", one_line(&steps[i].result, 80))),
+            }
+        }
+    };
+    let shown = call(caller, lanes, &mut steps, emit, "git_show", json!({"rev": rev}));
+    if steps[shown].is_error {
+        return Err(format!("git_show {rev}: {}", one_line(&steps[shown].result, 120)));
+    }
+    let hash = steps[shown].structured["hash"].as_str().unwrap_or("").to_string();
+    let short = short_hash(&hash).to_string();
+    let author = steps[shown].structured["author"].as_str().unwrap_or("").to_string();
+    let subject = steps[shown].structured["subject"].as_str().unwrap_or("").to_string();
+    let files: Vec<(String, u64, u64, bool)> = files_of(&steps[shown]).into_iter().filter(|f| !f.3).collect();
+    if files.is_empty() {
+        emit(format!("итог: в коммите {short} нет текстовых файлов — ревьюить нечего"));
+        return Err(format!("{short}: нет изменённых текстовых файлов"));
+    }
+    let skipped = files.len().saturating_sub(REVIEW_MAX_FILES);
+    let mut reviewers: Vec<String> = Vec::new();
+    for (file, ..) in files.iter().take(REVIEW_MAX_FILES) {
+        let i = call(caller, lanes, &mut steps, emit, "git_log", json!({"path": file, "limit": 10}));
+        reviewers.push(reviewer_of(&steps[i], &author).unwrap_or_else(|| author.clone()));
+    }
+    let topic = one_line(&subject, 40);
+    for ((file, added, deleted, _), who) in files.iter().take(REVIEW_MAX_FILES).zip(&reviewers) {
+        call(
+            caller,
+            lanes,
+            &mut steps,
+            emit,
+            "issue_create",
+            json!({
+                "title": format!("Ревью {short} «{topic}»: {file} (+{added}/−{deleted})"),
+                "source": format!("{file}@{short}"),
+                "assignee": who,
+                "priority": if added + deleted >= REVIEW_BIG { "high" } else { "normal" },
+                "label": format!("review:{short}"),
+            }),
+        );
+    }
+    let listed = call(
+        caller,
+        lanes,
+        &mut steps,
+        emit,
+        "issue_list",
+        json!({"status": "open", "label": format!("review:{short}")}),
+    );
+    let table = steps[listed].result.clone();
+    let filename = req.filename.clone().unwrap_or_else(|| format!("review-{short}.md"));
+    let saved = call(caller, lanes, &mut steps, emit, "saveToFile", json!({"filename": filename, "content": table}));
+    let path = steps[saved].structured["path"].as_str().unwrap_or("").to_string();
+    let mut people: Vec<&str> = reviewers.iter().map(String::as_str).collect();
+    people.sort_unstable();
+    people.dedup();
+    call(
+        caller,
+        lanes,
+        &mut steps,
+        emit,
+        "notify_send",
+        json!({"channel": req.channel, "text": format!(
+            "Ревью {short} «{topic}» (автор {author}): {} файлов{} → ревьюеры {}. Чек-лист: {path}",
+            reviewers.len(),
+            if skipped > 0 { format!(" (ещё {skipped} не взяты)") } else { String::new() },
+            people.join(", ")
+        )}),
+    );
+    let checks = check_flow(&steps);
+    for l in audit_lines(&steps, &checks) {
+        emit(l);
+    }
+    Ok(TriageReport { flow: &REVIEW, steps, checks, path, table })
 }
 
 /// Audit of a flow — the automatic one or one the model assembled. Routing
@@ -758,6 +1043,7 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
         .collect();
     if !routed.is_empty() {
         out.push(Check {
+            soft: false,
             ok: wrong.is_empty(),
             text: if wrong.is_empty() {
                 format!("маршрутизация: {0}/{0} вызовов попали на сервер-владелец инструмента", routed.len())
@@ -771,19 +1057,112 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
         let before = &steps[..i];
         let find = |pred: &dyn Fn(&ToolStep) -> bool| before.iter().rposition(|p| !p.is_error && pred(p));
         if s.is_error {
-            out.push(Check { ok: false, text: format!("шаг {n} {}: ошибка — {}", s.name, one_line(&s.result, 80)) });
+            out.push(Check { soft: false, ok: false, text: format!("шаг {n} {}: ошибка — {}", s.name, one_line(&s.result, 80)) });
             continue;
         }
         match s.name.as_str() {
             "git_log" => {
                 let Some(path) = s.args["path"].as_str() else { continue };
-                let from = find(&|p| p.name == "search" && hits_of(p).iter().any(|h| same_path(file_of(h), path)));
+                // A path with no search / git_show before it came from the user.
+                if !before.iter().any(|p| p.name == "search" || p.name == "git_show") {
+                    continue;
+                }
+                let listed = |p: &ToolStep| files_of(p).iter().any(|f| same_path(&f.0, path));
+                let from = find(&|p| {
+                    (p.name == "search" && hits_of(p).iter().any(|h| same_path(file_of(h), path)))
+                        || (p.name == "git_show" && listed(p))
+                });
                 out.push(Check {
+                    soft: false,
                     ok: from.is_some(),
                     text: match from {
+                        Some(k) if steps[k].name == "git_show" => {
+                            format!("шаг {n} git_log {path}: файл из изменённых в git_show (шаг {})", k + 1)
+                        }
                         Some(k) => format!("шаг {n} git_log {path}: файл из выдачи search (шаг {})", k + 1),
-                        None => format!("шаг {n} git_log {path}: такого файла нет в выдаче предыдущего search"),
+                        None => format!("шаг {n} git_log {path}: такого файла нет в выдаче предыдущего search / git_show"),
                     },
+                });
+            }
+            "git_show" => {
+                let rev = s.args["rev"].as_str().unwrap_or("").trim();
+                // Only a hash can be traced; HEAD, a tag or a branch the user named.
+                if rev.len() < 7 || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let from = find(&|p| {
+                    p.name == "git_log"
+                        && p.structured["commits"]
+                            .as_array()
+                            .is_some_and(|c| c.iter().any(|c| c["hash"].as_str().is_some_and(|h| h.starts_with(rev))))
+                });
+                if from.is_none() && !before.iter().any(|p| p.name == "git_log") {
+                    continue;
+                }
+                out.push(Check {
+                    soft: false,
+                    ok: from.is_some(),
+                    text: match from {
+                        Some(k) => format!("шаг {n} git_show {}: коммит из выдачи git_log (шаг {})", short_hash(rev), k + 1),
+                        None => format!("шаг {n} git_show {}: такого коммита нет в выдаче предыдущего git_log", short_hash(rev)),
+                    },
+                });
+            }
+            "issue_create" if review_source(s.args["source"].as_str().unwrap_or("")).is_some() => {
+                let source = s.args["source"].as_str().unwrap_or("");
+                let (file, hash) = review_source(source).unwrap_or_default();
+                let assignee = s.args["assignee"].as_str().unwrap_or("").trim();
+                let id = s.structured["id"].as_str().unwrap_or("?");
+                // The commit is known either from git_show (it lists the file)
+                // or from the file's own git_log (the commit is in its history).
+                fn in_log<'a>(p: &'a ToolStep, hash: &str) -> Option<&'a str> {
+                    p.structured["commits"]
+                        .as_array()
+                        .and_then(|c| c.iter().find(|c| c["hash"].as_str().is_some_and(|h| h.starts_with(hash))))
+                        .and_then(|c| c["author"].as_str())
+                }
+                let shown = find(&|p| {
+                    p.name == "git_show"
+                        && p.structured["hash"].as_str().is_some_and(|h| h.starts_with(hash))
+                        && files_of(p).iter().any(|f| same_path(&f.0, file))
+                })
+                .or_else(|| {
+                    find(&|p| {
+                        p.name == "git_log"
+                            && p.args["path"].as_str().is_some_and(|q| same_path(q, file))
+                            && in_log(p, hash).is_some()
+                    })
+                });
+                let author = shown.and_then(|k| match steps[k].name.as_str() {
+                    "git_show" => steps[k].structured["author"].as_str(),
+                    _ => in_log(&steps[k], hash),
+                });
+                let log = find(&|p| p.name == "git_log" && p.args["path"].as_str().is_some_and(|q| same_path(q, file)));
+                let want = match (log, author) {
+                    (Some(k), Some(a)) => reviewer_of(&steps[k], a),
+                    _ => None,
+                };
+                let src = match shown {
+                    Some(k) => format!("файл {file} изменён в {hash} по {} (шаг {})", steps[k].name, k + 1),
+                    None => format!("«{source}»: ни git_show, ни git_log до этого не связывают этот файл с этим коммитом"),
+                };
+                let who = match (log, want.as_deref()) {
+                    (Some(k), Some(w)) if w == assignee => format!(
+                        "ревьюер {w} по git_log файла (шаг {}){}",
+                        k + 1,
+                        if author == Some(w) { " — других авторов у файла нет" } else { ", не автор коммита" }
+                    ),
+                    (Some(k), w) => format!(
+                        "ревьюер «{assignee}», а по git_log файла (шаг {}) должен быть «{}»",
+                        k + 1,
+                        w.unwrap_or("?")
+                    ),
+                    (None, _) => format!("ревьюер «{assignee}» не подтверждён: до этого не было git_log по {file}"),
+                };
+                out.push(Check {
+                    soft: false,
+                    ok: shown.is_some() && want.as_deref() == Some(assignee),
+                    text: format!("шаг {n} issue_create {id}: {src}; {who}"),
                 });
             }
             "issue_create" => {
@@ -810,6 +1189,7 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                     (None, _) => format!("исполнитель «{assignee}» не подтверждён: до этого не было git_log по {}", file_of(source)),
                 };
                 out.push(Check {
+                    soft: false,
                     ok: from.is_some() && author.is_some_and(|a| a == assignee),
                     text: format!("шаг {n} issue_create {id}: {src}; {who}"),
                 });
@@ -821,6 +1201,7 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                     continue;
                 }
                 out.push(Check {
+                    soft: false,
                     ok: !late,
                     text: if late {
                         format!("шаг {n} issue_list: вызван раньше, чем заведены все задачи")
@@ -836,6 +1217,7 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                 });
                 let via = s.structured["input"]["via"].as_str().unwrap_or("?");
                 out.push(Check {
+                    soft: from.is_none(),
                     ok: from.is_some(),
                     text: match from {
                         Some(k) => format!(
@@ -846,7 +1228,7 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                             short(got)
                         ),
                         None => format!(
-                            "шаг {n} {}: вход #{} не совпадает побайтно ни с одним выходом предыдущих шагов — текст изменён при передаче",
+                            "шаг {n} {}: записан текст модели, а не выход инструмента — вход #{} побайтно не совпадает ни с одним выходом предыдущих шагов",
                             s.name,
                             short(got)
                         ),
@@ -862,16 +1244,61 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                             text.contains(path) || text.contains(name)
                         })
                 });
-                let ids = before.iter().any(|p| p.name == "issue_create");
-                if from.is_some() || before.iter().any(|p| p.name == "saveToFile") || ids {
+                if from.is_some() || before.iter().any(|p| p.name == "saveToFile") {
                     out.push(Check {
+                        soft: false,
                         ok: from.is_some(),
                         text: match from {
                             Some(k) => format!("шаг {n} notify_send: в сообщении файл, сохранённый на шаге {}", k + 1),
                             None => format!("шаг {n} notify_send: в сообщении нет пути сохранённого отчёта"),
                         },
                     });
+                    continue;
                 }
+                // No report saved: the message must name a task this turn
+                // filed or closed — that is what it is about.
+                let touched: Vec<String> = before
+                    .iter()
+                    .filter(|p| !p.is_error && (p.name == "issue_create" || p.name == "issue_close"))
+                    .filter_map(|p| p.structured["id"].as_str().map(String::from))
+                    .collect();
+                if touched.is_empty() {
+                    continue;
+                }
+                let named: Vec<&String> = touched.iter().filter(|id| mentions_id(text, id)).collect();
+                out.push(Check {
+                    soft: false,
+                    ok: !named.is_empty(),
+                    text: if named.is_empty() {
+                        format!("шаг {n} notify_send: в сообщении нет ни одной из задач хода ({})", touched.join(", "))
+                    } else {
+                        format!(
+                            "шаг {n} notify_send: в сообщении {} — задачи, заведённые/закрытые выше",
+                            named.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        )
+                    },
+                });
+            }
+            "issue_close" => {
+                let Some(id) = s.structured["id"].as_str() else { continue };
+                let listed = |p: &ToolStep| {
+                    (p.name == "issue_list"
+                        && p.structured["issues"].as_array().is_some_and(|a| a.iter().any(|i| i["id"] == id)))
+                        || (p.name == "issue_create" && p.structured["id"] == id)
+                };
+                // An id with no tracker call before it came from the user.
+                if !before.iter().any(|p| p.name == "issue_list" || p.name == "issue_create") {
+                    continue;
+                }
+                let from = find(&listed);
+                out.push(Check {
+                    soft: false,
+                    ok: from.is_some(),
+                    text: match from {
+                        Some(k) => format!("шаг {n} issue_close {id}: задача из выдачи {} (шаг {})", steps[k].name, k + 1),
+                        None => format!("шаг {n} issue_close {id}: такой задачи не было в выдаче трекера выше"),
+                    },
+                });
             }
             _ => {}
         }
@@ -879,9 +1306,10 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
     out
 }
 
-/// Which steps of the triage flow ran (successfully): `(line, all six)`.
-pub fn coverage(steps: &[ToolStep]) -> (String, bool) {
-    let marks: Vec<String> = FLOW
+/// Which steps of `flow` ran (successfully): `(line, all of them)`.
+pub fn coverage(steps: &[ToolStep], flow: &Flow) -> (String, bool) {
+    let marks: Vec<String> = flow
+        .tools
         .iter()
         .map(|t| {
             let n = steps.iter().filter(|s| s.name == *t && !s.is_error).count();
@@ -892,8 +1320,16 @@ pub fn coverage(steps: &[ToolStep]) -> (String, bool) {
             }
         })
         .collect();
-    let all = FLOW.iter().all(|t| steps.iter().any(|s| s.name == *t && !s.is_error));
-    (format!("флоу триажа: {} ({})", marks.join(" · "), if all { "все 6 шагов" } else { "не полный" }), all)
+    let all = flow.tools.iter().all(|t| steps.iter().any(|s| s.name == *t && !s.is_error));
+    (
+        format!(
+            "флоу «{}»: {} ({})",
+            flow.name,
+            marks.join(" · "),
+            if all { format!("все {} шагов", flow.tools.len()) } else { "не полный".into() }
+        ),
+        all,
+    )
 }
 
 /// Servers in the order the flow visited them, consecutive repeats folded.
@@ -920,10 +1356,15 @@ pub fn is_orchestrated(steps: &[ToolStep]) -> bool {
 /// The audit block under the lane picture.
 pub fn audit_lines(steps: &[ToolStep], checks: &[Check]) -> Vec<String> {
     let mut lines = vec![format!("путь по серверам: {}", server_path(steps))];
-    // Покрытие флоу триажа — только когда ход и был триажем (нашёл и завёл),
-    // иначе «не полный» у «закрой T-2» только путает.
-    if ["search", "issue_create"].iter().all(|t| steps.iter().any(|s| s.name == *t)) {
-        lines.push(coverage(steps).0);
+    // Покрытие флоу — только когда ход и был этим флоу (нашёл / показал
+    // коммит и завёл задачи), иначе «не полный» у «закрой T-2» только путает.
+    let has = |t: &str| steps.iter().any(|s| s.name == t);
+    let report = has("issue_list") || has("saveToFile");
+    if has("search") && has("issue_create") && report {
+        lines.push(coverage(steps, &TRIAGE).0);
+    }
+    if has("git_show") && has("issue_create") && report {
+        lines.push(coverage(steps, &REVIEW).0);
     }
     lines.extend(checks.iter().map(Check::line));
     lines
@@ -971,14 +1412,30 @@ fn brief(step: &ToolStep) -> String {
     }
     let s = &step.structured;
     match step.name.as_str() {
-        "git_log" => format!(
-            "{} → {}",
-            step.args["path"].as_str().unwrap_or("весь репозиторий"),
-            author_of(step).unwrap_or("нет коммитов")
-        ),
+        "git_log" => {
+            let n = s["commits"].as_array().map_or(0, Vec::len);
+            let head = s["commits"][0]["hash"].as_str().map(short_hash).unwrap_or("");
+            match step.args["path"].as_str() {
+                Some(p) if n > 1 => format!("{p}: {n} комм., последний {}", author_of(step).unwrap_or("?")),
+                Some(p) => format!("{p} → {}", author_of(step).unwrap_or("нет коммитов")),
+                None => format!("{head} {} ({n} комм.)", author_of(step).unwrap_or("нет коммитов")),
+            }
+        }
+        "git_show" => {
+            let files = files_of(step);
+            format!(
+                "{} {}: {} файлов (+{}/−{})",
+                short_hash(s["hash"].as_str().unwrap_or("?")),
+                s["author"].as_str().unwrap_or("?"),
+                files.len(),
+                files.iter().map(|f| f.1).sum::<u64>(),
+                files.iter().map(|f| f.2).sum::<u64>()
+            )
+        }
         "search" => format!(
-            "«{}»: {} совп. [{}]",
+            "«{}»{}: {} совп. [{}]",
             s["query"].as_str().unwrap_or("?"),
+            step.args["path"].as_str().map(|p| format!(" в {p}")).unwrap_or_default(),
             s["count"],
             s["id"].as_str().unwrap_or("?")
         ),
@@ -1022,12 +1479,20 @@ pub struct Fixture {
     /// Author of HEAD — what a `git_log` without `path` would suggest.
     pub head_author: String,
     pub codename: String,
+    /// The latest commit touching `src/` — what `/review in src` reviews.
+    pub review_hash: String,
+    pub review_author: String,
+    /// `(file, reviewer)` of that commit: the latest *other* author of each file.
+    pub review: Vec<(String, String)>,
 }
 
 /// A small repository with three `TODO:` markers in three files by two
 /// authors, plus a later commit by a third one (so the *latest* commit is
-/// not the right assignee) and a decoy `todo` in lowercase. `tag` makes the
-/// names unguessable in the proof; empty for the demo.
+/// not the right assignee) and a decoy `todo` in lowercase. Before that
+/// last commit Ada changes two files that Carol and Boris wrote — the
+/// commit a review walks, where each file has a different reviewer and
+/// neither is the author. `tag` makes the names unguessable in the proof;
+/// empty for the demo.
 pub fn fixture_repo(dir: &Path, tag: &str) -> Res<Fixture> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let who = |name: &str| format!("{name}{tag} <{}@example.com>", name.to_lowercase());
@@ -1038,27 +1503,44 @@ pub fn fixture_repo(dir: &Path, tag: &str) -> Res<Fixture> {
     } else {
         format!("// TODO: {codename} обработать пустой ввод")
     };
+    let net = "pub fn fetch() {}\n// TODO: повторять запрос при таймауте\n";
     mcp_server::git(dir, &["init", "-q", "-b", "main"])?;
-    let commits: Vec<(&str, String, &str, String)> = vec![
-        ("README.md", "# demo\n".into(), "initial commit", who("Carol")),
-        ("src/lib.rs", "pub mod todo; // список дел, не метка\n".into(), "add lib", who("Carol")),
+    let one = |f: &'static str, body: String| vec![(f, body)];
+    // (files with their new content, message, author) — one commit each.
+    type Commit<'a> = (Vec<(&'a str, String)>, String, String);
+    let commits: Vec<Commit> = vec![
+        (one("README.md", "# demo\n".into()), "initial commit".into(), who("Carol")),
+        (one("src/lib.rs", "pub mod todo; // список дел, не метка\n".into()), "add lib".into(), who("Carol")),
         (
-            "src/parser.rs",
-            format!("pub fn parse(s: &str) -> Vec<&str> {{\n    s.split(',').collect()\n}}\n{parser_todo}\n"),
-            "add parser",
+            one("src/parser.rs", format!("pub fn parse(s: &str) -> Vec<&str> {{\n    s.split(',').collect()\n}}\n{parser_todo}\n")),
+            "add parser".into(),
             who("Ada"),
         ),
-        ("src/net.rs", "pub fn fetch() {}\n// TODO: повторять запрос при таймауте\n".into(), "add net", who("Boris")),
-        ("docs/plan.md", "# План\n\n- TODO: описать формат отчёта\n".into(), "add plan", who("Boris")),
-        ("README.md", "# demo\n\nПроект для проверки оркестрации MCP.\n".into(), "docs: readme", who("Carol")),
+        (one("src/net.rs", net.into()), "add net".into(), who("Boris")),
+        (one("docs/plan.md", "# План\n\n- TODO: описать формат отчёта\n".into()), "add plan".into(), who("Boris")),
+        (
+            vec![
+                ("src/net.rs", format!("{net}pub const TIMEOUT_MS: u64 = 5000;\n")),
+                ("src/lib.rs", "pub mod todo; // список дел, не метка\npub mod net;\n".into()),
+            ],
+            format!("net: таймаут из конфига {codename}").trim_end().to_string(),
+            who("Ada"),
+        ),
+        (
+            one("README.md", "# demo\n\nПроект для проверки оркестрации MCP.\n".into()),
+            "docs: readme".into(),
+            who("Carol"),
+        ),
     ];
-    for (file, body, msg, author) in &commits {
-        let path = dir.join(file);
-        if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    for (files, msg, author) in &commits {
+        for (file, body) in files {
+            let path = dir.join(file);
+            if let Some(p) = path.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&path, body).map_err(|e| e.to_string())?;
+            mcp_server::git(dir, &["add", file])?;
         }
-        std::fs::write(&path, body).map_err(|e| e.to_string())?;
-        mcp_server::git(dir, &["add", file])?;
         mcp_server::git(
             dir,
             &[
@@ -1068,14 +1550,18 @@ pub fn fixture_repo(dir: &Path, tag: &str) -> Res<Fixture> {
             ],
         )?;
     }
+    let review_hash = mcp_server::git(dir, &["rev-parse", "HEAD~1"])?.trim().to_string();
     Ok(Fixture {
         todos: vec![
             ("docs/plan.md:3".into(), boris.clone()),
-            ("src/net.rs:2".into(), boris),
-            ("src/parser.rs:4".into(), ada),
+            ("src/net.rs:2".into(), ada.clone()),
+            ("src/parser.rs:4".into(), ada.clone()),
         ],
-        head_author: carol,
+        head_author: carol.clone(),
         codename,
+        review_hash,
+        review_author: ada,
+        review: vec![("src/lib.rs".into(), carol), ("src/net.rs".into(), boris)],
     })
 }
 
@@ -1198,6 +1684,34 @@ impl Rig {
         Ok(ok)
     }
 
+    /// The tracker holds exactly one review task per changed file of the
+    /// fixture's review commit, each on that file's other author.
+    fn review_matches(&self, fx: &Fixture) -> Res<bool> {
+        let issues = self.tracker.issues("open")?;
+        let mut got: Vec<(String, String)> = Vec::new();
+        let mut right_commit = true;
+        for i in &issues {
+            match review_source(&i.source) {
+                Some((file, hash)) => {
+                    right_commit &= fx.review_hash.starts_with(hash);
+                    got.push((file.trim_start_matches("./").to_string(), i.assignee.clone()));
+                }
+                None => right_commit = false,
+            }
+        }
+        got.sort();
+        let ok = right_commit && got == fx.review;
+        println!(
+            "[{}] в трекере {} задач(и) ревью коммита {} (автор {}), ревьюеры из истории файлов: {}",
+            mark(ok),
+            issues.len(),
+            short_hash(&fx.review_hash),
+            fx.review_author,
+            issues.iter().map(|i| format!("{}→{}", i.source, i.assignee)).collect::<Vec<_>>().join(", ")
+        );
+        Ok(ok)
+    }
+
     fn clear_logs(&self) -> Res<()> {
         for log in [&self.git.calls, &self.pipeline.calls, &self.tracker.calls, &self.notify.calls] {
             log.lock().map_err(|e| e.to_string())?.clear();
@@ -1206,7 +1720,10 @@ impl Rig {
     }
 }
 
-fn file_and_notice(steps: &[ToolStep], rig: &Rig, filename: &str, codename: &str) -> Res<bool> {
+/// The report on disk is the last `issue_list` byte for byte, carries
+/// `token` (something only the repository knows), and the last message
+/// names the file.
+fn file_and_notice(steps: &[ToolStep], rig: &Rig, filename: &str, token: &str) -> Res<bool> {
     let table = steps
         .iter()
         .rev()
@@ -1220,8 +1737,8 @@ fn file_and_notice(steps: &[ToolStep], rig: &Rig, filename: &str, codename: &str
         mark(file_ok),
         path.display()
     );
-    let carried = on_disk.as_deref().is_some_and(|t| t.contains(codename));
-    println!("[{}] кодовое имя {codename} из файла репозитория доехало до отчёта", mark(carried));
+    let carried = on_disk.as_deref().is_some_and(|t| t.contains(token));
+    println!("[{}] {token} из репозитория доехал до отчёта", mark(carried));
     let last = rig.notify.messages()?.pop();
     let notice = last.as_ref().and_then(|m| m["text"].as_str()).is_some_and(|t| t.contains(filename));
     println!(
@@ -1233,22 +1750,107 @@ fn file_and_notice(steps: &[ToolStep], rig: &Rig, filename: &str, codename: &str
     Ok(file_ok && carried && notice)
 }
 
+fn clone_step(s: &ToolStep) -> ToolStep {
+    ToolStep {
+        name: s.name.clone(),
+        server: s.server.clone(),
+        args: s.args.clone(),
+        result: s.result.clone(),
+        is_error: s.is_error,
+        structured: s.structured.clone(),
+    }
+}
+
+/// A copy of `steps` with `tamper` applied must be caught by the audit.
+fn control(n: usize, what: &str, steps: &[ToolStep], tamper: impl FnOnce(&mut Vec<ToolStep>)) -> bool {
+    let mut t: Vec<ToolStep> = steps.iter().map(clone_step).collect();
+    tamper(&mut t);
+    let caught = check_flow(&t).iter().any(|c| !c.ok);
+    println!("[{}] контроль {n}: {what} — пойман аудитом", mark(caught));
+    caught
+}
+
+/// The model gets `question` (no tool or server named) and the chat's
+/// system note; returns its calls after printing them as lanes and audit.
+fn live_flow(rig: Rig, question: &str, settings: &Settings, flow: &Flow) -> Res<(Rig, Vec<ToolStep>, bool)> {
+    rig.clear_logs()?;
+    println!("вопрос: {question}");
+    let ep = Endpoint::for_model(&settings.model)?;
+    let mut tb = rig.tb;
+    let lanes = tb.lanes();
+    let system = format!(
+        "You are an agent with MCP tools. Answer in the language of the question.\n\n{}",
+        mcp_agent::chat_note(&tb)
+    );
+    let functions = tb.functions.clone();
+    println!("{}", lane_header(&lanes));
+    let mut n = 0;
+    let (outcome, steps, rounds) = mcp_agent::tool_loop(
+        &ep,
+        settings,
+        &system,
+        vec![json!({"role": "user", "content": question})],
+        &mut tb,
+        &functions,
+        &mut |s| {
+            n += 1;
+            println!("{}", lane_row(&lanes, n, s));
+        },
+    )?;
+    let rig = Rig { tb, ..rig };
+    let checks = check_flow(&steps);
+    for l in audit_lines(&steps, &checks) {
+        println!("    {l}");
+    }
+    let (_, full) = coverage(&steps, flow);
+    let audited = full && checks.iter().all(|c| c.ok);
+    println!("[{}] аудит флоу «{}»: все шаги ✓, покрыты все {}", mark(audited), flow.name, flow.tools.len());
+    let extra: Vec<&str> = steps
+        .iter()
+        .filter(|s| !flow.tools.contains(&s.name.as_str()))
+        .map(|s| s.name.as_str())
+        .collect();
+    println!(
+        "    выбор инструментов: {} вызовов, вне флоу: {}",
+        steps.len(),
+        if extra.is_empty() { "нет".into() } else { extra.join(", ") }
+    );
+    println!("    ответ модели: {}", one_line(outcome.text(), 300));
+    println!(
+        "    раундов {} [{}]",
+        rounds.len(),
+        rounds
+            .iter()
+            .map(|r| format!("{} ({}→{})", r.finish_reason, r.prompt_tokens, r.completion_tokens))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok((rig, steps, audited))
+}
+
 /// `ask --verify-orchestra offline|live|all`.
 ///
-/// A fixture repository with three `TODO:` markers whose authors have
-/// random names, and four real servers on four ports.
+/// A fixture repository whose authors have random names, and four real
+/// servers on four ports. Two flows, each on a fresh tracker and outbox:
 ///
-/// * offline — [`run_triage`] through the toolbox: Confirmed only if the
-///   audit is all ✓ with all six steps, every server's *own* call log
-///   equals what was routed to it, the tracker holds exactly the three
-///   markers each on the author git names for that file, the report on disk
-///   equals `issue_list`, and the outbox message names it. Four controls
-///   must fail: a step moved before its producer, an assignee taken from
-///   HEAD instead of the file's history, a call tagged with the wrong
-///   server, and a real name collision that has to be routed by qualified
-///   name to the right one of two servers.
-/// * live — the *model* gets one sentence that names no tool and no
-///   server; the same checks, on a fresh tracker and outbox.
+/// * triage — three `TODO:` markers; the assignee of each is the author of
+///   *its file*, not of HEAD;
+/// * review — the latest commit touching `src/` (not HEAD) changed two
+///   files; the reviewer of each is the latest *other* author of that file,
+///   a different person per file and never the commit's author.
+///
+/// offline — [`run_triage`] / [`run_review`] through the toolbox: Confirmed
+/// only if the audit is all ✓ with every step of the flow, every server's
+/// *own* call log equals what was routed to it, the tracker holds exactly
+/// the expected tasks on the expected people, the report on disk equals
+/// `issue_list`, and the outbox message names it. Seven controls must
+/// fail: steps moved before their producers, assignees from the wrong
+/// history, a call tagged with the wrong server, a source pointing at
+/// another commit, and a real name collision that has to be routed by
+/// qualified name to the right one of two servers.
+///
+/// live — the *model* gets one sentence per flow that names no tool and no
+/// server; the same checks.
 pub fn verify(which: &str, settings: &Settings) -> Res<bool> {
     let (offline, live) = match which {
         "offline" => (true, false),
@@ -1260,16 +1862,22 @@ pub fn verify(which: &str, settings: &Settings) -> Res<bool> {
     let base = TempDir(std::env::temp_dir().join(format!("ask-orchestra-proof-{code}")));
     let repo = base.0.join("repo");
     let fx = fixture_repo(&repo, &code)?;
+    let short = short_hash(&fx.review_hash).to_string();
     println!(
         "репозиторий-фикстура: {} — метки TODO: {}; HEAD от {}",
         repo.display(),
         fx.todos.iter().map(|(s, a)| format!("{s} ({a})")).collect::<Vec<_>>().join(", "),
         fx.head_author
     );
+    println!(
+        "  коммит для ревью {short} (автор {}, последний в src/, не HEAD): {}",
+        fx.review_author,
+        fx.review.iter().map(|(f, r)| format!("{f} → ревьюер {r}")).collect::<Vec<_>>().join(", ")
+    );
     let mut all_ok = true;
 
     if offline {
-        println!("\n== offline: автоматический флоу через 4 сервера ==");
+        println!("\n== offline 1/2: триаж через 4 сервера ==");
         let rig = Rig::new(&repo, &base.0, "offline")?;
         for s in &rig.tb.servers {
             println!("  {} — {}", s.conn.server_name, s.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
@@ -1283,107 +1891,99 @@ pub fn verify(which: &str, settings: &Settings) -> Res<bool> {
         let routed = rig.routing_matches(&rep.steps)?;
         let tracked = rig.tracker_matches(&fx)?;
         let delivered = file_and_notice(&rep.steps, &rig, &file, &fx.codename)?;
-
-        // Controls: each tampered flow must be caught.
-        let clone = |s: &ToolStep| ToolStep {
-            name: s.name.clone(),
-            server: s.server.clone(),
-            args: s.args.clone(),
-            result: s.result.clone(),
-            is_error: s.is_error,
-            structured: s.structured.clone(),
-        };
-        let caught = |steps: &[ToolStep]| check_flow(steps).iter().any(|c| !c.ok);
-        let mut reordered: Vec<ToolStep> = rep.steps.iter().map(clone).collect();
-        let first_issue = reordered.iter().position(|s| s.name == "issue_create").unwrap_or(0);
-        let moved = reordered.remove(first_issue);
-        reordered.insert(0, moved);
-        let c1 = caught(&reordered);
-        println!("[{}] контроль 1: issue_create перед search — порядок пойман аудитом", mark(c1));
-        let mut wrong_who: Vec<ToolStep> = rep.steps.iter().map(clone).collect();
-        if let Some(s) = wrong_who.iter_mut().find(|s| s.name == "issue_create") {
-            s.args["assignee"] = json!(fx.head_author);
-        }
-        let c2 = caught(&wrong_who);
-        println!(
-            "[{}] контроль 2: исполнитель = автор HEAD ({}), а не файла — пойман",
-            mark(c2),
-            fx.head_author
-        );
-        let mut misrouted: Vec<ToolStep> = rep.steps.iter().map(clone).collect();
-        if let Some(s) = misrouted.iter_mut().find(|s| s.name == "issue_create") {
-            s.server = NOTIFY.into();
-        }
-        let c3 = caught(&misrouted);
-        println!("[{}] контроль 3: issue_create, записанный на notify — пойман", mark(c3));
+        let c1 = control(1, "issue_create перед search", &rep.steps, |t| {
+            let k = t.iter().position(|s| s.name == "issue_create").unwrap_or(0);
+            let moved = t.remove(k);
+            t.insert(0, moved);
+        });
+        let head = fx.head_author.clone();
+        let c2 = control(2, &format!("исполнитель = автор HEAD ({head}), а не файла"), &rep.steps, |t| {
+            if let Some(s) = t.iter_mut().find(|s| s.name == "issue_create") {
+                s.args["assignee"] = json!(head);
+            }
+        });
+        let c3 = control(3, "issue_create, записанный на notify", &rep.steps, |t| {
+            if let Some(s) = t.iter_mut().find(|s| s.name == "issue_create") {
+                s.server = NOTIFY.into();
+            }
+        });
         let c4 = collision_control(&repo, &base.0)?;
-        let ok = rep.ok() && routed && tracked && delivered && c1 && c2 && c3 && c4;
-        println!("offline: {}", if ok { "Confirmed" } else { "Flat" });
+        let triage_ok = rep.ok() && routed && tracked && delivered && c1 && c2 && c3 && c4;
+
+        println!("\n== offline 2/2: ревью последнего коммита в src/ через 4 сервера ==");
+        let rig = Rig::new(&repo, &base.0, "offline-review")?;
+        let mut tb = rig.tb;
+        let file = format!("review-{code}.md");
+        let req = ReviewRequest::new(None, Some("src"), Some(&file));
+        let rep = run_review(&mut tb, &req, &lanes, &mut |l| println!("{l}"))?;
+        let rig = Rig { tb, ..rig };
+        println!("[{}] аудит флоу «ревью»: все шаги ✓, покрыты все 6", mark(rep.ok()));
+        let routed = rig.routing_matches(&rep.steps)?;
+        let tracked = rig.review_matches(&fx)?;
+        let delivered = file_and_notice(&rep.steps, &rig, &file, &short)?;
+        let author = fx.review_author.clone();
+        let c5 = control(5, &format!("ревьюер = автор коммита ({author}) — сам себе ревью"), &rep.steps, |t| {
+            if let Some(s) = t.iter_mut().find(|s| s.name == "issue_create") {
+                s.args["assignee"] = json!(author);
+            }
+        });
+        let c6 = control(6, "issue_create перед git_show", &rep.steps, |t| {
+            let k = t.iter().position(|s| s.name == "issue_create").unwrap_or(0);
+            let moved = t.remove(k);
+            t.insert(0, moved);
+        });
+        let c7 = control(7, "source указывает на другой коммит", &rep.steps, |t| {
+            if let Some(s) = t.iter_mut().find(|s| s.name == "issue_create") {
+                let src = s.args["source"].as_str().unwrap_or("").to_string();
+                let file = src.rsplit_once('@').map(|(f, _)| f).unwrap_or(&src).to_string();
+                s.args["source"] = json!(format!("{file}@0000000"));
+            }
+        });
+        let review_ok = rep.ok() && routed && tracked && delivered && c5 && c6 && c7;
+        let ok = triage_ok && review_ok;
+        println!(
+            "offline: {} (триаж {}, ревью {})",
+            if ok { "Confirmed" } else { "Flat" },
+            mark(triage_ok),
+            mark(review_ok)
+        );
         all_ok &= ok;
     }
 
     if live {
-        println!("\n== live: флоу собирает модель {} ==", settings.model);
-        let rig = Rig::new(&repo, &base.0, "live")?;
-        rig.clear_logs()?;
+        println!("\n== live 1/2: триаж собирает модель {} ==", settings.model);
         let file = format!("triage-live-{code}.md");
         let question = format!(
             "Разбери TODO-метки в проекте: на каждую заведи задачу в трекере на того, кто последним менял \
              этот файл. Потом сохрани список открытых задач в файл {file} и сообщи команде в канал team, \
              где лежит отчёт."
         );
-        println!("вопрос: {question}");
-        let ep = Endpoint::for_model(&settings.model)?;
-        let mut tb = rig.tb;
-        let lanes = tb.lanes();
-        let system = format!(
-            "You are an agent with MCP tools. Answer in the language of the question.\n\n{}",
-            mcp_agent::chat_note(&tb)
-        );
-        let functions = tb.functions.clone();
-        println!("{}", lane_header(&lanes));
-        let mut n = 0;
-        let (outcome, steps, rounds) = mcp_agent::tool_loop(
-            &ep,
-            settings,
-            &system,
-            vec![json!({"role": "user", "content": question})],
-            &mut tb,
-            &functions,
-            &mut |s| {
-                n += 1;
-                println!("{}", lane_row(&lanes, n, s));
-            },
-        )?;
-        let rig = Rig { tb, ..rig };
-        let checks = check_flow(&steps);
-        for l in audit_lines(&steps, &checks) {
-            println!("    {l}");
-        }
-        let (_, full) = coverage(&steps);
-        let audited = full && checks.iter().all(|c| c.ok);
-        println!("[{}] аудит флоу: все шаги ✓, покрыты все 6", mark(audited));
-        let extra: Vec<&str> = steps.iter().filter(|s| !FLOW.contains(&s.name.as_str())).map(|s| s.name.as_str()).collect();
-        println!(
-            "    выбор инструментов: {} вызовов, вне флоу: {}",
-            steps.len(),
-            if extra.is_empty() { "нет".into() } else { extra.join(", ") }
-        );
+        let (rig, steps, audited) = live_flow(Rig::new(&repo, &base.0, "live")?, &question, settings, &TRIAGE)?;
         let routed = rig.routing_matches(&steps)?;
         let tracked = rig.tracker_matches(&fx)?;
         let delivered = file_and_notice(&steps, &rig, &file, &fx.codename)?;
-        println!("    ответ модели: {}", one_line(outcome.text(), 300));
-        println!(
-            "    раундов {} [{}]",
-            rounds.len(),
-            rounds
-                .iter()
-                .map(|r| format!("{} ({}→{})", r.finish_reason, r.prompt_tokens, r.completion_tokens))
-                .collect::<Vec<_>>()
-                .join(", ")
+        let triage_ok = audited && routed && tracked && delivered;
+
+        println!("\n== live 2/2: ревью собирает модель {} ==", settings.model);
+        let file = format!("review-live-{code}.md");
+        let question = format!(
+            "Сделай ревью последнего коммита, который менял папку src: на каждый изменённый в нём файл \
+             заведи в трекере задачу на ревью. Ревьюер файла — последний, кто менял этот файл, кроме \
+             автора коммита (если других не было — сам автор). Сохрани список задач этого ревью в файл \
+             {file} и сообщи в канал dev, где лежит чек-лист."
         );
-        let ok = audited && routed && tracked && delivered;
-        println!("live: {}", if ok { "Confirmed" } else { "Flat" });
+        let (rig, steps, audited) = live_flow(Rig::new(&repo, &base.0, "live-review")?, &question, settings, &REVIEW)?;
+        let routed = rig.routing_matches(&steps)?;
+        let tracked = rig.review_matches(&fx)?;
+        let delivered = file_and_notice(&steps, &rig, &file, &short)?;
+        let review_ok = audited && routed && tracked && delivered;
+        let ok = triage_ok && review_ok;
+        println!(
+            "live: {} (триаж {}, ревью {})",
+            if ok { "Confirmed" } else { "Flat" },
+            mark(triage_ok),
+            mark(review_ok)
+        );
         all_ok &= ok;
     }
     Ok(all_ok)
@@ -1536,12 +2136,96 @@ mod tests {
         assert!(bad(&|s| s[1].server = TRACKER.into()) > 0, "git_log routed to tracker");
         assert!(bad(&|s| { let l = s.remove(7); s.insert(5, l); }) > 0, "issue_list before the last issue_create");
         assert!(bad(&|s| s[9].args["text"] = json!("готово")) > 0, "message without the report");
+        assert!(mentions_id("закрыл T-6, осталось 9", "T-6") && !mentions_id("T-60", "T-6"));
         // saveToFile fed with an edited table: its input digest no longer
         // matches any earlier output.
         let edited = tb
             .call_tool("saveToFile", json!({"filename": "b.md", "content": format!("{}\nP.S.", rep.table)}))
             .unwrap();
         assert!(bad(&|s| s[8].structured = edited.structured.clone()) > 0, "edited hand-off");
+    }
+
+    #[test]
+    fn review_walks_the_commit_and_assigns_other_authors() {
+        let base = TempDir(std::env::temp_dir().join(format!("ask-orchestra-review-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&base.0);
+        let repo = base.0.join("repo");
+        let fx = fixture_repo(&repo, "R").unwrap();
+        let rig = Rig::new(&repo, &base.0, "r").unwrap();
+        let mut tb = rig.tb;
+        let lanes = tb.lanes();
+        let mut seen = Vec::new();
+        let req = ReviewRequest::new(None, Some("src"), Some("r.md"));
+        let rep = run_review(&mut tb, &req, &lanes, &mut |l| seen.push(l)).unwrap();
+        let rig = Rig { tb, ..rig };
+        assert!(rep.ok(), "{seen:#?}");
+        let names: Vec<&str> = rep.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["git_log", "git_show", "git_log", "git_log", "issue_create", "issue_create", "issue_list",
+             "saveToFile", "notify_send"]
+        );
+        assert_eq!(server_path(&rep.steps), "git → tracker → pipeline → notify");
+        // Not HEAD (Carol's README) but the latest commit in src/, by Ada.
+        assert!(fx.review_hash.starts_with(rep.steps[1].args["rev"].as_str().unwrap()));
+        assert!(rig.routing_matches(&rep.steps).unwrap());
+        assert!(rig.review_matches(&fx).unwrap());
+        assert!(file_and_notice(&rep.steps, &rig, "r.md", short_hash(&fx.review_hash)).unwrap());
+        assert!(seen.iter().any(|l| l.contains("флоу «ревью»") && l.contains("все 6 шагов")), "{seen:#?}");
+        // Explicit rev, second run: same commit, no duplicates.
+        let mut tb = rig.tb;
+        let again = run_review(&mut tb, &ReviewRequest::new(Some(&fx.review_hash), None, None), &[], &mut |_| {}).unwrap();
+        assert!(again.ok());
+        assert_eq!(again.steps[0].name, "git_show");
+        assert_eq!(rig.tracker.issues("all").unwrap().len(), 2);
+        // Self-review and a source from another commit are caught.
+        let tamper = |f: &dyn Fn(&mut Vec<ToolStep>)| {
+            let mut t: Vec<ToolStep> = rep.steps.iter().map(clone_step).collect();
+            f(&mut t);
+            check_flow(&t).iter().any(|c| !c.ok)
+        };
+        assert!(!tamper(&|_| {}));
+        assert!(tamper(&|t| t[4].args["assignee"] = json!(fx.review_author)));
+        assert!(tamper(&|t| t[4].args["source"] = json!("src/lib.rs@0000000")));
+        assert!(tamper(&|t| t[1].args["rev"] = json!("0000000")));
+        assert!(tamper(&|t| t[2].args["path"] = json!("README.md")));
+        // Without git_show the file's own git_log still ties it to the commit.
+        assert!(!tamper(&|t| {
+            t.remove(1);
+        }));
+    }
+
+    #[test]
+    fn close_and_notify_are_tied_to_the_listed_task() {
+        let step = |name: &str, server: &str, args: Value, structured: Value| ToolStep {
+            name: name.into(),
+            server: server.into(),
+            args,
+            result: String::new(),
+            is_error: false,
+            structured,
+        };
+        let flow = |close: &str, text: &str| {
+            vec![
+                step("issue_list", TRACKER, json!({}), json!({"issues": [{"id": "T-6"}, {"id": "T-7"}]})),
+                step("issue_close", TRACKER, json!({"id": close}), json!({"id": close, "closed": true})),
+                step("notify_send", NOTIFY, json!({"channel": "dev", "text": text}), json!({"id": "m1"})),
+            ]
+        };
+        let bad = |steps: Vec<ToolStep>| check_flow(&steps).iter().filter(|c| !c.ok).count();
+        assert_eq!(bad(flow("T-6", "закрыл T-6, осталось 1")), 0);
+        assert_eq!(bad(flow("T-6", "готово")), 1, "message names no task");
+        assert_eq!(bad(flow("T-9", "закрыл T-9")), 1, "closed a task nobody listed");
+    }
+
+    #[test]
+    fn flow_args_split_into_main_scope_and_file() {
+        let s = |r: &str| split_flow_args(r);
+        assert_eq!(s(""), (String::new(), None, None));
+        assert_eq!(s("panic! in tree/task-20/src > p.md"), ("panic!".into(), Some("tree/task-20/src".into()), Some("p.md".into())));
+        assert_eq!(s("in src"), (String::new(), Some("src".into()), None));
+        assert_eq!(s("68b003e"), ("68b003e".into(), None, None));
+        assert_eq!(s("HEAD~1 > r.md"), ("HEAD~1".into(), None, Some("r.md".into())));
     }
 
     #[test]
@@ -1579,6 +2263,13 @@ mod tests {
         let dot = row.chars().position(|c| c == '●').unwrap();
         assert_eq!(head.chars().nth(dot), Some('g'));
         assert_eq!(todo_title("// TODO: повторять запрос", "TODO:"), "повторять запрос");
+        assert_eq!(todo_title("panic!(\"no result\");", "panic!"), "panic!(\"no result\");");
+        for real in ["// TODO: x", "# TODO: y", "- TODO: z", "/// TODO: doc", "<!-- TODO: html -->", " * TODO: block"] {
+            assert!(marker_in_comment(real, "TODO:"), "{real}");
+        }
+        for mention in ["//! pipeline.search «TODO:» → …", "next: &[free(\"TODO:\")],", "find `TODO:` markers", "x // see TODO: later"] {
+            assert!(!marker_in_comment(mention, "TODO:"), "{mention}");
+        }
         assert_eq!(alias("ask-pipeline-mcp"), "pipeline");
         assert_eq!(alias("DeepWiki"), "DeepWiki");
     }
