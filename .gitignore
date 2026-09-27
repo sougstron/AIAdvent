@@ -88,3 +88,9 @@ tree/task-17/target/*
 !tree/task-17/target/release/
 tree/task-17/target/release/*
 !tree/task-17/target/release/ask
+
+!tree/task-18/target/
+tree/task-18/target/*
+!tree/task-18/target/release/
+tree/task-18/target/release/*
+!tree/task-18/target/release/ask
