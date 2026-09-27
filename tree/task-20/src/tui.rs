@@ -3217,7 +3217,11 @@ impl App {
         // рисуем дорожки серверов и аудит маршрутов и порядка вместо списка.
         if crate::orchestra::is_orchestrated(&steps) {
             let lanes = self.mcp_lanes();
-            let checks = crate::orchestra::check_flow(&steps);
+            let request = self.entries.iter().rev().find_map(|e| match e {
+                Entry::User(t) => Some(t.as_str()),
+                _ => None,
+            });
+            let checks = crate::orchestra::check_turn(&steps, request.unwrap_or(""));
             let mut lines = crate::orchestra::render(&steps, &lanes);
             lines.extend(crate::orchestra::audit_lines(&steps, &checks));
             self.entries.push(Entry::Flow(lines.join("\n")));

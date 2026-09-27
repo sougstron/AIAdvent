@@ -1249,6 +1249,27 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                 if created == 0 && !late {
                     continue;
                 }
+                // A look at the tracker before any work ("покажи открытые задачи") is
+                // fine as long as a later issue_list sees every task and this early,
+                // incomplete list is not the one that ends up saved or summarized.
+                let rest = &steps[i + 1..];
+                let recheck = rest.iter().enumerate().any(|(j, p)| {
+                    p.name == "issue_list" && !rest[j + 1..].iter().any(|q| q.name == "issue_create")
+                });
+                let mine = s.structured["digest"].as_str();
+                let consumed = mine.is_some()
+                    && rest.iter().any(|p| {
+                        matches!(p.name.as_str(), "summarize" | "saveToFile")
+                            && p.structured["input"]["digest"].as_str() == mine
+                    });
+                if created == 0 && recheck && !consumed {
+                    out.push(Check {
+                        soft: false,
+                        ok: true,
+                        text: format!("шаг {n} issue_list: просмотр трекера до работы; полный список — позже"),
+                    });
+                    continue;
+                }
                 out.push(Check {
                     soft: false,
                     ok: !late,
@@ -1350,6 +1371,26 @@ pub fn check_flow(steps: &[ToolStep]) -> Vec<Check> {
                 });
             }
             _ => {}
+        }
+    }
+    out
+}
+
+/// [`check_flow`] for a chat turn: an `issue_close` id the user named in
+/// `request` ("закрой T-2") is theirs, not invented — even if the task was
+/// created in an earlier turn and no tracker output of this turn shows it. The
+/// close itself still has to succeed, so the tracker vouches that it existed.
+pub fn check_turn(steps: &[ToolStep], request: &str) -> Vec<Check> {
+    let mut out = check_flow(steps);
+    for c in out.iter_mut().filter(|c| !c.ok) {
+        let Some(n) = c.text.strip_prefix("шаг ").and_then(|t| t.split(' ').next()?.parse::<usize>().ok()) else {
+            continue;
+        };
+        let s = &steps[n - 1];
+        let Some(id) = s.structured["id"].as_str() else { continue };
+        if s.name == "issue_close" && !s.is_error && mentions_id(request, id) {
+            c.ok = true;
+            c.text = format!("шаг {n} issue_close {id}: задачу назвал пользователь в запросе, трекер её закрыл");
         }
     }
     out
@@ -2185,6 +2226,54 @@ mod tests {
         assert!(bad(&|s| s[1].server = TRACKER.into()) > 0, "git_log routed to tracker");
         assert!(bad(&|s| { let l = s.remove(7); s.insert(5, l); }) > 0, "issue_list before the last issue_create");
         assert!(bad(&|s| s[9].args["text"] = json!("готово")) > 0, "message without the report");
+        // A look at the tracker before the flow is not an order error, unless that
+        // early (incomplete) list is what gets saved.
+        let early = |s: &mut Vec<ToolStep>, digest: &str| {
+            let l = &s[7];
+            let mut structured = l.structured.clone();
+            structured["digest"] = json!(digest);
+            let step = ToolStep {
+                name: l.name.clone(),
+                server: l.server.clone(),
+                args: json!({}),
+                result: "0 задач".into(),
+                is_error: false,
+                structured,
+            };
+            s.insert(0, step);
+        };
+        assert_eq!(bad(&|s| early(s, "0000early")), 0, "issue_list as a first look");
+        assert!(
+            bad(&|s| {
+                early(s, "0000early");
+                s[9].structured["input"]["digest"] = json!("0000early");
+            }) > 0,
+            "early list saved to the file"
+        );
+        // Closing a task from an earlier chat turn: only the id the user named passes.
+        let mut steps: Vec<ToolStep> = rep
+            .steps
+            .iter()
+            .map(|s| ToolStep {
+                name: s.name.clone(),
+                server: s.server.clone(),
+                args: s.args.clone(),
+                result: s.result.clone(),
+                is_error: s.is_error,
+                structured: s.structured.clone(),
+            })
+            .collect();
+        steps.push(ToolStep {
+            name: "issue_close".into(),
+            server: TRACKER.into(),
+            args: json!({"id": "T-99"}),
+            result: "T-99 закрыта".into(),
+            is_error: false,
+            structured: json!({"id": "T-99"}),
+        });
+        let failed = |req: &str| check_turn(&steps, req).iter().filter(|c| !c.ok).count();
+        assert_eq!(failed("закрой T-99, её завели вчера"), 0);
+        assert!(failed("закрой T-9") > 0, "an id the user did not name");
         assert!(mentions_id("закрыл T-6, осталось 9", "T-6") && !mentions_id("T-60", "T-6"));
         // saveToFile fed with an edited table: its input digest no longer
         // matches any earlier output.
