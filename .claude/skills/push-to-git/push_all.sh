@@ -105,6 +105,45 @@ echo "  ok: '$want' is present on origin/main"
 git log --oneline -3 refs/remotes/origin/main | sed 's/^/  /'
 
 echo
+echo "== advancing local main (the checkout the human runs things from) =="
+# kanban's `land: worktree` copies files into the main checkout but never moves
+# its `main`, so tools that read local history (git log -- tree/task-N) see the
+# landed folders as untracked. Move local main only when that checkout's files
+# are already byte-identical to origin/main: then only the ref and the index
+# change, not a single file on disk.
+target=$(git rev-parse refs/remotes/origin/main)
+local_main=$(git rev-parse --verify --quiet refs/heads/main || true)
+main_wt=$(git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch refs\/heads\/main$/{print w}')
+if [ "$local_main" = "$target" ]; then
+  echo "  local main already at origin/main"
+elif [ -n "$local_main" ] && ! git merge-base --is-ancestor "$local_main" "$target"; then
+  echo "  local main has commits origin/main lacks — not moving it (ask the human)"
+elif [ -z "$main_wt" ]; then
+  git update-ref -m "push_all: fast-forward to origin/main" refs/heads/main "$target" ${local_main:+"$local_main"} \
+    && echo "  local main -> $target (no checkout holds it)"
+else
+  idx=$(mktemp)
+  same=0
+  if GIT_INDEX_FILE="$idx" git -C "$main_wt" read-tree "$target" \
+     && GIT_INDEX_FILE="$idx" git -C "$main_wt" update-index -q --refresh >/dev/null; then
+    GIT_INDEX_FILE="$idx" git -C "$main_wt" diff-files --quiet \
+      && [ -z "$(GIT_INDEX_FILE="$idx" git -C "$main_wt" ls-files -o --exclude-standard)" ] \
+      && same=1
+  fi
+  if [ "$same" = 1 ]; then
+    git update-ref -m "push_all: fast-forward to origin/main (files already identical)" refs/heads/main "$target" "$local_main" \
+      && git -C "$main_wt" reset -q \
+      && echo "  local main in $main_wt -> $target (files untouched, status now clean)"
+  else
+    echo "  local main in $main_wt NOT moved: its files differ from origin/main:"
+    GIT_INDEX_FILE="$idx" git -C "$main_wt" diff-files --name-status | head -10 | sed 's/^/    /'
+    GIT_INDEX_FILE="$idx" git -C "$main_wt" ls-files -o --exclude-standard | head -10 | sed 's/^/    ?? /'
+    echo "  (land or commit those first; nothing was changed)"
+  fi
+  rm -f "$idx"
+fi
+
+echo
 echo "== stale remote branches =="
 git fetch origin --prune --quiet
 stale=""
