@@ -14,6 +14,7 @@ use crate::isolation;
 use crate::mcp;
 use crate::mcp_agent;
 use crate::mcp_server;
+use crate::orchestra;
 use crate::memory;
 use crate::profile;
 use crate::render;
@@ -63,6 +64,9 @@ use crate::verify;
         ask --pipeline квазар --pipeline-source wikipedia --pipeline-file kvazar.md\n  \
         ask --pipeline-serve                  run the pipeline MCP server on 127.0.0.1:8767/mcp\n  \
         ask --verify-pipeline [offline|live|all]   prove the chain runs and hands data over intact\n  \
+        ask --orchestra-demo /tmp/triage-demo  make a small git repo with TODO markers by several authors\n  \
+        ask --triage --pipeline-root /tmp/triage-demo   TODO triage across 4 MCP servers: git, pipeline, tracker, notify\n  \
+        ask --verify-orchestra [offline|live|all]  prove routing and call order of the multi-server flow\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -321,6 +325,30 @@ pub struct Cli {
     /// sentence) or `all`.
     #[arg(long, value_name = "WHICH", num_args = 0..=1, default_missing_value = "all")]
     pub verify_pipeline: Option<String>,
+
+    /// Task 20: TODO triage across four MCP servers — `search` (pipeline) →
+    /// `git_log` per file (git) → `issue_create` per marker and
+    /// `issue_list` (tracker) → `saveToFile` (pipeline) → `notify_send`
+    /// (notify). The repository is `--pipeline-root`. Optional marker,
+    /// default `TODO:`.
+    #[arg(long, value_name = "MARKER", num_args = 0..=1, default_missing_value = "TODO:")]
+    pub triage: Option<String>,
+
+    /// File name of the triage report in `~/.ask6/pipeline/`.
+    #[arg(long, value_name = "NAME", default_value = "triage.md")]
+    pub triage_file: String,
+
+    /// Create a small git repository with `TODO:` markers by several authors
+    /// in DIR (must not exist or be empty) — a playground for the triage.
+    #[arg(long, value_name = "DIR")]
+    pub orchestra_demo: Option<String>,
+
+    /// Causal proof for task 20: `offline` (the automatic flow over four
+    /// servers, checked against each server's own log, with four controls
+    /// that must fail), `live` (the model assembles the flow from one
+    /// sentence) or `all`.
+    #[arg(long, value_name = "WHICH", num_args = 0..=1, default_missing_value = "all")]
+    pub verify_orchestra: Option<String>,
 
     /// Live proof for the task state machine: `machine` (legal transitions
     /// pass, illegal ones are refused — no network), `wire` (what the state
@@ -750,6 +778,40 @@ pub fn run() -> Res<()> {
         } else {
             Err("pipeline not confirmed".into())
         };
+    }
+
+    if let Some(which) = cli.verify_orchestra.as_deref() {
+        let settings = cli.to_settings()?;
+        println!("проверяю оркестрацию MCP-серверов ({which}) на модели {}", settings.model);
+        return if orchestra::verify(which, &settings)? {
+            Ok(())
+        } else {
+            Err("orchestration not confirmed".into())
+        };
+    }
+
+    if let Some(dir) = cli.orchestra_demo.as_deref() {
+        let fx = orchestra::demo(std::path::Path::new(dir))?;
+        println!("демо-репозиторий: {dir}");
+        for (src, who) in &fx.todos {
+            println!("  TODO в {src} — последним файл менял {who}");
+        }
+        println!("  последний коммит (HEAD) — {}: он НЕ исполнитель ни одной метки", fx.head_author);
+        println!("\nдальше: cd {dir} && ask   → в чате /triage или «разбери TODO в проекте …»");
+        return Ok(());
+    }
+
+    if let Some(marker) = cli.triage.as_deref() {
+        let root = std::path::Path::new(&cli.pipeline_root);
+        let mut tb = orchestra::local_toolbox(root)?;
+        for s in &tb.servers {
+            println!("MCP: {} — {}", s.conn.server_name, s.label);
+        }
+        let lanes = tb.lanes();
+        let req = orchestra::TriageRequest::new(Some(marker), Some(&cli.triage_file));
+        let rep = orchestra::run_triage(&mut tb, &req, &lanes, &mut |l| println!("{l}"))?;
+        println!("\n--- {} ---\n{}", rep.path, rep.table);
+        return if rep.ok() { Ok(()) } else { Err("triage flow audit failed".into()) };
     }
 
     if cli.pipeline.is_some() || cli.pipeline_serve {

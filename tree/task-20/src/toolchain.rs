@@ -206,7 +206,8 @@ impl Server {
         let (hits, truncated) = match source {
             "files" => {
                 let limit = limit_arg(args, 20, 50)?;
-                search_files(&self.root, &self.out, query, limit)?
+                let exact = args["case_sensitive"].as_bool().unwrap_or(false);
+                search_files(&self.root, &self.out, query, limit, exact)?
             }
             "wikipedia" => {
                 let limit = limit_arg(args, 3, 10)?;
@@ -347,6 +348,7 @@ pub fn tool_specs() -> Vec<Value> {
                     "source": {"type": "string", "enum": ["files", "wikipedia"], "description": "Where to search (default files)."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Max hits: files default 20 (≤50), wikipedia default 3 (≤10)."},
                     "lang": {"type": "string", "description": "Wikipedia language code (default ru)."},
+                    "case_sensitive": {"type": "boolean", "description": "files only: match the words case-sensitively (default false), e.g. to find `TODO:` markers but not the word todo."},
                 },
                 "required": ["query"],
                 "additionalProperties": false,
@@ -385,11 +387,18 @@ pub fn tool_specs() -> Vec<Value> {
 // ---------------------------------------------------------------- search
 
 /// Lines of text files under `root` containing every word of `query`
-/// (case-insensitive), as `(path:line, text)`. Hidden entries, `target`,
+/// (case-insensitive unless `exact`), as `(path:line, text)`. Hidden entries, `target`,
 /// `node_modules`, the output folder and binary / large files are skipped.
 /// Returns the hits and whether `limit` cut the scan short.
-pub fn search_files(root: &Path, skip: &Path, query: &str, limit: usize) -> Res<(Vec<(String, String)>, bool)> {
-    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+pub fn search_files(
+    root: &Path,
+    skip: &Path,
+    query: &str,
+    limit: usize,
+    exact: bool,
+) -> Res<(Vec<(String, String)>, bool)> {
+    let fold = |s: &str| if exact { s.to_string() } else { s.to_lowercase() };
+    let words: Vec<String> = query.split_whitespace().map(fold).collect();
     let mut hits = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -418,8 +427,8 @@ pub fn search_files(root: &Path, skip: &Path, query: &str, limit: usize) -> Res<
             }
             let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
             for (n, line) in text.lines().enumerate() {
-                let lower = line.to_lowercase();
-                if words.iter().all(|w| lower.contains(w.as_str())) {
+                let folded = fold(line);
+                if words.iter().all(|w| folded.contains(w.as_str())) {
                     if hits.len() == limit {
                         return Ok((hits, true));
                     }
@@ -940,6 +949,7 @@ pub fn verify(which: &str, settings: &Settings) -> Res<bool> {
         let s2 = conn.call_tool("summarize", json!({"text": tampered}))?;
         let step = |name: &str, r: CallResult| ToolStep {
             name: name.into(),
+            server: SERVER_NAME.into(),
             args: Value::Null,
             result: r.text,
             is_error: r.is_error,
@@ -1143,6 +1153,7 @@ mod tests {
         // audit: honest chain ✓, retyped-and-changed hand-off ✗
         let step = |name: &str, r: CallResult| ToolStep {
             name: name.into(),
+            server: SERVER_NAME.into(),
             args: Value::Null,
             result: r.text,
             is_error: r.is_error,
@@ -1161,6 +1172,7 @@ mod tests {
         // A non-pipeline tool (git_log) feeding summarize by value counts as a producer.
         let git = ToolStep {
             name: "git_log".into(),
+            server: "ask-git-mcp".into(),
             args: Value::Null,
             result: "abc1234 2026-09-27 Carol: fix: the answer is 42".into(),
             is_error: false,

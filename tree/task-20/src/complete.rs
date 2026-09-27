@@ -181,6 +181,8 @@ pub const ROOT: &[Node] = &[
             leaf("off"),
             lit("git", "[repo path]", &[free("")]),
             lit("pipeline", "[search dir]", &[free("")]),
+            lit("tracker", "[db path]", &[free("")]),
+            lit("notify", "[outbox dir]", &[free("")]),
             free("http://…/mcp"),
         ],
     ),
@@ -198,6 +200,13 @@ pub const ROOT: &[Node] = &[
         hint: "[wiki] query [> file.md]",
         alts: &["пайплайн"],
         next: &[leaf("wiki"), free("query")],
+        sources: &[],
+    },
+    Node {
+        token: "triage",
+        hint: "[marker] [> file.md]",
+        alts: &["триаж"],
+        next: &[free("TODO:")],
         sources: &[],
     },
     Node {
