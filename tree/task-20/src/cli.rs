@@ -66,6 +66,7 @@ use crate::verify;
         ask --verify-pipeline [offline|live|all]   prove the chain runs and hands data over intact\n  \
         ask --orchestra-demo /tmp/triage-demo  make a small git repo with TODO markers by several authors\n  \
         ask --triage --pipeline-root /tmp/triage-demo   TODO triage across 4 MCP servers: git, pipeline, tracker, notify\n  \
+        ask --review --scope tree/task-20/src   review the latest commit there across the same 4 servers\n  \
         ask --verify-orchestra [offline|live|all]  prove routing and call order of the multi-server flow\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
@@ -333,6 +334,20 @@ pub struct Cli {
     /// default `TODO:`.
     #[arg(long, value_name = "MARKER", num_args = 0..=1, default_missing_value = "TODO:")]
     pub triage: Option<String>,
+
+    /// Task 20: review of a commit across the four servers — `git_log` →
+    /// `git_show` → `git_log` per changed file (git) → `issue_create` per
+    /// file on its reviewer and `issue_list` (tracker) → `saveToFile`
+    /// (pipeline) → `notify_send` (notify). Optional commit; default the
+    /// latest one (in `--scope`, if given). The repository is the one
+    /// `--pipeline-root` is in.
+    #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "")]
+    pub review: Option<String>,
+
+    /// Folder for `--triage` (where to search) and `--review` (whose latest
+    /// commit), relative to the repository root.
+    #[arg(long, value_name = "DIR")]
+    pub scope: Option<String>,
 
     /// File name of the triage report in `~/.ask6/pipeline/`.
     #[arg(long, value_name = "NAME", default_value = "triage.md")]
@@ -797,7 +812,13 @@ pub fn run() -> Res<()> {
             println!("  TODO в {src} — последним файл менял {who}");
         }
         println!("  последний коммит (HEAD) — {}: он НЕ исполнитель ни одной метки", fx.head_author);
-        println!("\nдальше: cd {dir} && ask   → в чате /triage или «разбери TODO в проекте …»");
+        println!(
+            "  последний коммит в src/ — {} от {}: ревьюеры {}",
+            &fx.review_hash[..7],
+            fx.review_author,
+            fx.review.iter().map(|(f, r)| format!("{f} → {r}")).collect::<Vec<_>>().join(", ")
+        );
+        println!("\nдальше: cd {dir} && ask   → в чате /triage, /review in src или «разбери TODO в проекте …»");
         return Ok(());
     }
 
@@ -808,10 +829,23 @@ pub fn run() -> Res<()> {
             println!("MCP: {} — {}", s.conn.server_name, s.label);
         }
         let lanes = tb.lanes();
-        let req = orchestra::TriageRequest::new(Some(marker), Some(&cli.triage_file));
+        let mut req = orchestra::TriageRequest::new(Some(marker), Some(&cli.triage_file));
+        req.path = cli.scope.clone();
         let rep = orchestra::run_triage(&mut tb, &req, &lanes, &mut |l| println!("{l}"))?;
         println!("\n--- {} ---\n{}", rep.path, rep.table);
         return if rep.ok() { Ok(()) } else { Err("triage flow audit failed".into()) };
+    }
+
+    if let Some(rev) = cli.review.as_deref() {
+        let mut tb = orchestra::local_toolbox(std::path::Path::new(&cli.pipeline_root))?;
+        for s in &tb.servers {
+            println!("MCP: {} — {}", s.conn.server_name, s.label);
+        }
+        let lanes = tb.lanes();
+        let req = orchestra::ReviewRequest::new(Some(rev), cli.scope.as_deref(), None);
+        let rep = orchestra::run_review(&mut tb, &req, &lanes, &mut |l| println!("{l}"))?;
+        println!("\n--- {} ---\n{}", rep.path, rep.table);
+        return if rep.ok() { Ok(()) } else { Err("review flow audit failed".into()) };
     }
 
     if cli.pipeline.is_some() || cli.pipeline_serve {
