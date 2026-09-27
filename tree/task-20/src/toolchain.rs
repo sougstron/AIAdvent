@@ -685,11 +685,16 @@ impl ChainReport {
 
 /// Long data in a shown argument list becomes `<N симв #digest>`.
 pub fn shown_args(args: &Value) -> String {
+    shown_args_within(args, 60)
+}
+
+/// [`shown_args`] with strings up to `max` chars shown verbatim.
+pub fn shown_args_within(args: &Value, max: usize) -> String {
     let mut a = args.clone();
     if let Some(obj) = a.as_object_mut() {
         for v in obj.values_mut() {
             if let Some(s) = v.as_str() {
-                if s.chars().count() > 60 {
+                if s.chars().count() > max {
                     *v = json!(format!("<{} симв #{}>", s.chars().count(), short(&digest(s))));
                 }
             }

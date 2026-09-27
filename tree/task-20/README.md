@@ -2496,35 +2496,39 @@ MCP-клиент (сам чат, `curl -X POST` или другой агент).
 
 ### Визуализация
 
-Каждый вызов рисуется строкой на дорожке своего сервера. Пока модель
-работает, строки появляются над спиннером по мере вызовов. После хода видна
-вся картина и аудит: ✓ зелёным, ✗ красным, ≈ жёлтым (≈ значит «в файл записан
-текст модели, а не выход инструмента»; это факт, а не ✓). Картина рисуется для
-любого хода, который задел больше одного сервера, а также трекер или
-уведомления. Ниже — настоящий `/review in tree/task-20/src`, запущенный из
-`tree/task-20/target/release`:
+В чате каждый вызов MCP записывается в момент вызова отдельной серой
+системной строкой: какой сервер, какой инструмент и с каким запросом, а под
+ней — результат (первые 8 строк, остальное посчитано). Так пишется *каждый*
+`tools/call`, прошедший через `Toolbox::call_tool`: и вызовы модели в
+обычном ходе, и шаги `/review` / `/triage`, и вызов инструмента, которого нет
+ни на одном сервере (`mcp ?`, результат красным). Пока модель размышляет,
+спиннер пишет «думаю»; пока идёт вызов — строку этого вызова. Таблицы-дорожек в
+чате больше нет (осталась в `--verify-orchestra`). После хода — аудит: ✓
+зелёным, ✗ красным, ≈ жёлтым (≈ значит «в файл записан текст модели, а не
+выход инструмента»; это факт, а не ✓). Ниже — настоящий `/review HEAD`:
 
 ```
-⇄ оркестрация «ревью»: git_log → git_show → git_log×файлы → issue_create×файлы → issue_list → saveToFile → notify_send
-    #  git            pipeline       tracker        notify           результат
-    1  ● git_log      ┆              ┆              ┆               tree/task-20/src → Evgeniy Sigitov
-    2  ● git_show     ┆              ┆              ┆               68b003e Evgeniy Sigitov: 11 файлов (+2136/−39)
-    3  ● git_log      ┆              ┆              ┆               docs/CurrentTask.md: 10 комм., последний Evgeniy Sigitov
-   …   (ещё 9 git_log — по файлу на строку)
-   13  ┆              ┆              ● issue_create ┆               T-1 docs/CurrentTask.md@68b003e → @Evgeniy Sigitov
-   …   (ещё 9 issue_create)
-   23  ┆              ┆              ● issue_list   ┆               10 задач, 1782 симв #1dbf12ca
-   24  ┆              ● saveToFile   ┆              ┆               review-68b003e.md (1927 байт) #1dbf12ca
-   25  ┆              ┆              ┆              ● notify_send   [m1] #dev
-  путь по серверам: git → tracker → pipeline → notify
-  флоу «ревью»: git_log×11 · git_show · issue_create×10 · issue_list · saveToFile · notify_send (все 6 шагов)
-  ✓ маршрутизация: 25/25 вызовов попали на сервер-владелец инструмента
-  ✓ шаг 2 git_show 68b003e: коммит из выдачи git_log (шаг 1)
-  ✓ шаг 3 git_log docs/CurrentTask.md: файл из изменённых в git_show (шаг 2)
-  ✓ шаг 13 issue_create T-1: файл docs/CurrentTask.md изменён в 68b003e по git_show (шаг 2); ревьюер Evgeniy Sigitov по git_log файла (шаг 3) — других авторов у файла нет
-  ✓ шаг 23 issue_list: после всех issue_create (10)
-  ✓ шаг 24 saveToFile получил выход issue_list (шаг 23) без искажений (#1dbf12ca, через content)
-  ✓ шаг 25 notify_send: в сообщении файл, сохранённый на шаге 24
+› /review HEAD
+⚙ tool call · mcp ask-git-mcp · git_show · запрос: {"rev":"HEAD"}
+  ← commit a7b6af80fa79cebdb347182ba6cc6e5fa006c133
+    Author: Evgeniy Sigitov <sougstron@mail.ru>
+    …
+⚙ tool call · mcp ask-git-mcp · git_log · запрос: {"limit":10,"path":"tree/task-20/memory/short/1790538797-7b89-1.json"}
+  ← a7b6af8 2026-09-27T22:58:06+03:00 Evgeniy Sigitov: kanban: live snapshot before TASK-099
+⚙ tool call · mcp ask-tracker-mcp · issue_create · запрос: {"assignee":"Evgeniy Sigitov","label":"review:a7b6af8",…}
+  ← T-21 создана: «Ревью a7b6af8 …»
+⚙ tool call · mcp ask-tracker-mcp · issue_list · запрос: {"label":"review:a7b6af8","status":"open"}
+  ← # Задачи (open, review:a7b6af8): 1
+    …
+⚙ tool call · mcp ask-pipeline-mcp · saveToFile · запрос: {"content":"<315 симв #c73083f6>","filename":"review-a7b6af8.md"}
+  ← [r1] saveToFile: 359 байт → /home/shmon/.ask6/pipeline/review-a7b6af8.md, #c73083f6
+⚙ tool call · mcp ask-notify-mcp · notify_send · запрос: {"channel":"dev","text":"Ревью a7b6af8 …"}
+  ← [m7] → #dev: Ревью a7b6af8 «kanban: live snapshot before TASK-099» …
+⇄ путь по серверам: git → tracker → pipeline → notify
+  флоу «ревью»: git_log · git_show · issue_create · issue_list · saveToFile · notify_send (все 6 шагов)
+  ✓ маршрутизация: 6/6 вызовов попали на сервер-владелец инструмента
+  ✓ шаг 2 git_log …: файл из изменённых в git_show (шаг 1)
+  …
 ```
 
 У этого репозитория один автор, поэтому ревьюер везде один и аудит прямо
