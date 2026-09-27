@@ -233,10 +233,64 @@ pub struct Toolbox {
     pub routes: Vec<Route>,
     /// Every `tools/call` since the last [`Toolbox::take_log`].
     pub log: Vec<ToolStep>,
-    /// Rendered lines of the calls of the turn in flight, for the chat to
-    /// show while the model is still working (task 20). Its own lock, so the
-    /// UI can read it while the turn holds the toolbox.
-    pub live: Arc<Mutex<Vec<String>>>,
+    /// Every `tools/call` as it happens, for the chat to put into the
+    /// transcript while the turn is still running (task 20). Its own lock,
+    /// so the UI can drain it while the turn holds the toolbox.
+    pub live: Arc<Mutex<Live>>,
+}
+
+/// What the chat shows of the calls in flight: finished calls not yet taken
+/// into the transcript, and the call running right now (the spinner names it
+/// instead of "думаю").
+#[derive(Default)]
+pub struct Live {
+    pub done: Vec<CallLine>,
+    pub calling: Option<String>,
+}
+
+/// One finished `tools/call` as the chat prints it: the call line, then the
+/// result under it.
+pub struct CallLine {
+    pub call: String,
+    pub result: String,
+    pub is_error: bool,
+}
+
+/// `tool call · mcp ask-git-mcp · git_log · запрос: {"path":"src"}` — which
+/// server got which tool with which arguments.
+pub fn call_line(server: &str, tool: &str, args: &Value) -> String {
+    format!(
+        "tool call · mcp {} · {tool} · запрос: {}",
+        if server.is_empty() { "?" } else { server },
+        crate::toolchain::shown_args_within(args, 200)
+    )
+}
+
+/// The result as shown under its call line: the first lines of the text,
+/// long lines cut, the rest counted.
+pub fn result_lines(text: &str) -> String {
+    const LINES: usize = 8;
+    const WIDTH: usize = 160;
+    let text = text.trim_end();
+    let total = text.lines().count();
+    let mut out: Vec<String> = text
+        .lines()
+        .take(LINES)
+        .map(|l| {
+            let mut s: String = l.chars().take(WIDTH).collect();
+            if l.chars().count() > WIDTH {
+                s.push('…');
+            }
+            s
+        })
+        .collect();
+    if total > LINES {
+        out.push(format!("… (+{} строк)", total - LINES));
+    }
+    if out.is_empty() {
+        out.push("(пусто)".into());
+    }
+    out.join("\n")
 }
 
 pub type SharedToolbox = Arc<Mutex<Toolbox>>;
@@ -373,9 +427,32 @@ impl ToolCaller for Toolbox {
             } else {
                 format!("`{name}` exists on several servers — call one of: {}", shared.join(", "))
             }
-        })?;
+        });
+        let route = match route {
+            Ok(r) => r,
+            Err(e) => {
+                // Не дошедший ни до какого сервера вызов тоже виден в чате.
+                if let Ok(mut l) = self.live.lock() {
+                    l.done.push(CallLine { call: call_line("", name, &args), result: result_lines(&e), is_error: true });
+                }
+                return Err(e);
+            }
+        };
         let (server, tool) = (route.server, route.tool.clone());
-        self.servers[server].conn.call_tool(&tool, args)
+        let line = call_line(&self.servers[server].conn.server_name, &tool, &args);
+        if let Ok(mut l) = self.live.lock() {
+            l.calling = Some(line.clone());
+        }
+        let out = self.servers[server].conn.call_tool(&tool, args);
+        if let Ok(mut l) = self.live.lock() {
+            l.calling = None;
+            let (result, is_error) = match &out {
+                Ok(r) => (result_lines(&r.text), r.is_error),
+                Err(e) => (result_lines(e), true),
+            };
+            l.done.push(CallLine { call: line, result, is_error });
+        }
+        out
     }
 
     fn resolve(&self, name: &str) -> (String, String) {
@@ -574,5 +651,24 @@ mod tests {
         let r = ToolCaller::call_tool(&mut tb, "git_log", json!({"limit": 1})).unwrap();
         assert!(!r.is_error && r.text.contains("toolbox marker") && r.text.contains("Dana"));
         assert!(tb.take_log().is_empty());
+        // Каждый вызов записан для чата: строка вызова с сервером, именем и
+        // запросом, под ней результат; вызов мимо всех серверов — тоже.
+        let _ = ToolCaller::call_tool(&mut tb, "no_such_tool", json!({"q": 1}));
+        let live = tb.live.lock().unwrap();
+        assert!(live.calling.is_none());
+        assert_eq!(live.done.len(), 2);
+        assert_eq!(live.done[0].call, r#"tool call · mcp ask-git-mcp · git_log · запрос: {"limit":1}"#);
+        assert!(live.done[0].result.contains("toolbox marker") && !live.done[0].is_error);
+        assert!(live.done[1].call.starts_with("tool call · mcp ? · no_such_tool"));
+        assert!(live.done[1].is_error && live.done[1].result.contains("no attached MCP server"));
+    }
+
+    #[test]
+    fn result_lines_cut_long_output() {
+        let text: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        let r = result_lines(&text);
+        assert_eq!(r.lines().count(), 9);
+        assert!(r.ends_with("… (+12 строк)"));
+        assert_eq!(result_lines(""), "(пусто)");
     }
 }

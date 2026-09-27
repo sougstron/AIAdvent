@@ -1548,19 +1548,6 @@ fn brief(step: &ToolStep) -> String {
     }
 }
 
-/// The whole picture of a finished flow: title, lanes, one row per call.
-pub fn render(steps: &[ToolStep], lanes: &[String]) -> Vec<String> {
-    let mut used: Vec<&str> = steps.iter().map(|s| alias(&s.server)).collect();
-    used.sort_unstable();
-    used.dedup();
-    let mut lines = vec![
-        format!("оркестрация MCP · серверов: {} · вызовов: {}", used.len(), steps.len()),
-        lane_header(lanes),
-    ];
-    lines.extend(steps.iter().enumerate().map(|(i, s)| lane_row(lanes, i + 1, s)));
-    lines
-}
-
 // ---------------------------------------------------------------- fixture
 
 pub struct Fixture {

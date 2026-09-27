@@ -654,13 +654,8 @@ impl Agent {
                 .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
                 .collect();
             let functions = tb.functions.clone();
-            // Задача 20: каждый вызов сразу строкой-дорожкой в общую ленту —
-            // чат рисует её под спиннером, пока модель ещё работает.
-            let (live, lanes) = (tb.live.clone(), tb.lanes());
-            if let Ok(mut l) = live.lock() {
-                l.clear();
-            }
-            let mut n = 0;
+            // Задача 20: каждый вызов сам пишется в `Toolbox::live`
+            // (см. `Toolbox::call_tool`) — чат выводит его строкой сразу.
             let (outcome, steps, _) = mcp_agent::tool_loop(
                 &self.endpoint,
                 &settings,
@@ -668,12 +663,7 @@ impl Agent {
                 messages,
                 &mut *tb,
                 &functions,
-                &mut |s| {
-                    n += 1;
-                    if let Ok(mut l) = live.lock() {
-                        l.push(crate::orchestra::lane_row(&lanes, n, s));
-                    }
-                },
+                &mut |_| {},
             )?;
             tb.log.extend(steps);
             return Ok(outcome);

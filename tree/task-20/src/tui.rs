@@ -245,9 +245,13 @@ enum Entry {
     User(String),
     Assistant { text: String, note: Option<String> },
     Info(String),
-    /// Задача 20: картина вызовов MCP по дорожкам серверов и аудит флоу —
-    /// строки с ✓ зелёные, с ✗ красные, строки вызовов (●) яркие.
+    /// Задача 20: аудит флоу по вызовам MCP — строки с ✓ зелёные, с ✗
+    /// красные.
     Flow(String),
+    /// Один вызов MCP, записанный в момент вызова: строка `tool call · mcp
+    /// <сервер> · <инструмент> · запрос: <аргументы>` и под ней результат.
+    /// Системная строка — серым.
+    Tool { call: String, result: String, is_error: bool },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -319,9 +323,10 @@ struct App {
     /// rendered as the last line of the transcript, replacing the old
     /// full-screen "working" overlay.
     spinner: Option<(String, &'static str)>,
-    /// Лента вызовов MCP текущего хода (`Toolbox::live`) и шапка дорожек:
-    /// пока крутится спиннер, строки появляются над ним по мере вызовов.
-    flow_feed: Option<(std::sync::Arc<std::sync::Mutex<Vec<String>>>, String)>,
+    /// Лента вызовов MCP (`Toolbox::live`): пока крутится спиннер, каждый
+    /// законченный вызов сразу уходит в транскрипт строкой `Entry::Tool`, а
+    /// идущий сейчас вызов подписывает спиннер вместо «думаю».
+    flow_feed: Option<std::sync::Arc<std::sync::Mutex<crate::mcp_agent::Live>>>,
     /// Прогон задачи (`run.rs`): этап, фаза запроса, попытка, журнал
     /// переходов и подписи под планом. Вся лестница в TUI двигается
     /// **только** через `run.apply(...)` — прямых вызовов `TaskState::advance`
@@ -2939,8 +2944,9 @@ impl App {
         });
         let mut frame = 0usize;
         loop {
+            let calling = self.drain_live();
             self.spinner = Some((
-                label.to_string(),
+                calling.unwrap_or_else(|| label.to_string()),
                 SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
             ));
             if self.follow {
@@ -2948,11 +2954,13 @@ impl App {
             }
             let _ = terminal.draw(|f| self.draw(f));
             if self.poll_cancel_keys() {
+                self.drain_live();
                 self.spinner = None;
                 return None;
             }
             match rx.recv_timeout(Duration::from_millis(110)) {
                 Ok(v) => {
+                    self.drain_live();
                     self.spinner = None;
                     return Some(v);
                 }
@@ -3208,33 +3216,24 @@ impl App {
         }
     }
 
-    /// One info line per MCP `tools/call` the model made during the turn:
-    /// the proof in the transcript that the answer went through the tool.
+    /// After an MCP turn: every call is already in the transcript (one
+    /// `Entry::Tool` each, written as it happened); what's left is the audit
+    /// of the turn's route and hand-offs.
     fn show_mcp_steps(&mut self) {
+        self.drain_live();
         self.flow_feed = None;
         let steps = self.take_mcp_steps();
         // Задача 20: ход задел несколько серверов (или трекер/уведомления) —
-        // рисуем дорожки серверов и аудит маршрутов и порядка вместо списка.
+        // аудит маршрутов и порядка.
         if crate::orchestra::is_orchestrated(&steps) {
-            let lanes = self.mcp_lanes();
             let request = self.entries.iter().rev().find_map(|e| match e {
                 Entry::User(t) => Some(t.as_str()),
                 _ => None,
             });
             let checks = crate::orchestra::check_turn(&steps, request.unwrap_or(""));
-            let mut lines = crate::orchestra::render(&steps, &lanes);
-            lines.extend(crate::orchestra::audit_lines(&steps, &checks));
+            let lines = crate::orchestra::audit_lines(&steps, &checks);
             self.entries.push(Entry::Flow(lines.join("\n")));
             return;
-        }
-        for step in &steps {
-            self.entries.push(Entry::Info(format!(
-                "MCP → {} {}  ← {}{}",
-                step.name,
-                crate::toolchain::shown_args(&step.args),
-                if step.is_error { "ERROR " } else { "" },
-                crate::mcp_agent::preview(&step.result)
-            )));
         }
         // Задача 19: если модель сама собрала цепочку из инструментов
         // пайплайна — сверяем, что каждый получил ровно выход предыдущего.
@@ -3242,6 +3241,17 @@ impl App {
         if !audit.is_empty() {
             self.entries.push(Entry::Info(audit.join("\n")));
         }
+    }
+
+    /// Move finished MCP calls from the live feed into the transcript; returns
+    /// the call running right now, if any, for the spinner to show.
+    fn drain_live(&mut self) -> Option<String> {
+        let feed = self.flow_feed.clone()?;
+        let mut live = feed.lock().ok()?;
+        for c in live.done.drain(..) {
+            self.entries.push(Entry::Tool { call: c.call, result: c.result, is_error: c.is_error });
+        }
+        live.calling.clone()
     }
 
     /// Короткие имена подключённых серверов — дорожки картины вызовов.
@@ -3252,16 +3262,13 @@ impl App {
         }
     }
 
-    /// Перед ходом с MCP: очистить ленту `Toolbox::live` и показывать её под
-    /// спиннером, пока ход идёт (снимается в `show_mcp_steps`).
+    /// Перед ходом с MCP: подключить ленту `Toolbox::live`, чтобы вызовы
+    /// попадали в транскрипт по мере хода (снимается в `show_mcp_steps`).
+    /// Ленту не чистим: вызовы, досказанные прерванным (Esc) ходом, тоже
+    /// попадут в чат — записан должен быть каждый.
     fn arm_flow_feed(&mut self) {
         self.flow_feed = match self.agent.mcp().map(|tb| tb.lock()) {
-            Some(Ok(tb)) => {
-                if let Ok(mut l) = tb.live.lock() {
-                    l.clear();
-                }
-                Some((tb.live.clone(), crate::orchestra::lane_header(&tb.lanes())))
-            }
+            Some(Ok(tb)) => Some(tb.live.clone()),
             _ => None,
         };
     }
@@ -3320,28 +3327,25 @@ impl App {
         let Some(toolbox) = self.agent.mcp().cloned() else { return };
         self.entries.push(Entry::User(typed.trim_end().to_string()));
         self.arm_flow_feed();
-        let feed = self.flow_feed.as_ref().map(|(f, _)| f.clone()).unwrap_or_default();
         let lanes = self.mcp_lanes();
+        let header = crate::orchestra::lane_header(&lanes);
         let result = self.with_spinner(terminal, &format!("оркестрация: {route}"), move || {
             let mut tb = toolbox.lock().map_err(|e| format!("MCP: {e}"))?;
             let mut said = Vec::new();
+            // Вызовы сами пишутся в чат через `Toolbox::live`; здесь — только
+            // пояснения флоу (шапку дорожек и строки-дорожки не повторяем).
             let report = flow(&mut *tb, &lanes, &mut |l| {
-                // В ленту под спиннером — только строки вызовов.
-                if l.starts_with(|c: char| c == ' ' || c.is_ascii_digit()) && l.contains('\u{25cf}') {
-                    if let Ok(mut f) = feed.lock() {
-                        f.push(l.clone());
-                    }
+                if l != header && !l.contains('\u{25cf}') {
+                    said.push(l);
                 }
-                said.push(l);
             });
             Ok::<_, String>((report, said))
         });
+        self.drain_live();
         self.flow_feed = None;
         match result {
             Some(Ok((Ok(rep), _))) => {
-                let lanes = self.mcp_lanes();
-                let mut lines = crate::orchestra::render(&rep.steps, &lanes);
-                lines.extend(crate::orchestra::audit_lines(&rep.steps, &rep.checks));
+                let lines = crate::orchestra::audit_lines(&rep.steps, &rep.checks);
                 self.entries.push(Entry::Flow(lines.join("\n")));
                 self.entries.push(Entry::Info(format!("сохранено в {}:\n{}", rep.path, rep.table.trim_end())));
                 self.status = if rep.ok() {
@@ -3351,8 +3355,8 @@ impl App {
                 };
             }
             Some(Ok((Err(e), said))) => {
-                // Сделанные до остановки вызовы тоже видны — иначе «ничего
-                // не найдено» нечем проверить.
+                // Сделанные до остановки вызовы уже в чате; добавляем, почему
+                // флоу встал.
                 self.entries.push(Entry::Flow(said.join("\n")));
                 self.entries.push(Entry::Info(format!("оркестрация остановлена: {e}")));
                 self.status = format!("оркестрация остановлена: {e}");
@@ -3594,8 +3598,8 @@ impl App {
             let set = agent.invariants().clone();
             let hist = history.clone();
             let label = match stage {
-                Some(st) => format!("этап `{}`: проверяю ответ", st.id()),
-                None => "проверяю инварианты".to_string(),
+                Some(st) => format!("этап `{}`: думаю", st.id()),
+                None => "думаю".to_string(),
             };
             self.arm_flow_feed();
             let result = self.with_spinner(terminal, &label, move || {
@@ -3657,11 +3661,7 @@ impl App {
         if self.settings.json_mode.enabled || self.agent.mcp().is_some() {
             let agent = self.prepared_agent();
             let hist = history.clone();
-            let label = if agent.uses_mcp() {
-                "model is thinking (MCP tools on)"
-            } else {
-                "model is thinking"
-            };
+            let label = "думаю";
             self.arm_flow_feed();
             let result = self.with_spinner(terminal, label, move || {
                 agent.complete_outcome(&hist)
@@ -4212,12 +4212,10 @@ impl App {
                     out.extend(flow_lines(text));
                     out.push(Line::raw(""));
                 }
-            }
-        }
-        if let (Some(_), Some((feed, header))) = (&self.spinner, &self.flow_feed) {
-            let rows = feed.lock().map(|f| f.clone()).unwrap_or_default();
-            if !rows.is_empty() {
-                out.extend(flow_lines(&format!("{header}\n{}", rows.join("\n"))));
+                Entry::Tool { call, result, is_error } => {
+                    out.extend(tool_lines(call, result, *is_error));
+                    out.push(Line::raw(""));
+                }
             }
         }
         if let Some((label, frame)) = &self.spinner {
@@ -4848,6 +4846,18 @@ fn marked_lines(
     rows
 }
 
+/// Строки `Entry::Tool`: вызов и результат под ним — серым, как системные;
+/// результат-ошибка — красным.
+fn tool_lines(call: &str, result: &str, is_error: bool) -> Vec<Line<'static>> {
+    let mut out = marked_lines("\u{2699} ", muted(), call, muted());
+    let style = if is_error { Style::default().fg(Color::Red) } else { muted() };
+    for (i, line) in result.lines().enumerate() {
+        let lead = if i == 0 { if is_error { "  \u{2190} ERROR " } else { "  \u{2190} " } } else { "    " };
+        out.push(Line::from(vec![Span::styled(lead.to_string(), muted()), Span::styled(line.to_string(), style)]));
+    }
+    out
+}
+
 /// Строки `Entry::Flow`: ✗ — красным, ✓ — зелёным, ≈ (записан текст модели,
 /// а не выход инструмента) — жёлтым, вызов (●) — обычным
 /// цветом с акцентной точкой, остальное (шапка, путь, покрытие) — приглушённо.
@@ -5140,6 +5150,23 @@ mod tests {
             Some(Entry::Info(t)) => assert!(t.contains("git_log(") && t.contains("git_status(")),
             _ => panic!("no /mcp listing"),
         }
+        // Вызов инструмента попадает в чат отдельной строкой `Entry::Tool`.
+        app.arm_flow_feed();
+        {
+            let tb = app.agent.mcp().unwrap().clone();
+            let mut tb = tb.lock().unwrap();
+            let _ = crate::mcp_agent::ToolCaller::call_tool(&mut *tb, "git_log", serde_json::json!({"limit": 1}));
+        }
+        app.show_mcp_steps();
+        match app.entries.last() {
+            Some(Entry::Tool { call, result, is_error }) => {
+                assert!(call.starts_with("tool call · mcp ask-git-mcp · git_log · запрос: "), "{call}");
+                assert!(result.contains("chore: tui mcp") && !is_error, "{result}");
+            }
+            _ => panic!("no tool call line in the transcript"),
+        }
+        let text: Vec<String> = app.transcript_lines().iter().map(|l| l.to_string()).collect();
+        assert!(text.iter().any(|l| l.contains("tool call · mcp ask-git-mcp · git_log")), "{text:?}");
         app.settings.json_mode.enabled = true;
         assert!(!app.prepared_agent().uses_mcp(), "JSON mode keeps its own answer shape");
         app.cmd_mcp("off");
