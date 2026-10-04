@@ -5,6 +5,18 @@
 ## Текущая задача
 
 - **Task 22** — путь: `tree/task-22/`
+- Задача 22: **первый RAG-запрос**. `src/ragqa.rs`: вопрос → эмбеддинг
+  Ollama → top-k чанков индекса задачи 21 (без REFERENCES) → «ответь по
+  фрагментам, цитируй [n]» + `<context>` + вопрос → LLM. Агент с двумя
+  режимами: настройка `rag` (`/rag on|off`, строка в Tab-панели, `--rag`,
+  `--rag-k`, `--rag-strategy`); `/rag compare <N|вопрос>` — тот же вопрос без
+  и с RAG. Пятый MCP-сервер чата `ask-docs-mcp` (`src/docs_mcp.rs`:
+  `docs_list` / `docs_read` / `docs_search`) — сырое чтение PDF/MD/TXT из
+  `docs/` для сравнения. `docs/control.json` — 10 контрольных вопросов
+  (ожидание словами + проверяемые группы `must` + раздел-источник);
+  `ask --rag-eval` гоняет plain / rag / mcp и пишет `rag/eval.md`.
+  Прогон: plain 29/42, rag 42/42, mcp 42/42 при ×2.9 prompt-токенов.
+  Подробности — «Первый RAG-запрос» в `tree/task-22/README.md`.
 - Задача 21: **индексация документов** (первая из RAG-серии 21–25).
   `src/rag.rs`: `docs/*.pdf|md|txt` (сейчас — обзор RAG, arXiv 2312.10997,
   21 стр.) → чанки двумя стратегиями (`fixed`: `--chunk-size` /

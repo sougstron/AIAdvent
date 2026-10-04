@@ -71,6 +71,7 @@ const SETTINGS_ROWS: &[&str] = &[
     "top_k",
     "profile",
     "todo",
+    "rag",
     "approve",
     "system_prompt",
 ];
@@ -81,6 +82,8 @@ const PROFILE_USAGE: &str =
     "/profile [show|list|off|prompt|<id>], id из каталога — /profile list";
 const TODO_USAGE: &str = "/todo [show|on|off|start <задача>|approve [коммент]|reject <причина>|\
                           pause [почему]|resume|abort <причина>|log|reset|prompt]";
+const RAG_USAGE: &str =
+    "/rag [show|on|off|k N|strategy structure|fixed|questions|search <вопрос>|compare <N|вопрос>]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -201,6 +204,8 @@ pub fn run(settings: Settings, loaded: Option<Session>) -> Res<()> {
     // «разбери TODO, заведи задачи, сохрани отчёт и сообщи» шло через все четыре.
     app.cmd_mcp("tracker");
     app.cmd_mcp("notify");
+    // Задача 22: сырое чтение документов (`docs/`) — то, с чем сравнивается RAG.
+    app.cmd_mcp("docs");
     if let Some(msg) = boot {
         app.start_keyless(&msg);
     } else {
@@ -1170,6 +1175,7 @@ impl App {
             "mem" | "memory" => self.cmd_mem(rest),
             "profile" | "профиль" => self.cmd_profile(rest),
             "todo" | "туду" | "task" => self.cmd_todo(rest, terminal),
+            "rag" | "раг" => self.cmd_rag(rest, terminal),
             "branch" => self.cmd_branch(rest),
             "checkpoint" => self.cmd_checkpoint(rest),
             "temp" | "temperature" => self.cmd_temp(rest),
@@ -2861,6 +2867,165 @@ impl App {
     /// Usage: `/personas <question>` (default cast: physicist, philosopher,
     /// mathematician) or `/personas physicist,poet: <question>` for a custom
     /// cast.
+    /// Задача 22: retrieval в фоне под спиннером (эмбеддинг вопроса в
+    /// Ollama), Esc отменяет.
+    fn rag_prepare(&mut self, question: &str, terminal: &mut DefaultTerminal) -> Option<Res<crate::ragqa::Prepared>> {
+        let (q, k, strategy) = (question.to_string(), self.settings.rag_k, self.settings.rag_strategy.clone());
+        self.with_spinner(terminal, "RAG: ищу в индексе", move || crate::ragqa::prepare(&q, k, &strategy))
+    }
+
+    fn rag_card(&self) -> String {
+        let paths = crate::ragqa::default_paths();
+        let index = match crate::ragqa::Retriever::open(&paths.db, &self.settings.rag_strategy, &paths.url) {
+            Ok(r) => format!("{} — {} чанков `{}`, эмбеддинги {} ({})", r.db.display(), r.len(), r.strategy, r.model, paths.url),
+            Err(e) => format!("недоступен: {e}"),
+        };
+        format!(
+            "RAG: {} · k={} · стратегия {}\nиндекс: {index}\nдокументы: {} (их же читает MCP docs_list/docs_read/docs_search)\n\
+             Вкл: вопрос → эмбеддинг → ближайшие чанки → вопрос + чанки → LLM. Выкл: модель отвечает сама \
+             (а если подключён MCP docs — может прочитать документ сырьём).\n\
+             /rag questions — 10 контрольных вопросов · /rag compare <N|вопрос> — без RAG и с RAG рядом\n{RAG_USAGE}",
+            if self.settings.rag { "on" } else { "off" },
+            self.settings.rag_k,
+            self.settings.rag_strategy,
+            paths.dir.display()
+        )
+    }
+
+    /// `/rag …` — режим RAG и инструменты, чтобы сравнить ответы.
+    fn cmd_rag(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
+        let rest = rest.trim();
+        let (sub, arg) = rest.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((rest, ""));
+        match sub {
+            "" | "show" => self.entries.push(Entry::Info(self.rag_card())),
+            "on" | "off" => {
+                let on = sub == "on";
+                self.settings.rag = on;
+                self.agent.settings_mut().rag = on;
+                self.status = if on {
+                    format!("RAG on — к каждому вопросу {} чанка(ов) из индекса", self.settings.rag_k)
+                } else {
+                    "RAG off — модель отвечает без индекса".into()
+                };
+            }
+            "k" => match arg.parse::<usize>() {
+                Ok(k) if (1..=crate::ragqa::MAX_K).contains(&k) => {
+                    self.settings.rag_k = k;
+                    self.agent.settings_mut().rag_k = k;
+                    self.status = format!("RAG: k={k}");
+                }
+                _ => self.status = format!("/rag k N — N от 1 до {}", crate::ragqa::MAX_K),
+            },
+            "strategy" => match arg {
+                "structure" | "fixed" => {
+                    self.settings.rag_strategy = arg.to_string();
+                    self.agent.settings_mut().rag_strategy = arg.to_string();
+                    self.status = format!("RAG: чанки из стратегии {arg}");
+                }
+                _ => self.status = "/rag strategy structure|fixed".into(),
+            },
+            "questions" | "q" => {
+                let text = match crate::ragqa::load_controls(&crate::ragqa::default_paths().dir) {
+                    Ok(set) => {
+                        let mut lines = vec!["Контрольные вопросы по документу (docs/control.json):".to_string()];
+                        for c in &set {
+                            lines.push(format!("{:>2}. {}\n    ждём: {}\n    раздел: {}", c.id, c.q, c.expect, c.sources.join("; ")));
+                        }
+                        lines.push("Спросить: скопируйте вопрос в чат (с /rag on и без), или /rag compare N; все 10 разом — ask --rag-eval".into());
+                        lines.join("\n")
+                    }
+                    Err(e) => format!("RAG: {e}"),
+                };
+                self.entries.push(Entry::Info(text));
+            }
+            "search" if !arg.is_empty() => match self.rag_prepare(arg, terminal) {
+                Some(Ok(p)) => {
+                    let mut lines = vec![p.note];
+                    for (i, h) in p.hits.iter().enumerate() {
+                        let text: String = h.chunk.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let mut head: String = text.chars().take(240).collect();
+                        if text.chars().count() > 240 {
+                            head.push('…');
+                        }
+                        lines.push(format!("[{}] {head}", i + 1));
+                    }
+                    self.entries.push(Entry::Info(lines.join("\n")));
+                }
+                Some(Err(e)) => self.entries.push(Entry::Info(format!("RAG: {e}"))),
+                None => self.status = "поиск отменён (Esc)".into(),
+            },
+            "compare" if !arg.is_empty() => self.rag_compare(arg, terminal),
+            _ => self.status = RAG_USAGE.into(),
+        }
+    }
+
+    /// Один вопрос два раза — без RAG и с RAG, той же моделью, без истории
+    /// и без MCP-инструментов: разница только в том, есть ли в запросе
+    /// чанки. Номер — вопрос из `docs/control.json`, тогда видно и ожидание,
+    /// и сколько его попало в каждый ответ.
+    fn rag_compare(&mut self, arg: &str, terminal: &mut DefaultTerminal) {
+        let control = arg
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| crate::ragqa::load_controls(&crate::ragqa::default_paths().dir).ok()?.into_iter().find(|c| c.id == n));
+        let question = control.as_ref().map(|c| c.q.clone()).unwrap_or_else(|| arg.to_string());
+        self.entries.push(Entry::User(format!("/rag compare: {question}")));
+        if let Some(c) = &control {
+            self.entries.push(Entry::Info(format!("ждём: {}\nраздел: {}", c.expect, c.sources.join("; "))));
+        }
+        let prepared = match self.rag_prepare(&question, terminal) {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => {
+                self.entries.push(Entry::Info(format!("RAG: {e}")));
+                return;
+            }
+            None => {
+                self.status = "сравнение отменено (Esc)".into();
+                return;
+            }
+        };
+        let mut agent = self.prepared_agent();
+        agent.set_mcp(None);
+        // Ответ мимо валидатора инвариантов (`pipeline::run_stage_with`) —
+        // значит, и их блок в `system` ему не нужен, иначе модель дописывает
+        // служебную строку «ИНВАРИАНТЫ: …» прямо в ответ.
+        agent.settings_mut().invariants = false;
+        let note = prepared.note.clone();
+        for (label, prompt) in [("без RAG", question.clone()), ("с RAG", prepared.wire.clone())] {
+            if label == "с RAG" {
+                self.entries.push(Entry::Info(note.clone()));
+            }
+            let a = agent.clone();
+            let result = self.with_spinner(terminal, &format!("{label}: думаю"), move || {
+                a.complete_outcome(&[ChatMessage::user(prompt)])
+            });
+            match result {
+                Some(Ok(o)) => {
+                    let text = o.text().trim().to_string();
+                    let score = control
+                        .as_ref()
+                        .map(|c| {
+                            let (n, missing) = crate::ragqa::coverage(&text, &c.must);
+                            let miss = if missing.is_empty() { String::new() } else { format!(", нет: {}", missing.join(", ")) };
+                            format!(" · ожидаемого {n}/{}{miss}", c.must.len())
+                        })
+                        .unwrap_or_default();
+                    self.entries.push(Entry::Assistant {
+                        text: format!("[{label}]\n{text}"),
+                        note: Some(format!("{label} · prompt {} tok{score}", o.usage.prompt_tokens)),
+                    });
+                }
+                Some(Err(e)) => self.entries.push(Entry::Info(format!("[{label}] ошибка: {e}"))),
+                None => {
+                    self.status = "сравнение отменено (Esc)".into();
+                    return;
+                }
+            }
+            self.scroll_to_bottom(terminal);
+        }
+        self.status = "сравнение готово: тот же вопрос без RAG и с RAG".into();
+    }
+
     fn cmd_personas(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
         if rest.trim().is_empty() {
             self.status = "usage: /personas [persona,persona,...:] <question>".into();
@@ -3078,6 +3243,10 @@ impl App {
             "todo" => {
                 self.settings.todo = !self.settings.todo;
                 self.agent.settings_mut().todo = self.settings.todo;
+            }
+            "rag" => {
+                self.settings.rag = !self.settings.rag;
+                self.agent.settings_mut().rag = self.settings.rag;
             }
             // Кто подписывает план. Гейт не выключается ни в одном
             // положении: `auto` — это подпись «auto» в журнале, а не
@@ -3509,12 +3678,20 @@ impl App {
                 };
                 crate::mcp_agent::Toolbox::local_notify(&dir)
             }
+            "docs" => {
+                let dir = if arg.trim().is_empty() {
+                    crate::ragqa::default_paths().dir
+                } else {
+                    std::path::PathBuf::from(arg.trim())
+                };
+                crate::mcp_agent::Toolbox::local_docs(&dir)
+            }
             url if url.starts_with("http://") || url.starts_with("https://") => {
                 crate::mcp_agent::Toolbox::connect(url, url.to_string())
             }
             other => {
                 self.status = format!(
-                    "unknown /mcp {other} — /mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|<url>]"
+                    "unknown /mcp {other} — /mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|docs [dir]|<url>]"
                 );
                 return;
             }
@@ -3559,6 +3736,7 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) {
         let invariant_query = question.clone();
+        let staged = echo.is_some();
         // Calls left over from a turn cancelled with Esc belong to that turn.
         self.take_mcp_steps();
         self.session.push_user(question.clone());
@@ -3568,7 +3746,7 @@ impl App {
         }
         self.follow = true;
         self.agent.set_history(self.session.history());
-        let history = self.agent.history().to_vec();
+        let mut history = self.agent.history().to_vec();
         // Управление контекстом: свернуть отставшую часть истории до
         // отправки хода. При `compress=off` это no-op без запроса; иначе на
         // провод пойдёт `wire_history` — summary в system плюс хвост.
@@ -3583,6 +3761,29 @@ impl App {
         // dividing it by the provider's `prompt_tokens` is what calibrates
         // the footer's estimates (see `tokens.rs`).
         self.sent_shape = self.conversation_shape();
+        // Задача 22: RAG. Вопрос → ближайшие чанки индекса → на провод уходит
+        // вопрос вместе с ними. Подмена только в копии истории для этого
+        // хода: в сессии остаётся вопрос как он набран, и следующий ход не
+        // тащит старый контекст. Этапы тудушки — инструкции, а не вопросы
+        // по документу, их не трогаем.
+        if self.settings.rag && !staged {
+            match self.rag_prepare(&invariant_query, terminal) {
+                Some(Ok(p)) => {
+                    self.entries.push(Entry::Info(p.note));
+                    self.sent_shape = self.sent_shape.plus(crate::tokens::Shape::new(p.added, 0));
+                    if let Some(last) = history.last_mut() {
+                        last.content = p.wire;
+                    }
+                }
+                Some(Err(e)) => self.entries.push(Entry::Info(format!("RAG: {e} — отвечаю без RAG"))),
+                None => {
+                    self.session.messages.pop();
+                    self.session.resync_tree();
+                    self.status = "generation cancelled (Esc)".into();
+                    return;
+                }
+            }
+        }
 
         // With invariants enabled the complete answer must pass the
         // deterministic validator before any assistant text reaches the
@@ -4408,6 +4609,13 @@ impl App {
                     )
                 }
             }
+            "rag" => {
+                if self.settings.rag {
+                    format!("on   (k={}, {}; чанки из индекса — к каждому вопросу)", self.settings.rag_k, self.settings.rag_strategy)
+                } else {
+                    "off  (модель отвечает сама; /rag on)".to_string()
+                }
+            }
             "approve" => match self.settings.approve {
                 crate::run::ApprovePolicy::Manual => {
                     "manual (план утверждает человек: /todo approve)".to_string()
@@ -4771,7 +4979,9 @@ const HELP: &str = "\
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
-/mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|<url>]  MCP servers the chat may call (all four on by default)
+/rag [show|on|off|k N|strategy structure|fixed]  RAG: nearest chunks of rag/index.sqlite go with every question (off by default)
+/rag questions | search <q> | compare <N|q>  control questions / retrieval only / the same question without and with RAG
+/mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|docs [dir]|<url>]  MCP servers the chat may call (all five on by default)
 /pipeline [wiki] <query> [> file.md]  run search → summarize → saveToFile over MCP, every step shown
 /review [rev] [in dir] [> file.md]  review a commit over 4 MCP servers: git_log → git_show → git_log×files → issue_create×files → issue_list → saveToFile → notify_send
 /triage [marker] [in dir] [> file.md]  marker triage over 4 MCP servers: search → git_log → issue_create → issue_list → saveToFile → notify_send

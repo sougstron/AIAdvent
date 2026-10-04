@@ -116,6 +116,23 @@ impl Config {
         self
     }
 
+    /// Default chunking parameters over `dir` / `db`, paths resolved as
+    /// [`Config::resolve_paths`] does — how the chat and `--rag-eval` find
+    /// the index `--rag-index` built.
+    pub fn locate(dir: &str, db: &str) -> Config {
+        Config {
+            dir: dir.into(),
+            strategies: vec![Strategy::Structure],
+            size: 1000,
+            overlap: 200,
+            struct_max: 4000,
+            model: DEFAULT_MODEL.into(),
+            url: std::env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_URL.into()),
+            db: db.into(),
+        }
+        .resolve_paths()
+    }
+
     fn params(&self, s: Strategy) -> Value {
         match s {
             Strategy::Fixed => json!({"size": self.size, "overlap": self.overlap, "norm": NORM}),

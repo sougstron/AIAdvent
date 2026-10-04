@@ -1,0 +1,72 @@
+[
+  {
+    "id": 1,
+    "q": "What are the three paradigms of retrieval-augmented generation described in the survey?",
+    "expect": "Naive RAG, Advanced RAG and Modular RAG (an evolution: retrieve-read → pre/post-retrieval optimization → replaceable modules and flows).",
+    "must": ["naive", "advanced", "modular"],
+    "sources": ["II. OVERVIEW OF RAG"]
+  },
+  {
+    "id": 2,
+    "q": "What drawbacks of Naive RAG does the survey list?",
+    "expect": "Retrieval challenges (low precision/recall, misaligned or irrelevant chunks), generation difficulties (hallucination, irrelevance, toxicity, bias), augmentation hurdles (disjointed/incoherent output, redundancy and repetitive answers).",
+    "must": ["precision|recall", "hallucinat", "redundan|repetit", "incoheren|disjoint"],
+    "sources": ["Naive RAG"]
+  },
+  {
+    "id": 3,
+    "q": "Which techniques does the survey describe for query expansion and query transformation?",
+    "expect": "Expansion: Multi-Query, Sub-Query (least-to-most), Chain-of-Verification (CoVe). Transformation: query rewrite (RRR, BEQUE at Taobao), HyDE (hypothetical documents), Step-back prompting. Plus query routing.",
+    "must": ["multi-query|multi query|multiple quer", "sub-quer|sub-question|sub quer|subquer", "chain-of-verification|chain of verification|cove", "hyde|hypothetical", "step-back|step back"],
+    "sources": ["Query Optimization"]
+  },
+  {
+    "id": 4,
+    "q": "In index optimization, what is the Small2Big method and what metadata can be attached to chunks?",
+    "expect": "Small2Big: sentences (small) are the retrieval unit, the preceding and following sentences are given to the LLM as (big) context. Metadata: page number, file name, author, category, timestamp — used to filter retrieval.",
+    "must": ["sentence", "page", "file name|filename|file", "author", "timestamp|time"],
+    "sources": ["Indexing Optimization"]
+  },
+  {
+    "id": 5,
+    "q": "What is the 'Lost in the middle' problem and how does the survey suggest processing retrieved content because of it?",
+    "expect": "LLMs focus on the beginning and the end of a long context and forget the middle; so retrieved content is post-processed: reranking (put the most relevant first) and context selection/compression (e.g. LLMLingua).",
+    "must": ["beginning|start", "middle", "rerank|re-rank", "compress|llmlingua"],
+    "sources": ["Context Curation"]
+  },
+  {
+    "id": 6,
+    "q": "Which adaptive retrieval methods does the survey name, and how do they decide when to retrieve?",
+    "expect": "FLARE triggers retrieval when the probability (confidence) of generated terms falls below a threshold; Self-RAG uses reflection tokens (retrieve / critic) so the model decides itself when to retrieve.",
+    "must": ["flare", "self-rag|selfrag|self rag", "reflection", "probabilit|confiden|threshold"],
+    "sources": ["Adaptive Retrieval"]
+  },
+  {
+    "id": 7,
+    "q": "Which three quality scores and four required abilities are used to evaluate RAG models?",
+    "expect": "Quality scores: context relevance, answer faithfulness, answer relevance. Abilities: noise robustness, negative rejection, information integration, counterfactual robustness.",
+    "must": ["context relevance", "faithful", "answer relevance", "noise robust", "negative rejection", "information integration", "counterfactual"],
+    "sources": ["Evaluation Aspects"]
+  },
+  {
+    "id": 8,
+    "q": "Which benchmarks and automated tools for evaluating RAG does the survey mention?",
+    "expect": "Benchmarks RGB, RECALL, CRUD (essential abilities); automated tools RAGAS, ARES, TruLens that use LLMs to judge the quality scores.",
+    "must": ["rgb", "crud", "ragas", "ares", "trulens"],
+    "sources": ["Evaluation Benchmarks and Tools"]
+  },
+  {
+    "id": 9,
+    "q": "According to the survey, how does adding irrelevant documents to the context affect the accuracy of RAG?",
+    "expect": "Counter-intuitively, including irrelevant documents can increase accuracy by over 30% (contrary to the assumption that quality drops).",
+    "must": ["30", "increase|improve|higher|boost|rais"],
+    "sources": ["RAG Robustness"]
+  },
+  {
+    "id": 10,
+    "q": "How large a context can current LLMs handle according to the survey, and why is RAG still needed then?",
+    "expect": "Over 200,000 tokens; RAG is still needed because a huge context slows inference (chunked retrieval / on-demand input is more efficient) and RAG quickly locates original references so users can verify answers (the process is observable, long context is a black box).",
+    "must": ["200,000|200 000|200000|200k|200 k", "speed|slow|efficien|latency|cost", "verif|referenc|traceab|observab|black box"],
+    "sources": ["RAG vs Long Context"]
+  }
+]

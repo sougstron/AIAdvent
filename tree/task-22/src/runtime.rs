@@ -44,6 +44,7 @@ use crate::pipeline::{self, Decision};
 /// What a box refuses to *send*. Checked before any network call, so a
 /// rejection costs nothing.
 #[derive(Clone, Debug, Default)]
+
 pub struct InputPolicy {
     /// Reject prompts longer than this many characters.
     pub max_chars: Option<usize>,
@@ -490,6 +491,9 @@ pub struct AgentBox {
     fold_tokens: u64,
 }
 
+/// Rewrites one guarded prompt for the wire only (see [`AgentBox::ask_with`]).
+pub type WireFn<'a> = dyn Fn(&str) -> Res<String> + 'a;
+
 impl AgentBox {
     fn from_spec(endpoint: Endpoint, spec: BoxSpec) -> AgentBox {
         let mut agent = Agent::with_endpoint(endpoint, spec.settings.clone());
@@ -630,6 +634,14 @@ impl AgentBox {
     /// `Err` means the transport failed; a policy refusal is an `Ok` turn
     /// with `accepted() == false`.
     pub fn ask(&mut self, prompt: &str) -> Res<Turn> {
+        self.ask_with(prompt, None)
+    }
+
+    /// [`Self::ask`], but what goes to the model is `wire(sent)` — the
+    /// guarded prompt rewritten for this one request (task 22: RAG adds the
+    /// retrieved chunks). Session, memory and the invariant check keep the
+    /// prompt as it was typed.
+    pub fn ask_with(&mut self, prompt: &str, wire: Option<&WireFn<'_>>) -> Res<Turn> {
         let (verdict, sent) = self.input.apply(prompt);
         if verdict != InputVerdict::Allow {
             self.refused += 1;
@@ -659,6 +671,10 @@ impl AgentBox {
         if let Err(e) = self.agent.update_memory(&history) {
             eprintln!("warning: память не обновлена: {e}");
         }
+        let mut wire_history = history.clone();
+        if let (Some(wire), Some(last)) = (wire, wire_history.last_mut()) {
+            last.content = wire(&sent)?;
+        }
         let invariants = self.agent.invariants().clone();
         let invariants_enabled = self.agent.settings().invariants;
         let pipeline = pipeline::run_with(
@@ -666,7 +682,7 @@ impl AgentBox {
             invariants_enabled,
             &sent,
             |_, retry_note| {
-                let mut attempt_history = history.clone();
+                let mut attempt_history = wire_history.clone();
                 if let Some(note) = retry_note {
                     attempt_history.push(ChatMessage::user(note));
                 }
