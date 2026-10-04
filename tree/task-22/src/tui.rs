@@ -2884,7 +2884,7 @@ impl App {
             "RAG: {} · k={} · стратегия {}\nиндекс: {index}\nдокументы: {} (их же читает MCP docs_list/docs_read/docs_search)\n\
              Вкл: вопрос → эмбеддинг → ближайшие чанки → вопрос + чанки → LLM. Выкл: модель отвечает сама \
              (а если подключён MCP docs — может прочитать документ сырьём).\n\
-             /rag questions — 10 контрольных вопросов · /rag compare <N|вопрос> — без RAG и с RAG рядом\n{RAG_USAGE}",
+             /rag questions — 10 контрольных вопросов · /rag compare <N|вопрос> — без RAG (сам читает док через MCP) и с RAG рядом\n{RAG_USAGE}",
             if self.settings.rag { "on" } else { "off" },
             self.settings.rag_k,
             self.settings.rag_strategy,
@@ -2959,15 +2959,19 @@ impl App {
         }
     }
 
-    /// Один вопрос два раза — без RAG и с RAG, той же моделью, без истории
-    /// и без MCP-инструментов: разница только в том, есть ли в запросе
-    /// чанки. Номер — вопрос из `docs/control.json`, тогда видно и ожидание,
-    /// и сколько его попало в каждый ответ.
+    /// Один вопрос два раза — без RAG и с RAG, той же моделью, без истории.
+    /// Документ есть у обеих сторон, честно: без RAG модель сама ищет и
+    /// читает его через `ask-docs-mcp` (`docs_list`/`docs_read`/`docs_search`),
+    /// с RAG — получает top-k чанков из индекса и инструментов не имеет.
+    /// Сравниваем, кто как по доку ищет: вызовы, прочитанные символы и
+    /// разделы, prompt-токены. Номер — вопрос из `docs/control.json`, тогда
+    /// видно и ожидание, и сколько его попало в каждый ответ.
     fn rag_compare(&mut self, arg: &str, terminal: &mut DefaultTerminal) {
+        let paths = crate::ragqa::default_paths();
         let control = arg
             .parse::<usize>()
             .ok()
-            .and_then(|n| crate::ragqa::load_controls(&crate::ragqa::default_paths().dir).ok()?.into_iter().find(|c| c.id == n));
+            .and_then(|n| crate::ragqa::load_controls(&paths.dir).ok()?.into_iter().find(|c| c.id == n));
         let question = control.as_ref().map(|c| c.q.clone()).unwrap_or_else(|| arg.to_string());
         self.entries.push(Entry::User(format!("/rag compare: {question}")));
         if let Some(c) = &control {
@@ -2984,46 +2988,91 @@ impl App {
                 return;
             }
         };
-        let mut agent = self.prepared_agent();
-        agent.set_mcp(None);
-        // Ответ мимо валидатора инвариантов (`pipeline::run_stage_with`) —
-        // значит, и их блок в `system` ему не нужен, иначе модель дописывает
-        // служебную строку «ИНВАРИАНТЫ: …» прямо в ответ.
-        agent.settings_mut().invariants = false;
-        let note = prepared.note.clone();
-        for (label, prompt) in [("без RAG", question.clone()), ("с RAG", prepared.wire.clone())] {
-            if label == "с RAG" {
-                self.entries.push(Entry::Info(note.clone()));
+        let docs = match crate::mcp_agent::Toolbox::local_docs(&paths.dir) {
+            Ok(tb) => tb,
+            Err(e) => {
+                self.entries.push(Entry::Info(format!("ask-docs-mcp не поднялся: {e}")));
+                return;
             }
-            let a = agent.clone();
-            let result = self.with_spinner(terminal, &format!("{label}: думаю"), move || {
-                a.complete_outcome(&[ChatMessage::user(prompt)])
-            });
-            match result {
-                Some(Ok(o)) => {
-                    let text = o.text().trim().to_string();
-                    let score = control
-                        .as_ref()
-                        .map(|c| {
-                            let (n, missing) = crate::ragqa::coverage(&text, &c.must);
-                            let miss = if missing.is_empty() { String::new() } else { format!(", нет: {}", missing.join(", ")) };
-                            format!(" · ожидаемого {n}/{}{miss}", c.must.len())
-                        })
-                        .unwrap_or_default();
-                    self.entries.push(Entry::Assistant {
-                        text: format!("[{label}]\n{text}"),
-                        note: Some(format!("{label} · prompt {} tok{score}", o.usage.prompt_tokens)),
-                    });
-                }
-                Some(Err(e)) => self.entries.push(Entry::Info(format!("[{label}] ошибка: {e}"))),
-                None => {
-                    self.status = "сравнение отменено (Esc)".into();
-                    return;
-                }
+        };
+        let tools = docs.tool_names();
+        // Тот же агент, что у `ask --rag-eval`: модель и сэмплинг из
+        // настроек, фиксированный system и ничего больше (ни AGENTS.md, ни
+        // профиля, ни инвариантов) — обе стороны в равных условиях, ответы
+        // на одном языке с проверяемыми группами `must`.
+        let base = match crate::ragqa::eval_agent(&self.settings) {
+            Ok(a) => a,
+            Err(e) => {
+                self.entries.push(Entry::Info(format!("агент сравнения: {e}")));
+                return;
             }
+        };
+        let mut raw = base.clone();
+        raw.set_mcp(Some(std::sync::Arc::new(std::sync::Mutex::new(docs))));
+        let mut rag = base;
+        rag.set_mcp(None);
+        // Обе стороны знают, о каком документе вопрос; различается только
+        // то, как документ доходит до модели.
+        let titled = format!("About the document “{}”: {question}", prepared.title);
+        let must = control.as_ref().map(|c| c.must.clone()).unwrap_or_default();
+        let mut results = Vec::new();
+        for (mode, agent, prompt) in [
+            (crate::ragqa::Mode::Mcp, raw, titled.clone()),
+            (crate::ragqa::Mode::Rag, rag, crate::ragqa::augment(&titled, &prepared.hits)),
+        ] {
+            let label = if mode == crate::ragqa::Mode::Rag { "с RAG" } else { "без RAG · сам читает док" };
+            self.entries.push(Entry::Info(if mode == crate::ragqa::Mode::Rag {
+                prepared.note.clone()
+            } else {
+                format!("без RAG: индекса нет, документ доступен через MCP — {tools}")
+            }));
+            let (m, a) = (must.clone(), agent.clone());
+            let Some(ans) = self.with_spinner(terminal, &format!("{label}: думаю"), move || {
+                crate::ragqa::answer(&a, mode, &prompt, &m)
+            }) else {
+                self.status = "сравнение отменено (Esc)".into();
+                return;
+            };
+            if mode == crate::ragqa::Mode::Mcp {
+                let mut lines = vec![format!("поиск по доку без RAG: {} вызов(ов)", ans.tool_calls)];
+                lines.extend(ans.calls.iter().map(|c| format!("  {c}")));
+                if !ans.read_sections.is_empty() {
+                    lines.push(format!("  прочитаны разделы: {}", ans.read_sections.join("; ")));
+                }
+                self.entries.push(Entry::Info(lines.join("\n")));
+            }
+            let score = control
+                .as_ref()
+                .map(|c| {
+                    let miss = if ans.missing.is_empty() { String::new() } else { format!(", нет: {}", ans.missing.join(", ")) };
+                    format!(" · ожидаемого {}/{}{miss}", ans.covered, c.must.len())
+                })
+                .unwrap_or_default();
+            match &ans.error {
+                Some(e) => self.entries.push(Entry::Info(format!("[{label}] ошибка: {e}"))),
+                None => self.entries.push(Entry::Assistant {
+                    text: format!("[{label}]\n{}", ans.text),
+                    note: Some(format!("{label} · prompt {} tok{score}", ans.prompt_tokens)),
+                }),
+            }
+            results.push((label, ans));
             self.scroll_to_bottom(terminal);
         }
-        self.status = "сравнение готово: тот же вопрос без RAG и с RAG".into();
+        let summary: Vec<String> = results
+            .iter()
+            .map(|(label, a)| {
+                let reading = if a.mode == crate::ragqa::Mode::Mcp {
+                    format!(" · {} вызов(ов), прочитано {} симв.", a.tool_calls, a.read_chars)
+                } else {
+                    format!(" · {} чанка, +{} симв.", prepared.hits.len(), prepared.added)
+                };
+                let score = if must.is_empty() { String::new() } else { format!(" · ожидаемого {}/{}", a.covered, must.len()) };
+                format!("  {label}: prompt {} tok{reading} · {:.1} с{score}", a.prompt_tokens, a.latency_ms as f64 / 1000.0)
+            })
+            .collect();
+        self.entries.push(Entry::Info(format!("итог сравнения (документ у обеих сторон):\n{}", summary.join("\n"))));
+        self.scroll_to_bottom(terminal);
+        self.status = "сравнение готово: сырое чтение через MCP против RAG".into();
     }
 
     fn cmd_personas(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
@@ -4980,7 +5029,7 @@ const HELP: &str = "\
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
 /rag [show|on|off|k N|strategy structure|fixed]  RAG: nearest chunks of rag/index.sqlite go with every question (off by default)
-/rag questions | search <q> | compare <N|q>  control questions / retrieval only / the same question without and with RAG
+/rag questions | search <q> | compare <N|q>  control questions / retrieval only / the same question: raw reading via docs MCP vs RAG
 /mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|docs [dir]|<url>]  MCP servers the chat may call (all five on by default)
 /pipeline [wiki] <query> [> file.md]  run search → summarize → saveToFile over MCP, every step shown
 /review [rev] [in dir] [> file.md]  review a commit over 4 MCP servers: git_log → git_show → git_log×files → issue_create×files → issue_list → saveToFile → notify_send

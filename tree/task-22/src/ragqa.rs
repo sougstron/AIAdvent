@@ -182,6 +182,8 @@ pub struct Prepared {
     pub hits: Vec<Hit>,
     /// Characters the context added to the question.
     pub added: usize,
+    /// Title of the indexed document — `/rag compare` names it to both sides.
+    pub title: String,
 }
 
 /// question → index → augmented question, with the default paths. What the
@@ -192,7 +194,7 @@ pub fn prepare(question: &str, k: usize, strategy: &str) -> Res<Prepared> {
     let hits = r.search(question, k)?;
     let wire = augment(question, &hits);
     let added = wire.chars().count().saturating_sub(question.chars().count());
-    Ok(Prepared { note: sources_note(&r, &hits, added), wire, hits, added })
+    Ok(Prepared { note: sources_note(&r, &hits, added), wire, hits, added, title: r.title().to_string() })
 }
 
 /// Where the chat and `--rag-eval` look for the index (`rag/index.sqlite`
@@ -301,6 +303,8 @@ pub struct Answer {
     /// mcp: tool calls made and characters of document text they returned.
     pub tool_calls: usize,
     pub read_chars: usize,
+    /// mcp: each call as `name {args} → N симв.`, in order.
+    pub calls: Vec<String>,
     /// mcp: sections the model actually read (from `docs_read` results).
     pub read_sections: Vec<String>,
 }
@@ -336,7 +340,7 @@ pub fn load_controls(dir: &Path) -> Res<Vec<Control>> {
 /// system prompt and nothing else in `system` (no AGENTS.md, profile,
 /// invariants, todo) — the only thing that differs between modes is how
 /// the document reaches the model.
-fn eval_agent(settings: &Settings) -> Res<Agent> {
+pub fn eval_agent(settings: &Settings) -> Res<Agent> {
     let mut s = settings.clone();
     s.system_prompt = EVAL_SYSTEM.into();
     s.context_enabled = false;
@@ -349,7 +353,9 @@ fn eval_agent(settings: &Settings) -> Res<Agent> {
     Agent::new(s)
 }
 
-fn answer(agent: &Agent, mode: Mode, prompt: &str, must: &[String]) -> Answer {
+/// One question through `agent`, scored against `must`; for an agent with
+/// the docs toolbox it also records the calls and what they read.
+pub fn answer(agent: &Agent, mode: Mode, prompt: &str, must: &[String]) -> Answer {
     let t = Instant::now();
     let result = agent.complete_outcome(&[ChatMessage::user(prompt)]);
     let steps = agent
@@ -364,6 +370,10 @@ fn answer(agent: &Agent, mode: Mode, prompt: &str, must: &[String]) -> Answer {
             }
         }
     }
+    let calls = steps
+        .iter()
+        .map(|s| format!("{}{} {} → {} симв.", if s.is_error { "✗ " } else { "" }, s.name, s.args, s.result.chars().count()))
+        .collect();
     let read_chars = steps.iter().filter(|s| !s.is_error).map(|s| s.result.chars().count()).sum();
     let (text, error, usage, finish_reason, latency_ms) = match result {
         Ok(o) => (o.text().trim().to_string(), None, o.usage, o.finish_reason.clone(), o.latency_ms),
@@ -381,6 +391,7 @@ fn answer(agent: &Agent, mode: Mode, prompt: &str, must: &[String]) -> Answer {
         latency_ms,
         finish_reason,
         tool_calls: steps.len(),
+        calls,
         read_chars,
         read_sections,
     }
