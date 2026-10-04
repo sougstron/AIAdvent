@@ -9,7 +9,8 @@
   `src/rag.rs`: `docs/*.pdf|md|txt` (сейчас — обзор RAG, arXiv 2312.10997,
   21 стр.) → чанки двумя стратегиями (`fixed`: `--chunk-size` /
   `--chunk-overlap`; `structure`: по разделам, `--struct-max`) → эмбеддинги
-  локальной Ollama `nomic-embed-text` → SQLite `rag/index.sqlite` с
+  локальной Ollama `nomic-embed-text` → нормализация min-max каждого
+  вектора в `[0; 1]` → SQLite `rag/index.sqlite` с
   метаданными (source, file, title, section, sections, страницы, chunk_id).
   `ask --rag-index docs` индексирует и пишет `rag/comparison.md`, где есть
   пробный поиск по `docs/questions.json` с проверкой раздела по метаданным;
