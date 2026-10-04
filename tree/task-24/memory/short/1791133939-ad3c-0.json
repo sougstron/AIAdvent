@@ -1,0 +1,17 @@
+{
+  "layer": "short",
+  "scope": "1791133939-ad3c-0",
+  "records": [],
+  "dialog": [
+    {
+      "n": 1,
+      "role": "user",
+      "text": "For what kind of optimization problems is Bayesian optimization tutorial describe?"
+    },
+    {
+      "n": 2,
+      "role": "assistant",
+      "text": "The tutorial describes Bayesian optimization for problems where the objective is expensive to evaluate (each evaluation takes minutes to hours, with at most a few hundred evaluations possible), the input dimension is small (typically d ≤ 20), the objective is continuous, possibly with stochastic noise [1][2]. It also covers \"exotic\" problems breaking these assumptions: parallel evaluations, constraints, multi-fidelity, multiple information sources, random environmental conditions, multi-task objectives, and derivative observations [3][4].\n\nИсточники:\n  [1] bayesian-optimization-tutorial-1807.02811.pdf — Front matter, стр. 1 · fixed-bayesian-optimization-tutorial-1807.02811-0000\n  [2] bayesian-optimization-tutorial-1807.02811.pdf — Front matter, стр. 1 · fixed-bayesian-optimization-tutorial-1807.02811-0002\n  [3] bayesian-optimization-tutorial-1807.02811.pdf — Front matter, стр. 2 · fixed-bayesian-optimization-tutorial-1807.02811-0009\n  [4] bayesian-optimization-tutorial-1807.02811.pdf — Front matter, стр. 12 · fixed-bayesian-optimization-tutorial-1807.02811-0059\n\nЦитаты:\n  [1] «optimizing objective functions that take a long time (minutes or hours) to evaluate. It is best-suited for optimization over continuous domains of less than 20 dimensions, and tolerates stochastic noise in function evaluations.»\n  [2] «f is “expensive to evaluate” in the sense that the number of evaluations that may be performed is limited, typically to a few hundred.»\n  [3] «These exotic Bayesian optimization problems include those with parallel evaluations, constraints, multi-fidelity evaluations, multiple information sources, random environmental conditions, multi-task objectives, and derivative observations.»\n\nПроверка: ✓ источники 4/4 · ✓ цитаты 3/3 дословно · ✓ числа 1/1 в цитатах · ✓ смысл по цитатам: да"
+    }
+  ]
+}
