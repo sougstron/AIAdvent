@@ -97,9 +97,14 @@ pub struct Session {
     /// `runs/`, ровно по двум требованиям постановки 15: прогон **привязан
     /// к сессии** и **удаляется вместе с ней** — и то и другое получается
     /// бесплатно, второго источника правды не заводим. `None` — прогона
-    /// нет (не начинали, или он дошёл до `done` и убрался за собой).
     #[serde(default)]
     run: Option<crate::run::TaskRun>,
+    /// Память задачи RAG-чата (`chatmem.rs`, задача 25): цель, уточнения,
+    /// ограничения и термины диалога. Лежит в сессии, как `todo`: состояние
+    /// привязано к разговору, переживает выход из приложения и удаляется
+    /// вместе с сессией. Сессии до задачи 25 читаются как «памяти нет».
+    #[serde(default)]
+    task_mem: crate::chatmem::TaskMem,
 }
 
 /// Per-process counter that makes ids unique when many sessions are created
@@ -125,6 +130,7 @@ impl Session {
             memory_task: crate::memory::DEFAULT_TASK.to_string(),
             todo: crate::todo::TaskState::new(),
             run: None,
+            task_mem: crate::chatmem::TaskMem::default(),
         }
     }
 
@@ -158,6 +164,15 @@ impl Session {
 
     pub fn set_todo(&mut self, state: crate::todo::TaskState) {
         self.todo = state;
+    }
+
+    /// Память задачи RAG-чата (задача 25).
+    pub fn task_mem(&self) -> &crate::chatmem::TaskMem {
+        &self.task_mem
+    }
+
+    pub fn set_task_mem(&mut self, mem: crate::chatmem::TaskMem) {
+        self.task_mem = mem;
     }
 
     pub fn set_memory_task(&mut self, task: &str) {

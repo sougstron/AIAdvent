@@ -501,6 +501,14 @@ pub struct Settings {
     /// косинуса лучшего чанка.
     #[serde(default = "default_rag_idk_z")]
     pub rag_idk_z: f32,
+    /// Задача 25: память задачи RAG-чата (`chatmem.rs`) — цель диалога, что
+    /// пользователь уточнил, какие ограничения и термины зафиксированы.
+    /// Работает вместе с `rag`: после каждого отвеченного хода LLM-экстрактор
+    /// обновляет состояние, блок `<task-state>` едет в каждый запрос, а
+    /// строка состояния — в запрос эмбеддинга. По умолчанию включено;
+    /// `--chatmem off`, `/chatmem off`.
+    #[serde(default = "default_chatmem")]
+    pub chatmem: bool,
     /// Кто подписывает план (`run.rs`). Гейт утверждения работает всегда;
     /// эта настройка решает только, ждём ли мы человека или подписываем
     /// автоматически (и пишем в журнал `approved-by=auto`). По умолчанию —
@@ -612,6 +620,10 @@ fn default_rag_idk_z() -> f32 {
     crate::cite::DEFAULT_IDK_Z
 }
 
+fn default_chatmem() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -638,6 +650,7 @@ impl Default for Settings {
             effort: Effort::Low,
             json_mode: JsonMode::default(),
             max_chars: None,
+            chatmem: default_chatmem(),
             budget_tokens: None,
             stop: Vec::new(),
             temperature: None,

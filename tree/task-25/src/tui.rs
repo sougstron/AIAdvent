@@ -85,7 +85,7 @@ const PROFILE_USAGE: &str =
 const TODO_USAGE: &str = "/todo [show|on|off|start <задача>|approve [коммент]|reject <причина>|\
                           pause [почему]|resume|abort <причина>|log|reset|prompt]";
 const RAG_USAGE: &str = "/rag [show|on|off|k N|pool N|rewrite on|off|filter off|sim|llm|both|min-sim Z|min-llm N|\
-                         idk N|idk-z Z|strategy fixed|structure|questions|search <вопрос>|compare <N|вопрос>]";
+                         idk N|idk-z Z|strategy fixed|structure|questions|search <вопрос>|compare <N|вопрос>|mem [on|off|reset]]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -2894,16 +2894,24 @@ impl App {
     /// Порог «не знаю» срабатывает до модели; иначе — ответ, проверка цитат
     /// по чанкам, при нарушении формата один повтор, затем судья смысла.
     /// В сессию уходит текстовая форма карточки.
+    ///
+    /// Задача 25: память задачи (`chatmem.rs`). `mem` — состояние на входе
+    /// хода (None, когда настройка выключена): блок `<task-state>` едет в
+    /// запрос, а после отвеченного хода экстрактор обновляет состояние в
+    /// сессии. «Не знаю» память не трогает: вопрос без ответа нечего
+    /// фиксировать. Отказ экстрактора не ломает ход и не затирает старое
+    /// состояние — просто подпись в статусе.
     fn cited_turn(
         &mut self,
         question: &str,
         got: crate::rerank::Retrieval,
         history: Vec<ChatMessage>,
+        mem: Option<crate::chatmem::TaskMem>,
         terminal: &mut DefaultTerminal,
     ) {
         let idk = crate::cite::Idk::from_settings(&self.settings);
         let asks_model = crate::cite::weak(&got, idk).is_none();
-        let wire = crate::cite::prompt(question, &got.kept);
+        let wire = crate::cite::prompt(question, &got.kept, mem.as_ref());
         let added = wire.chars().count().saturating_sub(question.chars().count());
         if asks_model {
             self.sent_shape = self.sent_shape.plus(crate::tokens::Shape::new(added, 0));
@@ -2912,17 +2920,54 @@ impl App {
         agent.set_mcp(None);
         let checker = crate::cite::Checker::new(&self.settings).ok();
         let q = question.to_string();
+        let mem_in = mem.clone();
+        let hist_in = history.clone();
         let result = self.with_spinner(terminal, "ответ с источниками и цитатами", move || {
-            crate::cite::answer(&agent, checker.as_ref(), &history, &q, &got, idk)
+            crate::cite::answer(&agent, checker.as_ref(), &history, &q, &got, idk, mem_in.as_ref())
         });
+        // Задача 25: вопрос был про договорённости диалога — корпуса под ним
+        // нет, порог честно сказал «не знаю». При непустой памяти задачи
+        // отвечаем из состояния и истории (chatmem::recall), без источников
+        // и с явной подписью, вместо потери цели.
+        let result = match result {
+            Some(Ok(card))
+                if card.status == crate::cite::Status::Unknown
+                    && mem.is_some()
+                    && !self.session.task_mem().is_empty() =>
+            {
+                let agent2 = self.prepared_agent();
+                let q2 = question.to_string();
+                let m = self.session.task_mem().clone();
+                match self.with_spinner(terminal, "ответ из памяти задачи", move || crate::chatmem::recall(&agent2, &hist_in, &m, &q2)) {
+                    Some(Ok(Some(rc))) => Some(Ok(rc)),
+                    _ => Some(Ok(card)),
+                }
+            }
+            other => other,
+        };
         match result {
             Some(Ok(card)) => {
                 self.session.push_assistant(card.to_text());
+                let mut mem_note = String::new();
+                if mem.is_some() && card.status == crate::cite::Status::Answer && !card.from_memory {
+                    match crate::chatmem::Extractor::new(&self.settings) {
+                        Ok(extractor) => {
+                            let cur = mem.unwrap_or_default();
+                            let (q2, ans) = (question.to_string(), card.answer.clone());
+                            match self.with_spinner(terminal, "память задачи", move || extractor.update(&cur, &q2, &ans)) {
+                                Some(Ok((new, _))) => self.session.set_task_mem(new),
+                                Some(Err(e)) => mem_note = format!(" · память не обновилась: {e}"),
+                                None => mem_note = " · память: обновление отменено (Esc)".into(),
+                            }
+                        }
+                        Err(e) => mem_note = format!(" · память не обновилась: {e}"),
+                    }
+                }
                 if card.attempts > 0 {
                     self.tokens.record(self.sent_shape.chars, &card.first_usage);
                 }
                 self.status = format!(
-                    "{} · попыток {} · tokens: prompt={} completion={} · {}ms",
+                    "{} · попыток {} · tokens: prompt={} completion={} · {}ms{mem_note}",
                     if card.status == crate::cite::Status::Unknown { "не знаю" } else if card.grounded() { "ответ подтверждён цитатами" } else { "ответ НЕ подтверждён" },
                     card.attempts,
                     card.prompt_tokens,
@@ -3087,6 +3132,19 @@ impl App {
                 None => self.status = "поиск отменён (Esc)".into(),
             },
             "compare" if !arg.is_empty() => self.rag_compare(arg, terminal),
+            // Задача 25: память задачи RAG-чата (chatmem.rs) — цель, что
+            // уточнено, какие ограничения и термины зафиксированы. Живёт в
+            // сессии, как `todo`: переживает перезапуск, чистится с ней.
+            "mem" => match arg {
+                "on" | "off" => self.rag_set(|s: &mut Settings| s.chatmem = arg == "on"),
+                "reset" => {
+                    self.session.set_task_mem(crate::chatmem::TaskMem::default());
+                    self.save_session();
+                    self.status = "память задачи RAG-чата очищена".into();
+                }
+                "" => self.entries.push(Entry::Info(self.session.task_mem().card())),
+                _ => self.status = "/rag mem [on|off|reset] — память задачи RAG-чата: цель, уточнения, ограничения, термины".into(),
+            },
             _ => self.status = RAG_USAGE.into(),
         }
     }
@@ -3953,10 +4011,17 @@ impl App {
         // обязана вернуть источники и дословные цитаты, всё проверяется по
         // чанкам, а при слабом контексте вместо ответа — «не знаю».
         if self.settings.rag && !staged {
-            match self.rag_prepare(&invariant_query, terminal) {
+            // Задача 25: память задачи. Эмбеддинг идёт по вопросу плюс одна
+            // строка состояния (цель и ограничения), чтобы короткий вопрос
+            // «а таймауты?» попадал в документы именно этой задачи; модель
+            // получает блок <task-state> тем же состоянием.
+            let mem = if self.settings.chatmem { Some(self.session.task_mem().clone()) } else { None };
+            let retrieval_q =
+                mem.as_ref().map(|m| m.retrieval_query(&invariant_query)).unwrap_or_else(|| invariant_query.clone());
+            match self.rag_prepare(&retrieval_q, terminal) {
                 Some(Ok(p)) => {
                     self.entries.push(Entry::Info(p.note));
-                    self.cited_turn(&invariant_query, p.retrieval, history, terminal);
+                    self.cited_turn(&invariant_query, p.retrieval, history, mem, terminal);
                     return;
                 }
                 Some(Err(e)) => self.entries.push(Entry::Info(format!("RAG: {e} — отвечаю без RAG"))),
