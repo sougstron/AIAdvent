@@ -324,6 +324,14 @@ impl Toolbox {
         Toolbox::connect(&url, format!("notify: исходящие в {} ({url})", server.outbox().display()))
     }
 
+    /// Task 22: the raw documents of `dir` (`docs_list` / `docs_read` /
+    /// `docs_search`) — what RAG is compared against.
+    pub fn local_docs(dir: &Path) -> Res<Toolbox> {
+        let server = crate::docs_mcp::Server::new(dir, false)?;
+        let url = server.spawn(0)?;
+        Toolbox::connect(&url, format!("docs: документы в {} ({url})", server.dir().display()))
+    }
+
     /// Recompute routes and functions after the set of servers changed.
     pub fn rebuild(&mut self) {
         let mut aliases: Vec<String> = Vec::new();

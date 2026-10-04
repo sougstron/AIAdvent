@@ -16,6 +16,7 @@ use crate::mcp_agent;
 use crate::mcp_server;
 use crate::orchestra;
 use crate::rag;
+use crate::ragqa;
 use crate::memory;
 use crate::profile;
 use crate::render;
@@ -72,6 +73,8 @@ use crate::verify;
         ask --rag-index docs                  chunk docs/ two ways, embed via Ollama, save rag/index.sqlite, compare\n  \
         ask --rag-index docs --chunk-strategy fixed --chunk-size 500 --chunk-overlap 100\n  \
         ask --rag-compare docs                re-print the chunking comparison from the saved index\n  \
+        ask --rag \"what is HyDE?\"            answer with the nearest chunks of rag/index.sqlite (task 22)\n  \
+        ask --rag-eval                        10 control questions: plain vs RAG vs raw reading over MCP → rag/eval.md\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -381,6 +384,35 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
     pub rag_compare: Option<String>,
 
+    /// Task 22: answer with RAG — the question is embedded by Ollama, the
+    /// nearest chunks of `--rag-db` go to the LLM together with it. In the
+    /// chat this is the starting value of the `rag` setting (`/rag on|off`).
+    #[arg(long)]
+    pub rag: bool,
+
+    /// How many chunks RAG adds to the question (1…12, default 4).
+    #[arg(long, value_name = "N")]
+    pub rag_k: Option<usize>,
+
+    /// Which strategy of the index RAG retrieves from: `structure`
+    /// (default) or `fixed`.
+    #[arg(long, value_name = "structure|fixed")]
+    pub rag_strategy: Option<String>,
+
+    /// Task 22: run the control questions `DIR/control.json` with and
+    /// without RAG (and with raw reading through the docs MCP server),
+    /// score every answer against its expectation, write `rag/eval.md`.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
+    pub rag_eval: Option<String>,
+
+    /// Modes for `--rag-eval`: any of `plain`, `rag`, `mcp`.
+    #[arg(long, value_name = "MODES", default_value = "plain,rag,mcp")]
+    pub rag_eval_modes: String,
+
+    /// Only these control question ids, e.g. `1,9`.
+    #[arg(long, value_name = "IDS", value_delimiter = ',')]
+    pub rag_eval_only: Vec<usize>,
+
     /// Chunking strategy for `--rag-index`: `fixed`, `structure` or `both`.
     #[arg(long, value_name = "fixed|structure|both", default_value = "both")]
     pub chunk_strategy: String,
@@ -564,6 +596,21 @@ impl Cli {
         }
         if self.todo {
             s.todo = true;
+        }
+        if self.rag {
+            s.rag = true;
+        }
+        if let Some(k) = self.rag_k {
+            if !(1..=crate::ragqa::MAX_K).contains(&k) {
+                return Err(format!("--rag-k: от 1 до {}, получено {k}", crate::ragqa::MAX_K));
+            }
+            s.rag_k = k;
+        }
+        if let Some(st) = &self.rag_strategy {
+            if !matches!(st.as_str(), "structure" | "fixed") {
+                return Err(format!("--rag-strategy: structure или fixed, получено `{st}`"));
+            }
+            s.rag_strategy = st.clone();
         }
         // Кто подписывает план. Без флага: в TUI ждём человека, а в
         // неинтерактивном заходе спросить некого — подпись ставит `auto`,
@@ -843,6 +890,18 @@ pub fn run() -> Res<()> {
         }
         .resolve_paths();
         return if cli.rag_index.is_some() { rag::index(&cfg) } else { rag::compare(&cfg) };
+    }
+
+    if let Some(dir) = cli.rag_eval.as_deref() {
+        let settings = cli.to_settings()?;
+        let opts = ragqa::EvalOpts {
+            paths: rag::Config::locate(dir, &cli.rag_db),
+            k: settings.rag_k,
+            strategy: settings.rag_strategy.clone(),
+            modes: ragqa::Mode::parse_list(&cli.rag_eval_modes)?,
+            only: cli.rag_eval_only.clone(),
+        };
+        return ragqa::eval(&settings, &opts);
     }
 
     if let Some(which) = cli.verify_pipeline.as_deref() {
@@ -1247,7 +1306,15 @@ fn one_shot(
         Some(s) => rt.resume(&s.id, spec)?,
         None => rt.spawn(spec),
     };
-    let turn = rt.get_mut(&id).ok_or("box vanished")?.ask(question)?;
+    // Задача 22: с RAG на провод уходит вопрос вместе с найденными чанками.
+    // Только этот запрос — сессия и память получают вопрос как он набран.
+    let rag = |q: &str| -> Res<String> {
+        let p = ragqa::prepare(q, settings.rag_k, &settings.rag_strategy)?;
+        eprintln!("{}", p.note);
+        Ok(p.wire)
+    };
+    let wire: Option<&crate::runtime::WireFn<'_>> = if settings.rag { Some(&rag) } else { None };
+    let turn = rt.get_mut(&id).ok_or("box vanished")?.ask_with(question, wire)?;
 
     if let Some(why) = turn.refusal() {
         return Err(why);

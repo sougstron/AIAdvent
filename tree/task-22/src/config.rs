@@ -463,6 +463,18 @@ pub struct Settings {
     /// (`/todo on`, строка `todo` в настройках, `--todo`).
     #[serde(default)]
     pub todo: bool,
+    /// RAG (задача 22): перед запросом к LLM вопрос эмбеддится локальной
+    /// Ollama, из индекса `rag/index.sqlite` берутся ближайшие чанки, и на
+    /// провод уходит вопрос вместе с ними (`ragqa.rs`). По умолчанию
+    /// выключено — `/rag on`, строка `rag` в настройках, `--rag`.
+    #[serde(default)]
+    pub rag: bool,
+    /// Сколько чанков подмешивать к вопросу.
+    #[serde(default = "default_rag_k")]
+    pub rag_k: usize,
+    /// Из какой стратегии индекса брать чанки: `structure` или `fixed`.
+    #[serde(default = "default_rag_strategy")]
+    pub rag_strategy: String,
     /// Кто подписывает план (`run.rs`). Гейт утверждения работает всегда;
     /// эта настройка решает только, ждём ли мы человека или подписываем
     /// автоматически (и пишем в журнал `approved-by=auto`). По умолчанию —
@@ -542,6 +554,14 @@ pub fn parse_max_tokens(n: u32) -> Res<u32> {
     Ok(n)
 }
 
+fn default_rag_k() -> usize {
+    crate::ragqa::DEFAULT_K
+}
+
+fn default_rag_strategy() -> String {
+    crate::ragqa::DEFAULT_STRATEGY.to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -550,6 +570,9 @@ impl Default for Settings {
             profile: default_profile(),
             approve: crate::run::ApprovePolicy::Manual,
             todo: false,
+            rag: false,
+            rag_k: default_rag_k(),
+            rag_strategy: default_rag_strategy(),
             invariants: true,
             context_enabled: true,
             context_strategy: ContextStrategy::default(),
@@ -583,6 +606,10 @@ impl Settings {
     pub fn clamp(&mut self) {
         if self.model.trim().is_empty() {
             self.model = default_model();
+        }
+        self.rag_k = self.rag_k.clamp(1, crate::ragqa::MAX_K);
+        if !matches!(self.rag_strategy.as_str(), "fixed" | "structure") {
+            self.rag_strategy = default_rag_strategy();
         }
         self.effort = match self.effort {
             Effort::None => Effort::Low,
@@ -649,6 +676,7 @@ impl Settings {
             }
         ));
         parts.push(format!("todo={}", if self.todo { "on" } else { "off" }));
+        parts.push(if self.rag { format!("rag=on(k={},{})", self.rag_k, self.rag_strategy) } else { "rag=off".into() });
         parts.push(format!(
             "invariants={}",
             if self.invariants { "on" } else { "off" }

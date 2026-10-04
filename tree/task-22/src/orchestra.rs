@@ -81,6 +81,7 @@ pub fn owner(tool: &str) -> Option<&'static str> {
         "search" | "summarize" | "saveToFile" => Some(toolchain::SERVER_NAME),
         t if TRACKER_TOOLS.contains(&t) => Some(TRACKER),
         t if NOTIFY_TOOLS.contains(&t) => Some(NOTIFY),
+        t if crate::docs_mcp::TOOLS.contains(&t) => Some(crate::docs_mcp::SERVER_NAME),
         _ => None,
     }
 }
@@ -120,7 +121,7 @@ fn one_line(s: &str, max: usize) -> String {
     out
 }
 
-fn spawn_on(port: u16, serve: impl FnOnce(TcpListener) + Send + 'static) -> Res<String> {
+pub(crate) fn spawn_on(port: u16, serve: impl FnOnce(TcpListener) + Send + 'static) -> Res<String> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("bind 127.0.0.1:{port}: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     std::thread::spawn(move || serve(listener));
