@@ -239,10 +239,18 @@ pub const ROOT: &[Node] = &[
             leaf("on"),
             leaf("off"),
             lit("k", "1-12", &[free("N")]),
+            lit("pool", "N", &[free("N")]),
             lit("strategy", "structure|fixed", &[leaf("structure"), leaf("fixed")]),
+            lit("rewrite", "on|off", &[leaf("on"), leaf("off")]),
+            lit("filter", "off|sim|llm|both", &[leaf("off"), leaf("sim"), leaf("llm"), leaf("both")]),
+            lit("min-sim", "Z", &[free("Z")]),
+            lit("min-llm", "0-10", &[free("N")]),
+            lit("idk", "0-10", &[free("N")]),
+            lit("idk-z", "Z", &[free("Z")]),
             leaf("questions"),
             lit("search", "question", &[free("")]),
             lit("compare", "N|question", &[free("")]),
+            lit("mem", "show|on|off|reset", &[leaf("show"), leaf("on"), leaf("off"), leaf("reset")]),
         ],
     ),
     leaf("quit"),
@@ -584,6 +592,14 @@ mod tests {
         assert_eq!(hint("/branch "), "command");
         // Точное совпадение литерала без пробела — путь уже пройден.
         assert_eq!(hint("/branch"), "command");
+    }
+
+    #[test]
+    fn rag_mem_is_offered_with_its_subcommands() {
+        // Задача 25: `/rag mem` должен быть виден в подсказках, иначе его не найти.
+        let v = values();
+        assert_eq!(candidates("/rag me", &v), vec!["mem"]);
+        assert_eq!(candidates("/rag mem ", &v), vec!["show", "on", "off", "reset"]);
     }
 
     #[test]
