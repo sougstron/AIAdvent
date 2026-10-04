@@ -94,10 +94,20 @@ impl Config {
 
     /// Relative `dir`/`db` are taken from the current directory; when `dir`
     /// is not there (e.g. launched from `target/release`), both fall back to
-    /// the task folder the binary was built from.
+    /// the nearest ancestor of the executable that has `dir` (the task
+    /// folder), and only then to the folder the binary was compiled in —
+    /// that one is baked in at build time and may be another checkout.
     pub fn resolve_paths(mut self) -> Self {
-        let home = Path::new(env!("CARGO_MANIFEST_DIR"));
-        if self.dir.is_relative() && !self.dir.exists() && home.join(&self.dir).exists() {
+        if !self.dir.is_relative() || self.dir.exists() {
+            return self;
+        }
+        let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+        let mut homes: Vec<PathBuf> = exe
+            .iter()
+            .flat_map(|p| p.ancestors().skip(1).map(Path::to_path_buf).collect::<Vec<_>>())
+            .collect();
+        homes.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        if let Some(home) = homes.into_iter().find(|h| h.join(&self.dir).exists()) {
             self.dir = home.join(&self.dir);
             if self.db.is_relative() {
                 self.db = home.join(&self.db);
