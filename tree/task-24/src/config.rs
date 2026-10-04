@@ -492,6 +492,15 @@ pub struct Settings {
     /// Порог реранкера: оценка релевантности 0–10 от LLM.
     #[serde(default = "default_rag_min_llm")]
     pub rag_min_llm: u8,
+    /// Задача 24: порог «не знаю». Если у лучшего чанка в контексте оценка
+    /// реранкера ниже — ассистент не отвечает, а говорит «не знаю» и просит
+    /// уточнить вопрос (`cite.rs`).
+    #[serde(default = "default_rag_idk_llm")]
+    pub rag_idk_llm: u8,
+    /// То же, когда реранкер не работал (`filter off|sim`): порог z-скора
+    /// косинуса лучшего чанка.
+    #[serde(default = "default_rag_idk_z")]
+    pub rag_idk_z: f32,
     /// Кто подписывает план (`run.rs`). Гейт утверждения работает всегда;
     /// эта настройка решает только, ждём ли мы человека или подписываем
     /// автоматически (и пишем в журнал `approved-by=auto`). По умолчанию —
@@ -595,6 +604,14 @@ fn default_rag_min_llm() -> u8 {
     crate::rerank::DEFAULT_MIN_LLM
 }
 
+fn default_rag_idk_llm() -> u8 {
+    crate::cite::DEFAULT_IDK_LLM
+}
+
+fn default_rag_idk_z() -> f32 {
+    crate::cite::DEFAULT_IDK_Z
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -611,6 +628,8 @@ impl Default for Settings {
             rag_pool: default_rag_pool(),
             rag_min_sim: default_rag_min_sim(),
             rag_min_llm: default_rag_min_llm(),
+            rag_idk_llm: default_rag_idk_llm(),
+            rag_idk_z: default_rag_idk_z(),
             invariants: true,
             context_enabled: true,
             context_strategy: ContextStrategy::default(),
@@ -657,6 +676,10 @@ impl Settings {
             self.rag_min_sim = default_rag_min_sim();
         }
         self.rag_min_llm = self.rag_min_llm.min(10);
+        self.rag_idk_llm = self.rag_idk_llm.min(10);
+        if !self.rag_idk_z.is_finite() {
+            self.rag_idk_z = default_rag_idk_z();
+        }
         self.effort = match self.effort {
             Effort::None => Effort::Low,
             Effort::Medium => Effort::High,

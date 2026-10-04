@@ -73,9 +73,10 @@ use crate::verify;
         ask --rag-index docs                  chunk docs/ two ways, embed via Ollama, save rag/index.sqlite, compare\n  \
         ask --rag-index docs --chunk-strategy fixed --chunk-size 500 --chunk-overlap 100\n  \
         ask --rag-compare docs                re-print the chunking comparison from the saved index\n  \
-        ask --rag \"what is HyDE?\"            answer with the nearest chunks of rag/index.sqlite (task 22)\n  \
+        ask --rag \"what is HyDE?\"            answer with sources + verbatim quotes, or \"не знаю\" (task 24)\n  \
         ask --rag-eval                        20 control questions: plain / base / sim / llm / rewrite / full → rag/eval.md\n  \
         ask --rag-tune                        top-K and threshold sweeps for the second stage → rag/tune.md\n  \
+        ask --rag-cite-eval                   sources + verbatim quotes + \"I don't know\" on 10+8 questions → rag/cite.md\n  \
         ask --rag --rag-rewrite --rag-filter both \"q\"   rewrite + similarity threshold + LLM reranker (task 23)\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
@@ -424,6 +425,21 @@ pub struct Cli {
     #[arg(long, value_name = "0..10")]
     pub rag_min_llm: Option<u8>,
 
+    /// Task 24: "I don't know" threshold — the best chunk's reranker score
+    /// below it means no answer and a request to clarify.
+    #[arg(long, value_name = "0..10")]
+    pub rag_idk_llm: Option<u8>,
+
+    /// The same when the reranker did not run: z-score of the best chunk.
+    #[arg(long, value_name = "Z")]
+    pub rag_idk_z: Option<f32>,
+
+    /// Task 24: grounded answers on ten control questions (one per document),
+    /// the five without an answer and three vague ones: sources, verbatim
+    /// quotes, numbers and meaning checked → `rag/cite.md`.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
+    pub rag_cite_eval: Option<String>,
+
     /// Task 22/23: run the control questions `DIR/control.json` in every
     /// mode, score every answer against its expectation, write `rag/eval.md`.
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
@@ -663,6 +679,15 @@ impl Cli {
                 return Err(format!("--rag-min-llm: от 0 до 10, получено {n}"));
             }
             s.rag_min_llm = n;
+        }
+        if let Some(n) = self.rag_idk_llm {
+            if n > 10 {
+                return Err(format!("--rag-idk-llm: от 0 до 10, получено {n}"));
+            }
+            s.rag_idk_llm = n;
+        }
+        if let Some(z) = self.rag_idk_z {
+            s.rag_idk_z = z;
         }
         // Кто подписывает план. Без флага: в TUI ждём человека, а в
         // неинтерактивном заходе спросить некого — подпись ставит `auto`,
@@ -954,6 +979,11 @@ pub fn run() -> Res<()> {
             tuned: crate::rerank::Pipeline::from_settings(&settings),
         };
         return ragqa::eval(&settings, &opts);
+    }
+
+    if let Some(dir) = cli.rag_cite_eval.as_deref() {
+        let settings = cli.to_settings()?;
+        return crate::cite::eval(&settings, &rag::Config::locate(dir, &cli.rag_db), &cli.rag_eval_only);
     }
 
     if let Some(dir) = cli.rag_tune.as_deref() {
@@ -1357,21 +1387,19 @@ fn one_shot(
     question: &str,
     loaded: Option<session::Session>,
 ) -> Res<()> {
+    // Задача 24: с RAG ответ — с обязательными источниками и цитатами, а
+    // при слабом контексте — «не знаю» без вызова модели (`cite.rs`). Это
+    // отдельный путь без сессии: проверка ответа важнее истории.
+    if settings.rag {
+        return crate::cite::ask_once(question, &settings);
+    }
     let mut rt = Runtime::for_model(&settings.model, session::sessions_dir())?;
     let spec = BoxSpec::new("", settings.clone());
     let id = match loaded {
         Some(s) => rt.resume(&s.id, spec)?,
         None => rt.spawn(spec),
     };
-    // Задача 22: с RAG на провод уходит вопрос вместе с найденными чанками.
-    // Только этот запрос — сессия и память получают вопрос как он набран.
-    let rag = |q: &str| -> Res<String> {
-        let p = ragqa::prepare(q, &settings)?;
-        eprintln!("{}", p.note);
-        Ok(p.wire)
-    };
-    let wire: Option<&crate::runtime::WireFn<'_>> = if settings.rag { Some(&rag) } else { None };
-    let turn = rt.get_mut(&id).ok_or("box vanished")?.ask_with(question, wire)?;
+    let turn = rt.get_mut(&id).ok_or("box vanished")?.ask_with(question, None)?;
 
     if let Some(why) = turn.refusal() {
         return Err(why);

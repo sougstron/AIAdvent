@@ -23,6 +23,7 @@ mod run;
 mod runtime;
 mod scheduler;
 mod pipeline;
+mod cite;
 mod rag;
 mod ragqa;
 mod rerank;

@@ -85,7 +85,7 @@ const PROFILE_USAGE: &str =
 const TODO_USAGE: &str = "/todo [show|on|off|start <задача>|approve [коммент]|reject <причина>|\
                           pause [почему]|resume|abort <причина>|log|reset|prompt]";
 const RAG_USAGE: &str = "/rag [show|on|off|k N|pool N|rewrite on|off|filter off|sim|llm|both|min-sim Z|min-llm N|\
-                         strategy fixed|structure|questions|search <вопрос>|compare <N|вопрос>]";
+                         idk N|idk-z Z|strategy fixed|structure|questions|search <вопрос>|compare <N|вопрос>]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -259,6 +259,9 @@ enum Entry {
     /// <сервер> · <инструмент> · запрос: <аргументы>` и под ней результат.
     /// Системная строка — серым.
     Tool { call: String, result: String, is_error: bool },
+    /// Задача 24: ответ RAG с источниками и цитатами (или «не знаю» с
+    /// просьбой уточнить) и итогом проверки — карточкой, а не текстом.
+    Cited(Box<crate::cite::Card>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2887,6 +2890,64 @@ impl App {
         self.with_spinner(terminal, &label, move || crate::ragqa::prepare_with(&q, &settings, &p))
     }
 
+    /// Задача 24: один ход RAG с обязательными источниками и цитатами.
+    /// Порог «не знаю» срабатывает до модели; иначе — ответ, проверка цитат
+    /// по чанкам, при нарушении формата один повтор, затем судья смысла.
+    /// В сессию уходит текстовая форма карточки.
+    fn cited_turn(
+        &mut self,
+        question: &str,
+        got: crate::rerank::Retrieval,
+        history: Vec<ChatMessage>,
+        terminal: &mut DefaultTerminal,
+    ) {
+        let idk = crate::cite::Idk::from_settings(&self.settings);
+        let asks_model = crate::cite::weak(&got, idk).is_none();
+        let wire = crate::cite::prompt(question, &got.kept);
+        let added = wire.chars().count().saturating_sub(question.chars().count());
+        if asks_model {
+            self.sent_shape = self.sent_shape.plus(crate::tokens::Shape::new(added, 0));
+        }
+        let mut agent = self.prepared_agent();
+        agent.set_mcp(None);
+        let checker = crate::cite::Checker::new(&self.settings).ok();
+        let q = question.to_string();
+        let result = self.with_spinner(terminal, "ответ с источниками и цитатами", move || {
+            crate::cite::answer(&agent, checker.as_ref(), &history, &q, &got, idk)
+        });
+        match result {
+            Some(Ok(card)) => {
+                self.session.push_assistant(card.to_text());
+                if card.attempts > 0 {
+                    self.tokens.record(self.sent_shape.chars, &card.first_usage);
+                }
+                self.status = format!(
+                    "{} · попыток {} · tokens: prompt={} completion={} · {}ms",
+                    if card.status == crate::cite::Status::Unknown { "не знаю" } else if card.grounded() { "ответ подтверждён цитатами" } else { "ответ НЕ подтверждён" },
+                    card.attempts,
+                    card.prompt_tokens,
+                    card.completion_tokens,
+                    card.ms
+                );
+                self.entries.push(Entry::Cited(Box::new(card)));
+                self.save_session();
+                if self.follow {
+                    self.scroll_to_bottom(terminal);
+                }
+            }
+            Some(Err(e)) => {
+                self.session.messages.pop();
+                self.session.resync_tree();
+                self.status = format!("request failed: {e}");
+            }
+            None => {
+                self.session.messages.pop();
+                self.session.resync_tree();
+                self.status = "generation cancelled (Esc)".into();
+            }
+        }
+    }
+
     fn rag_card(&self) -> String {
         let paths = crate::ragqa::default_paths();
         let index = match crate::ragqa::Retriever::open(&paths.db, &self.settings.rag_strategy, &paths.url) {
@@ -2906,7 +2967,8 @@ impl App {
             "RAG: {} · {} · стратегия {}\n\
              второй этап: rewrite {} · фильтр {} (sim: z ≥ {:.1}, llm: ≥ {}) · top-K до {} → после {}\n\
              индекс: {index}\nдокументы: {} (их же читает MCP docs_list/docs_read/docs_search)\n\
-             Вкл: вопрос → [rewrite] → ближайшие чанки → [порог similarity] → [LLM-реранкер] → вопрос + чанки → LLM.\n\
+             ответ: источники + дословные цитаты обязательны, проверяются по чанкам; {}\n\
+             Вкл: вопрос → [rewrite] → ближайшие чанки → [порог similarity] → [LLM-реранкер] → [порог «не знаю»] → вопрос + чанки → LLM → проверка цитат.\n\
              /rag questions — контрольные вопросы · /rag compare <N|вопрос> — без фильтра/rewrite и с ними рядом\n{RAG_USAGE}",
             if self.settings.rag { "on" } else { "off" },
             p.label(),
@@ -2917,6 +2979,7 @@ impl App {
             p.min_llm,
             p.pool,
             p.k,
+            crate::cite::Idk::from_settings(&self.settings).label(),
             paths.dir.display()
         )
     }
@@ -2925,7 +2988,11 @@ impl App {
     fn rag_set(&mut self, f: impl Fn(&mut Settings)) {
         f(&mut self.settings);
         f(self.agent.settings_mut());
-        self.status = format!("RAG: {}", crate::rerank::Pipeline::from_settings(&self.settings).label());
+        self.status = format!(
+            "RAG: {} · {}",
+            crate::rerank::Pipeline::from_settings(&self.settings).label(),
+            crate::cite::Idk::from_settings(&self.settings).label()
+        );
     }
 
     /// `/rag …` — режим RAG и инструменты, чтобы сравнить ответы.
@@ -2980,6 +3047,14 @@ impl App {
             "min-llm" | "llm" => match arg.parse::<u8>() {
                 Ok(n) if n <= 10 => self.rag_set(|s| s.rag_min_llm = n),
                 _ => self.status = "/rag min-llm N — порог оценки реранкера, 0–10".into(),
+            },
+            "idk" => match arg.parse::<u8>() {
+                Ok(n) if n <= 10 => self.rag_set(|s| s.rag_idk_llm = n),
+                _ => self.status = "/rag idk N — «не знаю», если у лучшего чанка оценка реранкера ниже N (0–10)".into(),
+            },
+            "idk-z" => match arg.parse::<f32>() {
+                Ok(z) if z.is_finite() => self.rag_set(|s| s.rag_idk_z = z),
+                _ => self.status = "/rag idk-z Z — «не знаю» без реранкера: z-скор лучшего чанка ниже Z".into(),
             },
             "questions" | "q" => {
                 let text = match crate::ragqa::load_controls(&crate::ragqa::default_paths().dir) {
@@ -3853,7 +3928,7 @@ impl App {
         }
         self.follow = true;
         self.agent.set_history(self.session.history());
-        let mut history = self.agent.history().to_vec();
+        let history = self.agent.history().to_vec();
         // Управление контекстом: свернуть отставшую часть истории до
         // отправки хода. При `compress=off` это no-op без запроса; иначе на
         // провод пойдёт `wire_history` — summary в system плюс хвост.
@@ -3873,14 +3948,16 @@ impl App {
         // хода: в сессии остаётся вопрос как он набран, и следующий ход не
         // тащит старый контекст. Этапы тудушки — инструкции, а не вопросы
         // по документу, их не трогаем.
+        //
+        // Задача 24: ответ RAG идёт своим путём (`cited_turn`): модель
+        // обязана вернуть источники и дословные цитаты, всё проверяется по
+        // чанкам, а при слабом контексте вместо ответа — «не знаю».
         if self.settings.rag && !staged {
             match self.rag_prepare(&invariant_query, terminal) {
                 Some(Ok(p)) => {
                     self.entries.push(Entry::Info(p.note));
-                    self.sent_shape = self.sent_shape.plus(crate::tokens::Shape::new(p.added, 0));
-                    if let Some(last) = history.last_mut() {
-                        last.content = p.wire;
-                    }
+                    self.cited_turn(&invariant_query, p.retrieval, history, terminal);
+                    return;
                 }
                 Some(Err(e)) => self.entries.push(Entry::Info(format!("RAG: {e} — отвечаю без RAG"))),
                 None => {
@@ -4524,6 +4601,10 @@ impl App {
                     out.extend(tool_lines(call, result, *is_error));
                     out.push(Line::raw(""));
                 }
+                Entry::Cited(card) => {
+                    out.extend(cited_lines(card));
+                    out.push(Line::raw(""));
+                }
             }
         }
         if let Some((label, frame)) = &self.spinner {
@@ -5114,6 +5195,7 @@ const HELP: &str = "\
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
 /rag [show|on|off|k N|strategy fixed|structure]  RAG: nearest chunks of rag/index.sqlite go with every question (off by default)
 /rag rewrite on|off | filter off|sim|llm|both | pool N | min-sim Z | min-llm N  second stage: query rewrite, similarity threshold, LLM reranker
+/rag idk N | idk-z Z  answers carry sources + verbatim quotes (checked); below the threshold — «не знаю» + a clarifying question
 /rag questions | search <q> | compare <N|q>  control questions / retrieval only / the same question without and with the second stage
 /mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|docs [dir]|<url>]  MCP servers the chat may call (all five on by default)
 /pipeline [wiki] <query> [> file.md]  run search → summarize → saveToFile over MCP, every step shown
@@ -5230,6 +5312,152 @@ fn flow_lines(text: &str) -> Vec<Line<'static>> {
             }
         })
         .collect()
+}
+
+fn good() -> Style {
+    Style::default().fg(Color::Green)
+}
+
+fn bad() -> Style {
+    Style::default().fg(Color::Red)
+}
+
+fn warn() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+/// Text with the citation marks `[1]`, `[2,3]` picked out in the accent.
+fn with_marks(text: &str, style: Style) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let tail = &rest[open + 1..];
+        let close = tail.find(']');
+        let is_mark = close.is_some_and(|c| c > 0 && tail[..c].chars().all(|ch| ch.is_ascii_digit() || ch == ',' || ch == ' ' || ch == '–' || ch == '-'));
+        let end = open + 1 + if is_mark { close.unwrap_or(0) + 1 } else { 0 };
+        if !rest[..open].is_empty() {
+            out.push(Span::styled(rest[..open].to_string(), style));
+        }
+        if is_mark {
+            out.push(Span::styled(rest[open..end].to_string(), accent().add_modifier(Modifier::BOLD)));
+        } else {
+            out.push(Span::styled("[".to_string(), style));
+        }
+        rest = &rest[end.max(open + 1)..];
+    }
+    if !rest.is_empty() {
+        out.push(Span::styled(rest.to_string(), style));
+    }
+    out
+}
+
+/// One row of the card's frame: the rail glyph, then spans.
+fn rail(glyph: &'static str, spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut v = vec![Span::styled(glyph, muted())];
+    v.extend(spans);
+    Line::from(v)
+}
+
+/// Задача 24: карточка ответа RAG. Ответ (метки `[n]` акцентом), под ним
+/// рамка: источники (файл · раздел · страницы · chunk_id · релевантность),
+/// цитаты с отметкой «дословно ✓ / нет во фрагментах ✗» и строка проверки,
+/// где каждая часть окрашена своим итогом. «Не знаю» — жёлтым, с причиной,
+/// вопросом-уточнением и ближайшими кандидатами.
+fn cited_lines(card: &crate::cite::Card) -> Vec<Line<'static>> {
+    use crate::cite::{By, Found, Status};
+    let mut out = Vec::new();
+    if card.status == Status::Unknown {
+        out.push(Line::from(vec![
+            Span::styled("? ", warn().add_modifier(Modifier::BOLD)),
+            Span::styled("Не знаю: в найденных фрагментах нет ответа на этот вопрос.", warn().add_modifier(Modifier::BOLD)),
+        ]));
+        let who = match card.by {
+            Some(By::Gate) => "порог релевантности — модель не вызывалась",
+            _ => "модель прочитала фрагменты и ответа в них не нашла",
+        };
+        out.push(rail("  \u{256d}\u{2500} ", vec![Span::styled(format!("почему: {}", card.why.clone().unwrap_or_else(|| who.into())), muted())]));
+        if card.why.is_some() {
+            out.push(rail("  \u{2502}  ", vec![Span::styled(who.to_string(), muted())]));
+        }
+        if let Some(c) = &card.clarify {
+            out.push(rail("  \u{2502} ", vec![Span::styled("уточните: ", warn()), Span::raw(c.clone())]));
+        }
+        for n in &card.nearest {
+            out.push(rail("  \u{2502}  ", vec![Span::styled("\u{2192} ", muted()), Span::styled(n.clone(), muted())]));
+        }
+        out.push(rail("  \u{2570}\u{2500} ", vec![Span::styled("ответ из собственных знаний модели не выдаётся", muted())]));
+        return out;
+    }
+    let grounded = card.grounded();
+    let marker = Span::styled("\u{25cf} ", if grounded { accent() } else { warn() });
+    for (i, line) in card.answer.lines().enumerate() {
+        let mut spans = vec![if i == 0 { marker.clone() } else { Span::raw("  ") }];
+        spans.extend(with_marks(line, Style::default()));
+        out.push(Line::from(spans));
+    }
+    if card.answer.trim().is_empty() {
+        out.push(Line::from(vec![marker, Span::styled("(модель не дала текста ответа)", bad())]));
+    }
+    out.push(rail("  \u{256d}\u{2500} ", vec![Span::styled("источники", accent().add_modifier(Modifier::BOLD))]));
+    if card.sources.is_empty() {
+        out.push(rail("  \u{2502} ", vec![Span::styled("\u{2717} модель не указала ни одного источника из контекста", bad())]));
+    }
+    for s in &card.sources {
+        let mut spans = vec![
+            Span::styled(format!("[{}] ", s.n), accent().add_modifier(Modifier::BOLD)),
+            Span::styled(s.file.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" \u{2014} {}, {}", s.section, s.pages), Style::default()),
+            Span::styled(format!(" \u{00b7} {} \u{00b7} {}", s.chunk_id, s.relevance), muted()),
+        ];
+        if !s.id_ok {
+            spans.push(Span::styled("  \u{2717} chunk_id/источник переписан неверно", bad()));
+        }
+        out.push(rail("  \u{2502} ", spans));
+    }
+    out.push(rail("  \u{251c}\u{2500} ", vec![Span::styled("цитаты", accent().add_modifier(Modifier::BOLD))]));
+    if card.quotes.is_empty() {
+        out.push(rail("  \u{2502} ", vec![Span::styled("\u{2717} цитат нет", bad())]));
+    }
+    for q in &card.quotes {
+        let (mark, style) = match q.found {
+            Found::Verbatim => ("\u{2713} дословно".to_string(), good()),
+            Found::Elsewhere(m) => (format!("\u{2713} дословно, но во фрагменте [{m}]"), warn()),
+            Found::Short => ("\u{2717} слишком короткая".to_string(), bad()),
+            Found::Missing => ("\u{2717} нет во фрагментах".to_string(), bad()),
+        };
+        let text_style = if q.found.ok() { Style::default().add_modifier(Modifier::ITALIC) } else { bad().add_modifier(Modifier::ITALIC) };
+        out.push(rail(
+            "  \u{2502} ",
+            vec![
+                Span::styled(format!("[{}] ", q.n), accent().add_modifier(Modifier::BOLD)),
+                Span::styled("\u{275d}", muted()),
+                Span::styled(q.text.clone(), text_style),
+                Span::styled("\u{275e} ", muted()),
+                Span::styled(mark, style),
+            ],
+        ));
+    }
+    let mut verdict = Vec::new();
+    for (i, part) in card.verdict().split(" \u{00b7} ").enumerate() {
+        if i > 0 {
+            verdict.push(Span::styled(" \u{00b7} ", muted()));
+        }
+        let style = if part.starts_with('\u{2713}') { good() } else if part.starts_with('\u{2717}') { bad() } else { muted() };
+        verdict.push(Span::styled(part.to_string(), style));
+    }
+    out.push(rail("  \u{2570}\u{2500} ", verdict));
+    if let Some(s) = card.support.as_ref().filter(|s| !s.unsupported.is_empty()) {
+        for claim in &s.unsupported {
+            out.push(Line::from(vec![Span::raw("     "), Span::styled(format!("не в цитатах: {claim}"), warn())]));
+        }
+    }
+    if !card.retried.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("     "),
+            Span::styled(format!("повтор после нарушения формата: {}", card.retried.join("; ")), muted()),
+        ]));
+    }
+    out
 }
 
 fn entries_from_session(s: &Session) -> Vec<Entry> {
