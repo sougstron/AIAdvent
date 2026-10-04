@@ -218,7 +218,7 @@ pub fn sources_note(r: &Retriever, p: &Pipeline, got: &Retrieval, added: usize) 
         lines.push(format!("  [{}] {}", i + 1, hit_line(h)));
     }
     if got.kept.is_empty() {
-        lines.push("  ничего не прошло фильтр — модель получит пустой контекст и должна сказать, что в документах ответа нет".into());
+        lines.push("  ничего не прошло фильтр — модель не вызывается: «не знаю» и просьба уточнить".into());
     }
     lines.extend(got.warnings.iter().map(|w| format!("  ! {w}")));
     lines.join("\n")
@@ -239,10 +239,9 @@ pub fn hit_line(h: &Hit) -> String {
     )
 }
 
-/// One RAG turn ready for the wire: the augmented text, the transcript
-/// note naming the chunks, and what the pipeline did.
+/// One RAG turn's retrieval: the transcript note naming the chunks and
+/// what the pipeline did; `cite::answer` builds the wire text from it.
 pub struct Prepared {
-    pub wire: String,
     pub note: String,
     pub hits: Vec<Hit>,
     /// Characters the context added to the question.
@@ -263,9 +262,9 @@ pub fn prepare_with(question: &str, settings: &Settings, p: &Pipeline) -> Res<Pr
     let r = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url)?;
     let judge = if p.needs_llm() { Some(Judge::new(settings, &r)?) } else { None };
     let got = rerank::run(&r, p, judge.as_ref(), question)?;
-    let wire = augment(question, &got.kept);
-    let added = wire.chars().count().saturating_sub(question.chars().count());
-    Ok(Prepared { note: sources_note(&r, p, &got, added), wire, hits: got.kept.clone(), added, retrieval: got, pipeline: p.clone() })
+    // task 24: what goes out is the grounded-answer prompt (`cite.rs`)
+    let added = crate::cite::prompt(question, &got.kept).chars().count().saturating_sub(question.chars().count());
+    Ok(Prepared { note: sources_note(&r, p, &got, added), hits: got.kept.clone(), added, retrieval: got, pipeline: p.clone() })
 }
 
 /// Where the chat and `--rag-eval` look for the index (`rag/index.sqlite`
