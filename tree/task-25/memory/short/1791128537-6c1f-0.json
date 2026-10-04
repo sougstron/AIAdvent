@@ -1,0 +1,27 @@
+{
+  "layer": "short",
+  "scope": "1791128537-6c1f-0",
+  "records": [],
+  "dialog": [
+    {
+      "n": 1,
+      "role": "user",
+      "text": "Какие парадигмы RAG выделяет обзор?"
+    },
+    {
+      "n": 2,
+      "role": "assistant",
+      "text": "Обзор выделяет три парадигмы RAG: Naive RAG, Advanced RAG и Modular RAG [1][2].\n\nИсточники:\n  [1] rag-survey-2312.10997.pdf — Front matter, стр. 1 · fixed-rag-survey-2312.10997-0001\n  [2] rag-survey-2312.10997.pdf — VIII. CONCLUSION, стр. 16–17 · fixed-rag-survey-2312.10997-0091\n\nЦитаты:\n  [1] «encompassing the Naive RAG, the Advanced RAG, and the Modular RAG.»\n  [2] «three developmental paradigms within the RAG framework: Naive, Advanced, and Modular RAG»\n\nПроверка: ✓ источники 2/2 · ✓ цитаты 2/2 дословно · ✓ смысл по цитатам: да"
+    },
+    {
+      "n": 3,
+      "role": "user",
+      "text": "Напомни, какая цель у этого диалога?"
+    },
+    {
+      "n": 4,
+      "role": "assistant",
+      "text": "В цитируемых фрагментах цель диалога напрямую не отражена, но сам обзор выделяет три парадигмы RAG: Naive RAG, Advanced RAG и Modular RAG [1][2].\n\nИсточники:\n  [1] rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG, стр. 2–3 · fixed-rag-survey-2312.10997-0010\n  [2] rag-survey-2312.10997.pdf — Front matter, стр. 1 · fixed-rag-survey-2312.10997-0001\n\nЦитаты:\n  [1] «we categorize it into three stages: Naive RAG, Advanced\nRAG, and Modular RAG»\n  [2] «encompassing\nthe Naive RAG, the Advanced RAG, and the Modular RAG.»\n\nПроверка: ✓ источники 2/2 · ✓ цитаты 2/2 дословно · ✓ смысл по цитатам: да"
+    }
+  ]
+}
