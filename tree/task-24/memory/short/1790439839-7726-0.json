@@ -1,0 +1,27 @@
+{
+  "layer": "short",
+  "scope": "1790439839-7726-0",
+  "records": [],
+  "dialog": [
+    {
+      "n": 1,
+      "role": "user",
+      "text": "can you see what project i have in my git?"
+    },
+    {
+      "n": 2,
+      "role": "assistant",
+      "text": "I can't run commands or inspect your filesystem — I only see the context files you've shared. From those, here's what I know:\n\n**Location:** `/home/shpe/Github/tests/homework/`\n\n**Project:** `ask` — a Rust/ratatui console chat TUI (ChatGPT-style) over an OpenAI-compatible endpoint (default provider: Yolo-Auto). The active snapshot is `tree/task-17/`, a working agent over z.ai's `glm-5.3-flash` API with:\n- chat sessions, effort/JSON-mode settings\n- six context strategies (`off` / `summary` / `window` / `facts` / `branch` / `memory`)\n- a three-layer memory model (short / working / long)\n- user profiles for personalization (`chemist`, `gopnik`, `tutor`, ...)\n- a task state machine (`study → plan → execute → validate → report`)\n- project invariants with client-side validation\n- a controlled task lifecycle (`run.rs`) with approval gates\n- causal self-verification flags (`--verify-stop`, `--verify-memory`, `--verify-profile`, `--verify-todo`, `--verify-lifecycle`, etc.)\n\n**Layout (repo root `src/`):** `main.rs`, `cli.rs`, `config.rs`, `api.rs`, `session.rs`, `render.rs`, `tui.rs`, `todo.rs`, `run.rs`, `invariants.rs`, `pipeline.rs`, `verify.rs`.\n\nIf you want me to check actual git state (branches, remotes, commit history), paste the output of `git log --oneline` / `git remote -v` / `git status` here."
+    },
+    {
+      "n": 3,
+      "role": "user",
+      "text": "But you can see throguh mcp?"
+    },
+    {
+      "n": 4,
+      "role": "assistant",
+      "text": "Нет — в этой сессии у меня нет подключённых MCP-инструментов. Мне доступны только текст контекста (AGENTS.md, инварианты), который ты видишь выше. Я не могу выполнять команды (`git log`, `ls` и т.п.) или читать файлы напрямую.\n\nЕсли у тебя есть MCP-сервер (например, filesystem или git), его нужно подключить в настройках клиента — тогда инструменты появятся у меня автоматически. Без этого: просто вставь вывод `git remote -v` и `git log --oneline -10` сюда, и я разберу."
+    }
+  ]
+}
