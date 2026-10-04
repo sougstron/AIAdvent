@@ -5,6 +5,18 @@
 ## Текущая задача
 
 - **Task 23** — путь: `tree/task-23/`
+- Задача 23: **реранкинг и фильтрация**. Корпус — 10 длинных PDF на разные
+  темы (`docs/`, ~1,1 млн симв., 1368 чанков `fixed`). `src/rerank.rs`:
+  вопрос → [rewrite LLM-ом] → top-K до (20) по косинусу → [порог similarity:
+  z-скор косинуса ≥ 2.5] → [LLM-реранкер 0–10, порог ≥ 5] → top-K после (4).
+  Настройки `rag_filter off|sim|llm|both`, `rag_rewrite`, `rag_pool`,
+  `rag_min_sim`, `rag_min_llm` (`/rag filter|rewrite|pool|min-sim|min-llm`,
+  строки в Tab-панели, `--rag-*`). `ask --rag-tune` → `rag/tune.md` (подбор
+  K и порогов), `ask --rag-eval` → `rag/eval.md`: 26 вопросов (5 без ответа в
+  корпусе) в режимах plain / base / sim / llm / rewrite / full. Итог: base
+  45/56, llm и full 51/56, чужих чанков 23 → 0. `/rag compare` — без фильтра
+  против второго этапа. Подробности — «Реранкинг и фильтрация» в
+  `tree/task-23/README.md`.
 - Задача 22: **первый RAG-запрос**. `src/ragqa.rs`: вопрос → эмбеддинг
   Ollama → top-k чанков индекса задачи 21 (без REFERENCES) → «ответь по
   фрагментам, цитируй [n]» + `<context>` + вопрос → LLM. Агент с двумя

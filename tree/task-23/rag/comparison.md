@@ -4,20 +4,20 @@
 |---|---|---|
 | параметры | `{"norm":"minmax-0-1","overlap":200,"size":1000}` | `{"norm":"minmax-0-1","struct_max":4000}` |
 | модель / dim | nomic-embed-text / 768 | nomic-embed-text / 768 |
-| чанков | 137 | 49 |
-| символов min / медиана / среднее / max | 649 / 997 / 993 / 1000 | 18 / 2218 / 2233 / 3980 |
-| мелких (< 200 симв.) | 0 (0%) | 1 (2%) |
+| чанков | 1368 | 314 |
+| символов min / медиана / среднее / max | 358 / 997 / 993 / 1000 | 18 / 3845 / 3481 / 3998 |
+| мелких (< 200 симв.) | 0 (0%) | 1 (0%) |
 | избыточность (Σ чанков / текст) | 1.24× | 1.00× |
-| пересекают границу раздела | 37 (27%) | 0 (0%) |
-| обрываются посреди предложения | 116 (85%) | 5 (10%) |
+| пересекают границу раздела | 50 (4%) | 0 (0%) |
+| обрываются посреди предложения | 1208 (88%) | 14 (4%) |
 | компоненты векторов min / max (нормализация min-max) | 0.000 / 1.000 | 0.000 / 1.000 |
-| время эмбеддингов | 14479 мс (106 мс/чанк) | 13908 мс (284 мс/чанк) |
+| время эмбеддингов | 136566 мс (100 мс/чанк) | 123466 мс (393 мс/чанк) |
 | поиск: hit@1 (чанк задевает раздел) | 10/12 | 9/12 |
 | поиск: hit@1 (чанк целиком в разделе) | 2/12 | 9/12 |
 | поиск: hit@3 | 11/12 | 11/12 |
-| поиск: MRR | 0.88 | 0.83 |
+| поиск: MRR | 0.87 | 0.83 |
 
-## Пробные вопросы (/home/shmon/Github/tests/homework/tree/task-21/docs/questions.json)
+## Пробные вопросы (docs/questions.json)
 
 Ранг — позиция первого чанка из ожидаемого раздела (0 — нет в выдаче).
 
@@ -26,7 +26,7 @@
 | What are the three paradigms of retrieval-augmented generation? | II. OVERVIEW OF RAG | 12 / 0.992 / REFERENCES | 6 / 0.992 / Front matter |
 | What are the drawbacks of Naive RAG? | Naive RAG | 1 / 0.990 / II. OVERVIEW OF RAG > A. Naive RAG | 3 / 0.988 / VII. DISCUSSION AND FUTURE PROSPECTS > B. RAG Robustness |
 | When should I use RAG instead of fine-tuning the model? | RAG vs Fine-tuning | 1 / 0.994 / II. OVERVIEW OF RAG > D. RAG vs Fine-tuning | 1 / 0.995 / II. OVERVIEW OF RAG > D. RAG vs Fine-tuning |
-| How can the user query be rewritten or expanded before retrieval? | Query Optimization | 2 / 0.990 / III. RETRIEVAL > B. Indexing Optimization | 1 / 0.990 / III. RETRIEVAL > C. Query Optimization (part 1/2) |
+| How can the user query be rewritten or expanded before retrieval? | Query Optimization | 3 / 0.990 / Front matter | 1 / 0.990 / III. RETRIEVAL > C. Query Optimization (part 1/2) |
 | How are chunk size and metadata used to optimize the index? | Indexing Optimization | 1 / 0.991 / III. RETRIEVAL > A. Retrieval Source … III. RETRIEVAL > B. Indexing Optimization | 1 / 0.989 / III. RETRIEVAL > B. Indexing Optimization |
 | How are embedding models fine-tuned for retrieval? | D. Embedding | 1 / 0.994 / III. RETRIEVAL > C. Query Optimization … III. RETRIEVAL > D. Embedding | 1 / 0.994 / III. RETRIEVAL > D. Embedding |
 | How does iterative retrieval alternate between retrieving and generating? | Iterative Retrieval | 1 / 0.993 / V. AUGMENTATION PROCESS IN RAG … V. AUGMENTATION PROCESS IN RAG > A. Iterative Retrieval | 1 / 0.993 / V. AUGMENTATION PROCESS IN RAG > A. Iterative Retrieval |

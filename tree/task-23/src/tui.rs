@@ -72,6 +72,8 @@ const SETTINGS_ROWS: &[&str] = &[
     "profile",
     "todo",
     "rag",
+    "rag filter",
+    "rag rewrite",
     "approve",
     "system_prompt",
 ];
@@ -82,8 +84,8 @@ const PROFILE_USAGE: &str =
     "/profile [show|list|off|prompt|<id>], id из каталога — /profile list";
 const TODO_USAGE: &str = "/todo [show|on|off|start <задача>|approve [коммент]|reject <причина>|\
                           pause [почему]|resume|abort <причина>|log|reset|prompt]";
-const RAG_USAGE: &str =
-    "/rag [show|on|off|k N|strategy structure|fixed|questions|search <вопрос>|compare <N|вопрос>]";
+const RAG_USAGE: &str = "/rag [show|on|off|k N|pool N|rewrite on|off|filter off|sim|llm|both|min-sim Z|min-llm N|\
+                         strategy fixed|structure|questions|search <вопрос>|compare <N|вопрос>]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -2867,29 +2869,63 @@ impl App {
     /// Usage: `/personas <question>` (default cast: physicist, philosopher,
     /// mathematician) or `/personas physicist,poet: <question>` for a custom
     /// cast.
-    /// Задача 22: retrieval в фоне под спиннером (эмбеддинг вопроса в
-    /// Ollama), Esc отменяет.
+    /// Задача 22/23: retrieval в фоне под спиннером (эмбеддинг вопроса в
+    /// Ollama, а с rewrite/реранкером — ещё вызовы LLM), Esc отменяет.
     fn rag_prepare(&mut self, question: &str, terminal: &mut DefaultTerminal) -> Option<Res<crate::ragqa::Prepared>> {
-        let (q, k, strategy) = (question.to_string(), self.settings.rag_k, self.settings.rag_strategy.clone());
-        self.with_spinner(terminal, "RAG: ищу в индексе", move || crate::ragqa::prepare(&q, k, &strategy))
+        let p = crate::rerank::Pipeline::from_settings(&self.settings);
+        self.rag_prepare_with(question, p, terminal)
+    }
+
+    fn rag_prepare_with(
+        &mut self,
+        question: &str,
+        p: crate::rerank::Pipeline,
+        terminal: &mut DefaultTerminal,
+    ) -> Option<Res<crate::ragqa::Prepared>> {
+        let (q, settings) = (question.to_string(), self.settings.clone());
+        let label = format!("RAG: {}", p.label());
+        self.with_spinner(terminal, &label, move || crate::ragqa::prepare_with(&q, &settings, &p))
     }
 
     fn rag_card(&self) -> String {
         let paths = crate::ragqa::default_paths();
         let index = match crate::ragqa::Retriever::open(&paths.db, &self.settings.rag_strategy, &paths.url) {
-            Ok(r) => format!("{} — {} чанков `{}`, эмбеддинги {} ({})", r.db.display(), r.len(), r.strategy, r.model, paths.url),
+            Ok(r) => format!(
+                "{} — {} чанков `{}` из {} документов, эмбеддинги {} ({})",
+                r.db.display(),
+                r.len(),
+                r.strategy,
+                r.titles().len(),
+                r.model,
+                paths.url
+            ),
             Err(e) => format!("недоступен: {e}"),
         };
+        let p = crate::rerank::Pipeline::from_settings(&self.settings);
         format!(
-            "RAG: {} · k={} · стратегия {}\nиндекс: {index}\nдокументы: {} (их же читает MCP docs_list/docs_read/docs_search)\n\
-             Вкл: вопрос → эмбеддинг → ближайшие чанки → вопрос + чанки → LLM. Выкл: модель отвечает сама \
-             (а если подключён MCP docs — может прочитать документ сырьём).\n\
-             /rag questions — 10 контрольных вопросов · /rag compare <N|вопрос> — без RAG (сам читает док через MCP) и с RAG рядом\n{RAG_USAGE}",
+            "RAG: {} · {} · стратегия {}\n\
+             второй этап: rewrite {} · фильтр {} (sim: z ≥ {:.1}, llm: ≥ {}) · top-K до {} → после {}\n\
+             индекс: {index}\nдокументы: {} (их же читает MCP docs_list/docs_read/docs_search)\n\
+             Вкл: вопрос → [rewrite] → ближайшие чанки → [порог similarity] → [LLM-реранкер] → вопрос + чанки → LLM.\n\
+             /rag questions — контрольные вопросы · /rag compare <N|вопрос> — без фильтра/rewrite и с ними рядом\n{RAG_USAGE}",
             if self.settings.rag { "on" } else { "off" },
-            self.settings.rag_k,
+            p.label(),
             self.settings.rag_strategy,
+            if p.rewrite { "on" } else { "off" },
+            p.filter.name(),
+            p.min_z,
+            p.min_llm,
+            p.pool,
+            p.k,
             paths.dir.display()
         )
+    }
+
+    /// Пишет изменённые настройки RAG и в агента, и в статус.
+    fn rag_set(&mut self, f: impl Fn(&mut Settings)) {
+        f(&mut self.settings);
+        f(self.agent.settings_mut());
+        self.status = format!("RAG: {}", crate::rerank::Pipeline::from_settings(&self.settings).label());
     }
 
     /// `/rag …` — режим RAG и инструменты, чтобы сравнить ответы.
@@ -2903,35 +2939,56 @@ impl App {
                 self.settings.rag = on;
                 self.agent.settings_mut().rag = on;
                 self.status = if on {
-                    format!("RAG on — к каждому вопросу {} чанка(ов) из индекса", self.settings.rag_k)
+                    format!("RAG on — {}", crate::rerank::Pipeline::from_settings(&self.settings).label())
                 } else {
                     "RAG off — модель отвечает без индекса".into()
                 };
             }
             "k" => match arg.parse::<usize>() {
-                Ok(k) if (1..=crate::ragqa::MAX_K).contains(&k) => {
-                    self.settings.rag_k = k;
-                    self.agent.settings_mut().rag_k = k;
-                    self.status = format!("RAG: k={k}");
-                }
+                Ok(k) if (1..=crate::ragqa::MAX_K).contains(&k) => self.rag_set(|s| {
+                    s.rag_k = k;
+                    s.rag_pool = s.rag_pool.max(k);
+                }),
                 _ => self.status = format!("/rag k N — N от 1 до {}", crate::ragqa::MAX_K),
+            },
+            "pool" => match arg.parse::<usize>() {
+                Ok(n) if (self.settings.rag_k..=crate::rerank::MAX_POOL).contains(&n) => self.rag_set(|s| s.rag_pool = n),
+                _ => self.status = format!("/rag pool N — top-K до фильтра, от k ({}) до {}", self.settings.rag_k, crate::rerank::MAX_POOL),
             },
             "strategy" => match arg {
                 "structure" | "fixed" => {
-                    self.settings.rag_strategy = arg.to_string();
-                    self.agent.settings_mut().rag_strategy = arg.to_string();
-                    self.status = format!("RAG: чанки из стратегии {arg}");
+                    let st = arg.to_string();
+                    self.rag_set(|s| s.rag_strategy = st.clone());
                 }
                 _ => self.status = "/rag strategy structure|fixed".into(),
+            },
+            "rewrite" => match arg {
+                "on" | "off" => {
+                    let on = arg == "on";
+                    self.rag_set(|s| s.rag_rewrite = on);
+                }
+                _ => self.status = "/rag rewrite on|off".into(),
+            },
+            "filter" => match crate::rerank::Filter::parse(arg) {
+                Ok(f) => self.rag_set(|s| s.rag_filter = f.name().into()),
+                Err(e) => self.status = format!("/rag filter off|sim|llm|both — {e}"),
+            },
+            "min-sim" | "sim" => match arg.parse::<f32>() {
+                Ok(z) if z.is_finite() => self.rag_set(|s| s.rag_min_sim = z),
+                _ => self.status = "/rag min-sim Z — порог z-скора косинуса, например 3.0".into(),
+            },
+            "min-llm" | "llm" => match arg.parse::<u8>() {
+                Ok(n) if n <= 10 => self.rag_set(|s| s.rag_min_llm = n),
+                _ => self.status = "/rag min-llm N — порог оценки реранкера, 0–10".into(),
             },
             "questions" | "q" => {
                 let text = match crate::ragqa::load_controls(&crate::ragqa::default_paths().dir) {
                     Ok(set) => {
-                        let mut lines = vec!["Контрольные вопросы по документу (docs/control.json):".to_string()];
+                        let mut lines = vec!["Контрольные вопросы по корпусу (docs/control.json):".to_string()];
                         for c in &set {
-                            lines.push(format!("{:>2}. {}\n    ждём: {}\n    раздел: {}", c.id, c.q, c.expect, c.sources.join("; ")));
+                            lines.push(format!("{:>2}. {}\n    ждём: {}\n    где: {}", c.id, c.q, c.expect, c.where_label()));
                         }
-                        lines.push("Спросить: скопируйте вопрос в чат (с /rag on и без), или /rag compare N; все 10 разом — ask --rag-eval".into());
+                        lines.push("Спросить: скопируйте вопрос в чат, или /rag compare N; все разом — ask --rag-eval".into());
                         lines.join("\n")
                     }
                     Err(e) => format!("RAG: {e}"),
@@ -2959,91 +3016,70 @@ impl App {
         }
     }
 
-    /// Один вопрос два раза — без RAG и с RAG, той же моделью, без истории.
-    /// Документ есть у обеих сторон, честно: без RAG модель сама ищет и
-    /// читает его через `ask-docs-mcp` (`docs_list`/`docs_read`/`docs_search`),
-    /// с RAG — получает top-k чанков из индекса и инструментов не имеет.
-    /// Сравниваем, кто как по доку ищет: вызовы, прочитанные символы и
-    /// разделы, prompt-токены. Номер — вопрос из `docs/control.json`, тогда
-    /// видно и ожидание, и сколько его попало в каждый ответ.
+    /// Задача 23: один вопрос два раза — RAG без фильтра и rewrite (как в
+    /// задаче 22) и с текущим вторым этапом (если он выключен — с полным:
+    /// rewrite + порог similarity + реранкер). Та же модель, без истории.
+    /// Видно, какие чанки ушли в контекст, что отсёк каждый порог, сколько
+    /// стоили этапы; номер — вопрос из `docs/control.json`, тогда ещё и
+    /// покрытие ожидания и попал ли нужный чанк.
     fn rag_compare(&mut self, arg: &str, terminal: &mut DefaultTerminal) {
+        use crate::rerank::{Filter, Pipeline};
         let paths = crate::ragqa::default_paths();
         let control = arg
             .parse::<usize>()
             .ok()
             .and_then(|n| crate::ragqa::load_controls(&paths.dir).ok()?.into_iter().find(|c| c.id == n));
         let question = control.as_ref().map(|c| c.q.clone()).unwrap_or_else(|| arg.to_string());
+        let c = control.clone().unwrap_or(crate::ragqa::Control {
+            id: 0,
+            q: question.clone(),
+            expect: String::new(),
+            must: vec![],
+            sources: vec![],
+            at: vec![],
+            wrong: vec![],
+        });
         self.entries.push(Entry::User(format!("/rag compare: {question}")));
         if let Some(c) = &control {
-            self.entries.push(Entry::Info(format!("ждём: {}\nраздел: {}", c.expect, c.sources.join("; "))));
+            self.entries.push(Entry::Info(format!("ждём: {}\nгде: {}", c.expect, c.where_label())));
         }
-        let prepared = match self.rag_prepare(&question, terminal) {
-            Some(Ok(p)) => p,
-            Some(Err(e)) => {
-                self.entries.push(Entry::Info(format!("RAG: {e}")));
-                return;
-            }
-            None => {
-                self.status = "сравнение отменено (Esc)".into();
-                return;
-            }
-        };
-        let docs = match crate::mcp_agent::Toolbox::local_docs(&paths.dir) {
-            Ok(tb) => tb,
-            Err(e) => {
-                self.entries.push(Entry::Info(format!("ask-docs-mcp не поднялся: {e}")));
-                return;
-            }
-        };
-        let tools = docs.tool_names();
-        // Тот же агент, что у `ask --rag-eval`: модель и сэмплинг из
-        // настроек, фиксированный system и ничего больше (ни AGENTS.md, ни
-        // профиля, ни инвариантов) — обе стороны в равных условиях, ответы
-        // на одном языке с проверяемыми группами `must`.
-        let base = match crate::ragqa::eval_agent(&self.settings) {
+        let current = Pipeline::from_settings(&self.settings);
+        let base = Pipeline { rewrite: false, filter: Filter::Off, ..current.clone() };
+        let improved = if current.is_base() { Pipeline { rewrite: true, filter: Filter::Both, ..current } } else { current };
+        let agent = match crate::ragqa::eval_agent(&self.settings) {
             Ok(a) => a,
             Err(e) => {
                 self.entries.push(Entry::Info(format!("агент сравнения: {e}")));
                 return;
             }
         };
-        let mut raw = base.clone();
-        raw.set_mcp(Some(std::sync::Arc::new(std::sync::Mutex::new(docs))));
-        let mut rag = base;
-        rag.set_mcp(None);
-        // Обе стороны знают, о каком документе вопрос; различается только
-        // то, как документ доходит до модели.
-        let titled = format!("About the document “{}”: {question}", prepared.title);
-        let must = control.as_ref().map(|c| c.must.clone()).unwrap_or_default();
         let mut results = Vec::new();
-        for (mode, agent, prompt) in [
-            (crate::ragqa::Mode::Mcp, raw, titled.clone()),
-            (crate::ragqa::Mode::Rag, rag, crate::ragqa::augment(&titled, &prepared.hits)),
-        ] {
-            let label = if mode == crate::ragqa::Mode::Rag { "с RAG" } else { "без RAG · сам читает док" };
-            self.entries.push(Entry::Info(if mode == crate::ragqa::Mode::Rag {
-                prepared.note.clone()
-            } else {
-                format!("без RAG: индекса нет, документ доступен через MCP — {tools}")
-            }));
-            let (m, a) = (must.clone(), agent.clone());
+        for (label, p) in [("без фильтра", base), ("с фильтром", improved)] {
+            let prepared = match self.rag_prepare_with(&question, p, terminal) {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => {
+                    self.entries.push(Entry::Info(format!("RAG: {e}")));
+                    return;
+                }
+                None => {
+                    self.status = "сравнение отменено (Esc)".into();
+                    return;
+                }
+            };
+            self.entries.push(Entry::Info(format!("[{label}] {}", prepared.note)));
+            let (a, prompt, cc) = (agent.clone(), crate::ragqa::augment(&question, &prepared.hits), c.clone());
             let Some(ans) = self.with_spinner(terminal, &format!("{label}: думаю"), move || {
-                crate::ragqa::answer(&a, mode, &prompt, &m)
+                crate::ragqa::answer(&a, crate::ragqa::Mode::Rag, &prompt, &cc)
             }) else {
                 self.status = "сравнение отменено (Esc)".into();
                 return;
             };
-            if mode == crate::ragqa::Mode::Mcp {
-                let mut lines = vec![format!("поиск по доку без RAG: {} вызов(ов)", ans.tool_calls)];
-                lines.extend(ans.calls.iter().map(|c| format!("  {c}")));
-                if !ans.read_sections.is_empty() {
-                    lines.push(format!("  прочитаны разделы: {}", ans.read_sections.join("; ")));
-                }
-                self.entries.push(Entry::Info(lines.join("\n")));
-            }
             let score = control
                 .as_ref()
                 .map(|c| {
+                    if !c.answerable() {
+                        return if ans.honest() { " · честный отказ".to_string() } else { " · ответил без опоры".to_string() };
+                    }
                     let miss = if ans.missing.is_empty() { String::new() } else { format!(", нет: {}", ans.missing.join(", ")) };
                     format!(" · ожидаемого {}/{}{miss}", ans.covered, c.must.len())
                 })
@@ -3055,24 +3091,36 @@ impl App {
                     note: Some(format!("{label} · prompt {} tok{score}", ans.prompt_tokens)),
                 }),
             }
-            results.push((label, ans));
             self.scroll_to_bottom(terminal);
+            results.push((label, prepared, ans, score));
         }
         let summary: Vec<String> = results
             .iter()
-            .map(|(label, a)| {
-                let reading = if a.mode == crate::ragqa::Mode::Mcp {
-                    format!(" · {} вызов(ов), прочитано {} симв.", a.tool_calls, a.read_chars)
-                } else {
-                    format!(" · {} чанка, +{} симв.", prepared.hits.len(), prepared.added)
-                };
-                let score = if must.is_empty() { String::new() } else { format!(" · ожидаемого {}/{}", a.covered, must.len()) };
-                format!("  {label}: prompt {} tok{reading} · {:.1} с{score}", a.prompt_tokens, a.latency_ms as f64 / 1000.0)
+            .map(|(label, p, a, score)| {
+                let r = &p.retrieval;
+                let hit = control.as_ref().filter(|c| c.answerable()).map(|c| match crate::ragqa::expected_rank(&p.hits, c) {
+                    0 => " · нужного чанка нет".to_string(),
+                    n => format!(" · нужный чанк [{n}]"),
+                });
+                let noise = control
+                    .as_ref()
+                    .map(|c| format!(", чужих {}", p.hits.iter().filter(|h| !crate::ragqa::expected_file(h, c)).count()))
+                    .unwrap_or_default();
+                format!(
+                    "  {label} ({}): {} чанк(ов){noise}, +{} симв.{} · prompt {} tok · этапы {} tok · {:.1} с{score}",
+                    p.pipeline.label(),
+                    p.hits.len(),
+                    p.added,
+                    hit.unwrap_or_default(),
+                    a.prompt_tokens,
+                    r.prompt_tokens + r.completion_tokens,
+                    (a.latency_ms + r.ms) as f64 / 1000.0
+                )
             })
             .collect();
-        self.entries.push(Entry::Info(format!("итог сравнения (документ у обеих сторон):\n{}", summary.join("\n"))));
+        self.entries.push(Entry::Info(format!("итог сравнения:\n{}", summary.join("\n"))));
         self.scroll_to_bottom(terminal);
-        self.status = "сравнение готово: сырое чтение через MCP против RAG".into();
+        self.status = "сравнение готово: RAG без фильтра против второго этапа".into();
     }
 
     fn cmd_personas(&mut self, rest: &str, terminal: &mut DefaultTerminal) {
@@ -3296,6 +3344,16 @@ impl App {
             "rag" => {
                 self.settings.rag = !self.settings.rag;
                 self.agent.settings_mut().rag = self.settings.rag;
+            }
+            // Задача 23: второй этап. Стрелка листает off → sim → llm → both.
+            "rag filter" => {
+                let next = crate::rerank::Filter::parse(&self.settings.rag_filter).unwrap_or(crate::rerank::Filter::Off).cycle();
+                self.settings.rag_filter = next.name().into();
+                self.agent.settings_mut().rag_filter = next.name().into();
+            }
+            "rag rewrite" => {
+                self.settings.rag_rewrite = !self.settings.rag_rewrite;
+                self.agent.settings_mut().rag_rewrite = self.settings.rag_rewrite;
             }
             // Кто подписывает план. Гейт не выключается ни в одном
             // положении: `auto` — это подпись «auto» в журнале, а не
@@ -4660,9 +4718,35 @@ impl App {
             }
             "rag" => {
                 if self.settings.rag {
-                    format!("on   (k={}, {}; чанки из индекса — к каждому вопросу)", self.settings.rag_k, self.settings.rag_strategy)
+                    format!(
+                        "on   ({}, {}; чанки из индекса — к каждому вопросу)",
+                        crate::rerank::Pipeline::from_settings(&self.settings).label(),
+                        self.settings.rag_strategy
+                    )
                 } else {
                     "off  (модель отвечает сама; /rag on)".to_string()
+                }
+            }
+            "rag filter" => match crate::rerank::Filter::parse(&self.settings.rag_filter).unwrap_or(crate::rerank::Filter::Off) {
+                crate::rerank::Filter::Off => format!("off  (top-{} по косинусу, как в задаче 22)", self.settings.rag_k),
+                crate::rerank::Filter::Sim => format!(
+                    "sim  (top-{} → z-скор косинуса ≥ {:.1} → top-{})",
+                    self.settings.rag_pool, self.settings.rag_min_sim, self.settings.rag_k
+                ),
+                crate::rerank::Filter::Llm => format!(
+                    "llm  (top-{} → LLM-реранкер, оценка ≥ {} → top-{})",
+                    self.settings.rag_pool, self.settings.rag_min_llm, self.settings.rag_k
+                ),
+                crate::rerank::Filter::Both => format!(
+                    "both (top-{} → z ≥ {:.1} → LLM ≥ {} → top-{})",
+                    self.settings.rag_pool, self.settings.rag_min_sim, self.settings.rag_min_llm, self.settings.rag_k
+                ),
+            },
+            "rag rewrite" => {
+                if self.settings.rag_rewrite {
+                    "on   (LLM переписывает вопрос в поисковый запрос, ищем по обоим)".to_string()
+                } else {
+                    "off  (ищем по вопросу как он набран)".to_string()
                 }
             }
             "approve" => match self.settings.approve {
@@ -5028,8 +5112,9 @@ const HELP: &str = "\
 /mem clear <layer> | task <name>  wipe one layer / switch the working-memory task
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
-/rag [show|on|off|k N|strategy structure|fixed]  RAG: nearest chunks of rag/index.sqlite go with every question (off by default)
-/rag questions | search <q> | compare <N|q>  control questions / retrieval only / the same question: raw reading via docs MCP vs RAG
+/rag [show|on|off|k N|strategy fixed|structure]  RAG: nearest chunks of rag/index.sqlite go with every question (off by default)
+/rag rewrite on|off | filter off|sim|llm|both | pool N | min-sim Z | min-llm N  second stage: query rewrite, similarity threshold, LLM reranker
+/rag questions | search <q> | compare <N|q>  control questions / retrieval only / the same question without and with the second stage
 /mcp [show|off|git [path]|pipeline [dir]|tracker [db]|notify [dir]|docs [dir]|<url>]  MCP servers the chat may call (all five on by default)
 /pipeline [wiki] <query> [> file.md]  run search → summarize → saveToFile over MCP, every step shown
 /review [rev] [in dir] [> file.md]  review a commit over 4 MCP servers: git_log → git_show → git_log×files → issue_create×files → issue_list → saveToFile → notify_send
