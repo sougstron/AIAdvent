@@ -22,6 +22,7 @@ mod run;
 mod runtime;
 mod scheduler;
 mod pipeline;
+mod rag;
 mod session;
 mod strategy;
 mod todo;

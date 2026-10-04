@@ -5,6 +5,16 @@
 ## Текущая задача
 
 - **Task 21** — путь: `tree/task-21/`
+- Задача 21: **индексация документов** (первая из RAG-серии 21–25).
+  `src/rag.rs`: `docs/*.pdf|md|txt` (сейчас — обзор RAG, arXiv 2312.10997,
+  21 стр.) → чанки двумя стратегиями (`fixed`: `--chunk-size` /
+  `--chunk-overlap`; `structure`: по разделам, `--struct-max`) → эмбеддинги
+  локальной Ollama `nomic-embed-text` → SQLite `rag/index.sqlite` с
+  метаданными (source, file, title, section, sections, страницы, chunk_id).
+  `ask --rag-index docs` индексирует и пишет `rag/comparison.md`, где есть
+  пробный поиск по `docs/questions.json` с проверкой раздела по метаданным;
+  `ask --rag-compare docs` печатает отчёт заново. Подробности — раздел
+  «Индексация документов» в `tree/task-21/README.md`.
 - Задача 20: **оркестрация MCP**. `src/orchestra.rs` — ещё два своих
   MCP-сервера: `ask-tracker-mcp` (задачи в SQLite `~/.ask6/tracker.db`:
   `issue_create` / `issue_list` / `issue_close`, метки прогонов) и

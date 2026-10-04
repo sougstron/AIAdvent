@@ -15,6 +15,7 @@ use crate::mcp;
 use crate::mcp_agent;
 use crate::mcp_server;
 use crate::orchestra;
+use crate::rag;
 use crate::memory;
 use crate::profile;
 use crate::render;
@@ -68,6 +69,9 @@ use crate::verify;
         ask --triage --pipeline-root /tmp/triage-demo   TODO triage across 4 MCP servers: git, pipeline, tracker, notify\n  \
         ask --review --scope tree/task-20/src   review the latest commit there across the same 4 servers\n  \
         ask --verify-orchestra [offline|live|all]  prove routing and call order of the multi-server flow\n  \
+        ask --rag-index docs                  chunk docs/ two ways, embed via Ollama, save rag/index.sqlite, compare\n  \
+        ask --rag-index docs --chunk-strategy fixed --chunk-size 500 --chunk-overlap 100\n  \
+        ask --rag-compare docs                re-print the chunking comparison from the saved index\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -364,6 +368,47 @@ pub struct Cli {
     /// sentence) or `all`.
     #[arg(long, value_name = "WHICH", num_args = 0..=1, default_missing_value = "all")]
     pub verify_orchestra: Option<String>,
+
+    /// Task 21: index the documents in DIR (`.pdf` via pdftotext, `.md`,
+    /// `.txt`) — chunk, embed with a local Ollama model, save to `--rag-db`,
+    /// then print the comparison of the chunking strategies.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
+    pub rag_index: Option<String>,
+
+    /// Re-print the strategy comparison from the saved index (no
+    /// re-chunking; only the probe questions are embedded). DIR holds
+    /// `questions.json`.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
+    pub rag_compare: Option<String>,
+
+    /// Chunking strategy for `--rag-index`: `fixed`, `structure` or `both`.
+    #[arg(long, value_name = "fixed|structure|both", default_value = "both")]
+    pub chunk_strategy: String,
+
+    /// Fixed strategy: chunk length in characters.
+    #[arg(long, value_name = "CHARS", default_value_t = 1000)]
+    pub chunk_size: usize,
+
+    /// Fixed strategy: characters shared by neighbouring chunks.
+    #[arg(long, value_name = "CHARS", default_value_t = 200)]
+    pub chunk_overlap: usize,
+
+    /// Structure strategy: a longer section is split at sentence ends.
+    #[arg(long, value_name = "CHARS", default_value_t = 4000)]
+    pub struct_max: usize,
+
+    /// Embedding model served by Ollama.
+    #[arg(long, value_name = "MODEL", default_value = rag::DEFAULT_MODEL)]
+    pub embed_model: String,
+
+    /// Ollama base URL.
+    #[arg(long, value_name = "URL", env = "OLLAMA_URL", default_value = rag::DEFAULT_URL)]
+    pub ollama_url: String,
+
+    /// SQLite file of the index; `chunks-*.jsonl` and `comparison.md` go
+    /// next to it.
+    #[arg(long, value_name = "FILE", default_value = rag::DEFAULT_DB)]
+    pub rag_db: String,
 
     /// Live proof for the task state machine: `machine` (legal transitions
     /// pass, illegal ones are refused — no network), `wire` (what the state
@@ -783,6 +828,20 @@ pub fn run() -> Res<()> {
         } else {
             Err("scheduler not confirmed".into())
         };
+    }
+
+    if let Some(dir) = cli.rag_index.as_deref().or(cli.rag_compare.as_deref()) {
+        let cfg = rag::Config {
+            dir: dir.into(),
+            strategies: rag::Strategy::parse_list(&cli.chunk_strategy)?,
+            size: cli.chunk_size,
+            overlap: cli.chunk_overlap,
+            struct_max: cli.struct_max,
+            model: cli.embed_model.clone(),
+            url: cli.ollama_url.clone(),
+            db: cli.rag_db.clone().into(),
+        };
+        return if cli.rag_index.is_some() { rag::index(&cfg) } else { rag::compare(&cfg) };
     }
 
     if let Some(which) = cli.verify_pipeline.as_deref() {
