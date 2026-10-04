@@ -92,6 +92,20 @@ impl Config {
         Ok(())
     }
 
+    /// Relative `dir`/`db` are taken from the current directory; when `dir`
+    /// is not there (e.g. launched from `target/release`), both fall back to
+    /// the task folder the binary was built from.
+    pub fn resolve_paths(mut self) -> Self {
+        let home = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if self.dir.is_relative() && !self.dir.exists() && home.join(&self.dir).exists() {
+            self.dir = home.join(&self.dir);
+            if self.db.is_relative() {
+                self.db = home.join(&self.db);
+            }
+        }
+        self
+    }
+
     fn params(&self, s: Strategy) -> Value {
         match s {
             Strategy::Fixed => json!({"size": self.size, "overlap": self.overlap, "norm": NORM}),

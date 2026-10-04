@@ -2762,6 +2762,10 @@ ollama serve &                       # если ещё не запущена; м
 ./target/release/ask --rag-compare docs                     # отчёт по сохранённому индексу
 ```
 
+Относительные `docs` и `--rag-db` берутся из текущей папки, а если `docs` там
+нет — из папки таски, где собран бинарник. Поэтому и `cd target/release &&
+./ask --rag-index docs` работает: индекс всё равно ляжет в `tree/task-21/rag/`.
+
 | флаг | по умолчанию | смысл |
 | --- | --- | --- |
 | `--chunk-strategy` | `both` | `fixed`, `structure` или `both` |

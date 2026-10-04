@@ -840,7 +840,8 @@ pub fn run() -> Res<()> {
             model: cli.embed_model.clone(),
             url: cli.ollama_url.clone(),
             db: cli.rag_db.clone().into(),
-        };
+        }
+        .resolve_paths();
         return if cli.rag_index.is_some() { rag::index(&cfg) } else { rag::compare(&cfg) };
     }
 
