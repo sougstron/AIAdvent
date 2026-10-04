@@ -1,0 +1,14 @@
+[
+  {"q": "What are the three paradigms of retrieval-augmented generation?", "expect": "II. OVERVIEW OF RAG"},
+  {"q": "What are the drawbacks of Naive RAG?", "expect": "Naive RAG"},
+  {"q": "When should I use RAG instead of fine-tuning the model?", "expect": "RAG vs Fine-tuning"},
+  {"q": "How can the user query be rewritten or expanded before retrieval?", "expect": "Query Optimization"},
+  {"q": "How are chunk size and metadata used to optimize the index?", "expect": "Indexing Optimization"},
+  {"q": "How are embedding models fine-tuned for retrieval?", "expect": "D. Embedding"},
+  {"q": "How does iterative retrieval alternate between retrieving and generating?", "expect": "Iterative Retrieval"},
+  {"q": "How does the model decide by itself when to retrieve?", "expect": "Adaptive Retrieval"},
+  {"q": "Which benchmarks and tools are used to evaluate RAG systems?", "expect": "Evaluation"},
+  {"q": "Do long-context LLMs make RAG unnecessary?", "expect": "RAG vs Long Context"},
+  {"q": "How robust is RAG to noisy or irrelevant retrieved documents?", "expect": "RAG Robustness"},
+  {"q": "Can RAG work with images, audio and video?", "expect": "Multi-modal RAG"}
+]
