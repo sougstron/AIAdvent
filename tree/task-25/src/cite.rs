@@ -125,7 +125,10 @@ fn nearest(got: &Retrieval, n: usize) -> Vec<String> {
 
 /// What goes to the model instead of the bare question: the contract, the
 /// excerpts with `source` / `section` / `chunk_id`, then the question.
-pub fn prompt(question: &str, hits: &[Hit]) -> String {
+/// `mem` (task 25) adds one `<task-state>` block between the contract and
+/// the context — tag-delimited, so the rest of the prompt stays
+/// byte-identical when the dialogue's state moves.
+pub fn prompt(question: &str, hits: &[Hit], mem: Option<&crate::chatmem::TaskMem>) -> String {
     let mut s = String::from(
         "Answer the question using only the document excerpts below. Reply with ONE JSON object and nothing else:\n\
          {\"status\":\"answer\",\"answer\":\"… [1] …\",\
@@ -140,8 +143,12 @@ pub fn prompt(question: &str, hits: &[Hit]) -> String {
          the quotes.\n\
          - If the excerpts do not contain the answer, do not answer from your own knowledge; reply \
          {\"status\":\"unknown\",\"answer\":\"\",\"sources\":[],\"quotes\":[],\"clarify\":\"<one question asking the \
-         user to clarify, in the language of the question>\"}\n\n<context>\n",
+         user to clarify, in the language of the question>\"}\n\n",
     );
+    if let Some(block) = mem.and_then(crate::chatmem::TaskMem::block) {
+        s += &block;
+    }
+    s += "<context>\n";
     for (i, h) in hits.iter().enumerate() {
         let c = &h.chunk;
         s += &format!(
@@ -419,6 +426,12 @@ pub struct Card {
     pub finish_reason: Option<String>,
     /// The last reply as the model sent it.
     pub raw: String,
+    /// Задача 25: ответ дан из памяти задачи (цели и договорённостей
+    /// диалога), а не из фрагментов корпуса — у него по определению нет
+    /// источников, и «Проверка: …» к нему не относится. Ставит только
+    /// `chatmem::Chat::recall`, когда вопрос — о договорённостях.
+    #[serde(default)]
+    pub from_memory: bool,
     /// Usage of the first attempt alone — the one whose prompt the chat
     /// measured, for the footer's chars-per-token calibration.
     #[serde(skip)]
@@ -447,8 +460,16 @@ impl Card {
             ms: 0,
             finish_reason: None,
             raw: String::new(),
+            from_memory: false,
             first_usage: Usage::default(),
         }
+    }
+
+    /// Задача 25: карточка ответа «из памяти задачи» (chatmem.rs). Вопрос
+    /// был о договорённостях диалога: корпуса под ним нет по определению,
+    /// поэтому источников нет и строка «Проверка» заменена подписью.
+    pub fn recall(answer: &str, usage: &Usage, ms: u128) -> Card {
+        Card { status: Status::Answer, by: None, answer: answer.trim().to_string(), sources: vec![], quotes: vec![], clarify: None, why: None, nearest: vec![], check: None, support: None, retried: vec![], attempts: 0, prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, ms, finish_reason: None, raw: String::new(), from_memory: true, first_usage: *usage }
     }
 
     /// Answered, and every part of the answer checks out.
@@ -523,7 +544,16 @@ impl Card {
                 s += &format!("\n  [{}] «{}»", q.n, q.text.trim());
             }
         }
-        s += &format!("\n\nПроверка: {}", self.verdict());
+        if self.from_memory {
+            // Из памяти задачи: источники-фрагменты сюда не приложишь, так
+            // что подпись честно говорит, откуда ответ.
+            s += "\n\nИз памяти задачи: ответ дан из цели и договорённостей этого диалога, а не из фрагментов корпуса — источников нет.";
+        } else {
+            let v = self.verdict();
+            if !v.is_empty() {
+                s += &format!("\n\nПроверка: {v}");
+            }
+        }
         s
     }
 }
@@ -619,6 +649,7 @@ pub fn verify(text: &str, question: &str, hits: &[Hit]) -> Card {
         ms: 0,
         finish_reason: None,
         raw: text.to_string(),
+        from_memory: false,
         first_usage: Usage::default(),
     }
 }
@@ -703,7 +734,7 @@ impl Checker {
 /// One grounded turn. `history` ends with the user's question as typed; its
 /// last message goes out as [`prompt`]. With a weak context the gate's
 /// card comes back without calling the model.
-pub fn answer(agent: &Agent, checker: Option<&Checker>, history: &[ChatMessage], question: &str, got: &Retrieval, idk: Idk) -> Res<Card> {
+pub fn answer(agent: &Agent, checker: Option<&Checker>, history: &[ChatMessage], question: &str, got: &Retrieval, idk: Idk, mem: Option<&crate::chatmem::TaskMem>) -> Res<Card> {
     if let Some(why) = weak(got, idk) {
         return Ok(Card::unknown(question, got, why));
     }
@@ -711,8 +742,8 @@ pub fn answer(agent: &Agent, checker: Option<&Checker>, history: &[ChatMessage],
     let hits = &got.kept;
     let mut wire = history.to_vec();
     match wire.last_mut() {
-        Some(last) => last.content = prompt(question, hits),
-        None => wire.push(ChatMessage::user(prompt(question, hits))),
+        Some(last) => last.content = prompt(question, hits, mem),
+        None => wire.push(ChatMessage::user(prompt(question, hits, mem))),
     }
     let (mut prompt_tokens, mut completion_tokens) = (0, 0);
     let mut card: Card;
@@ -796,7 +827,7 @@ pub fn ask_once(question: &str, settings: &Settings) -> Res<()> {
     eprintln!("{}", p.note);
     let agent = ragqa::eval_agent(settings)?;
     let checker = Checker::new(settings)?;
-    let card = answer(&agent, Some(&checker), &[ChatMessage::user(question)], question, &p.retrieval, Idk::from_settings(settings))?;
+    let card = answer(&agent, Some(&checker), &[ChatMessage::user(question)], question, &p.retrieval, Idk::from_settings(settings), None)?;
     println!("{}", card.to_text());
     if !card.retried.is_empty() {
         eprintln!("· повторы: {}", card.retried.join("; "));
@@ -884,7 +915,7 @@ pub fn eval(settings: &Settings, paths: &crate::rag::Config, only: &[usize]) -> 
         let label = if *kind == "vague" { format!("v{}", c.id - 100) } else { c.id.to_string() };
         println!("\n[{label}] {}", c.q);
         let got = rerank::run(&r, &p, judge.as_ref(), &c.q).map_err(|e| format!("[{label}] {e}"))?;
-        let (card, error) = match answer(&agent, Some(&checker), &[ChatMessage::user(&c.q)], &c.q, &got, idk) {
+        let (card, error) = match answer(&agent, Some(&checker), &[ChatMessage::user(&c.q)], &c.q, &got, idk, None) {
             Ok(card) => (Some(card), None),
             Err(e) => (None, Some(e)),
         };
@@ -1131,9 +1162,9 @@ mod tests {
 
     #[test]
     fn prompt_names_source_section_and_chunk_id_before_the_question() {
-        let p = prompt("Why random?", &[hit("fixed-raft-0002", RAFT, Some(10), 4.0)]);
+        let p = prompt("Why random?", &[hit("fixed-raft-0002", RAFT, Some(10), 4.0)], None);
         let header = p.find("[1] source=raft.pdf | section=Front matter | pages=стр. 6 | chunk_id=fixed-raft-0002").unwrap();
         assert!(p.find("\"status\":\"unknown\"").unwrap() < header && header < p.find("Question: Why random?").unwrap());
-        assert!(prompt("q", &[]).contains("no relevant excerpts"));
+        assert!(prompt("q", &[], None).contains("no relevant excerpts"));
     }
 }

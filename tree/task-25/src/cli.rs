@@ -77,6 +77,8 @@ use crate::verify;
         ask --rag-eval                        20 control questions: plain / base / sim / llm / rewrite / full → rag/eval.md\n  \
         ask --rag-tune                        top-K and threshold sweeps for the second stage → rag/tune.md\n  \
         ask --rag-cite-eval                   sources + verbatim quotes + \"I don't know\" on 10+8 questions → rag/cite.md\n  \
+        ask --rag-chat                        mini-chat: history + RAG + sources every turn + task memory (task 25)\n  \
+        ask --rag-chat-eval                   two 10–15-message scenarios: sources kept, goal held → rag/chat.md\n  \
         ask --rag --rag-rewrite --rag-filter both \"q\"   rewrite + similarity threshold + LLM reranker (task 23)\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
@@ -440,6 +442,25 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
     pub rag_cite_eval: Option<String>,
 
+    /// Task 25: the mini-chat with RAG + task memory — interactive: one
+    /// line is one turn, every answer comes with sources, the task state
+    /// (goal / clarifications / constraints / terms) is kept across turns.
+    /// Commands inside: `/state`, `/reset`, `/mem on|off`, `/quit`.
+    #[arg(long)]
+    pub rag_chat: bool,
+
+    /// Task 25: replay the long scenarios of `DIR/chat-scenarios.json`
+    /// (two dialogues of 10–15 messages) through the same mini-chat and
+    /// check sources on every answer, goal retention and the task memory →
+    /// `rag/chat.md`.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
+    pub rag_chat_eval: Option<String>,
+
+    /// Task 25: task memory of the RAG chat (`chatmem.rs`). On by default;
+    /// `off` is the control for the eval and for the chat.
+    #[arg(long, value_name = "on|off")]
+    pub chatmem: Option<String>,
+
     /// Task 22/23: run the control questions `DIR/control.json` in every
     /// mode, score every answer against its expectation, write `rag/eval.md`.
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
@@ -688,6 +709,13 @@ impl Cli {
         }
         if let Some(z) = self.rag_idk_z {
             s.rag_idk_z = z;
+        }
+        if let Some(v) = &self.chatmem {
+            s.chatmem = match v.as_str() {
+                "on" => true,
+                "off" => false,
+                other => return Err(format!("--chatmem: ожидалось on или off, получено `{other}`")),
+            };
         }
         // Кто подписывает план. Без флага: в TUI ждём человека, а в
         // неинтерактивном заходе спросить некого — подпись ставит `auto`,
@@ -984,6 +1012,16 @@ pub fn run() -> Res<()> {
     if let Some(dir) = cli.rag_cite_eval.as_deref() {
         let settings = cli.to_settings()?;
         return crate::cite::eval(&settings, &rag::Config::locate(dir, &cli.rag_db), &cli.rag_eval_only);
+    }
+
+    if cli.rag_chat {
+        let settings = cli.to_settings()?;
+        return crate::chatmem::repl(&settings, &rag::Config::locate("docs", &cli.rag_db));
+    }
+
+    if let Some(dir) = cli.rag_chat_eval.as_deref() {
+        let settings = cli.to_settings()?;
+        return crate::chatmem::eval(&settings, &rag::Config::locate(dir, &cli.rag_db), &cli.rag_eval_only);
     }
 
     if let Some(dir) = cli.rag_tune.as_deref() {

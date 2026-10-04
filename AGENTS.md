@@ -57,8 +57,29 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-25/`.** — a verbatim copy of
-`tree/task-24/` made to start task 25 (no new functionality yet). It is a working agent: a ratatui
+**The active snapshot is `tree/task-25/`.** — task 25 added the
+**RAG mini-chat with task memory** (`src/chatmem.rs`): on top of task 24's
+grounded answers (sources, verbatim quotes, «не знаю») the chat keeps a
+structured conversation state — goal / clarifications / fixed constraints /
+agreed terms — recomputed after every answered turn by an LLM extractor at
+temperature 0, validated and capped by `parse_state` (an unparseable reply is
+dropped, memory is never erased). The state is used twice per turn: one
+context line joins the embedding query, and a tag-delimited `<task-state>`
+block rides the `cite.rs` prompt. It lives in the session file
+(`Session::task_mem`), survives restarts, is removed with the session.
+Questions about the dialogue's own agreements (nothing in the corpus by
+definition) are served by `chatmem::recall` — answered from the state and
+history at t=0, clearly labeled, no fake sources; the `NOT-IN-MEMORY` marker
+falls back to the honest «не знаю». TUI: `/rag mem [on|off|reset]`; CLI chat:
+`ask --rag-chat` (`/state`, `/reset`, `/mem on|off`). Proof:
+`ask --rag-chat-eval` replays the two scripted 12–14-message dialogues of
+`docs/chat-scenarios.json` (Raft service, RAG pipeline) through the same
+`Chat::turn` the REPL uses and writes `rag/chat.md` — causally checked:
+sources/quotes against chunks, constraint retention via mandatory word
+groups, the memory by reading the state itself. The rest of the paragraphs
+below describes earlier state; the newer tasks (21–24: indexing, first RAG
+query, reranking, citations) are documented in `docs/CurrentTask.md` and the
+snapshot READMEs. It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
 than a bare HTTP call. Default and only live model is `glm-5.3-flash`; the

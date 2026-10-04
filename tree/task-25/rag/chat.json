@@ -1,0 +1,2417 @@
+{
+  "model": "glm-5.3-flash",
+  "scenarios": [
+    {
+      "goal": "спроектировать по статье о Raft внутренний сервис конфигураций: кластер из 5 узлов, строго актуальные чтения, смена состава без даунтайма",
+      "goal_covered": 2,
+      "goal_must": 2,
+      "goal_text": "Спроектировать внутренний распределённый сервис конфигураций на основе Raft, устойчивый к отказам узлов; начать с понимания устройства Raft.",
+      "id": 1,
+      "mem": {
+        "clarified": [
+          "Проектируется внутренний сервис конфигураций",
+          "Должен быть распределённым и переживать отказ узлов",
+          "Основой служит статья о Raft",
+          "Изучен механизм выборов лидера в Raft",
+          "Изучены требования к таймаутам выборов",
+          "Изучена причина рандомизации таймаутов выборов",
+          "Договорились: quorum = 3",
+          "Изучен механизм коммита записей лидером"
+        ],
+        "constraints": [
+          "Кластер ровно из 5 узлов",
+          "Строго актуальные (линеаризуемые) чтения",
+          "Смена состава кластера без даунтайма"
+        ],
+        "goal": "Спроектировать внутренний распределённый сервис конфигураций на основе Raft, устойчивый к отказам узлов; начать с понимания устройства Raft.",
+        "terms": [
+          {
+            "meaning": "Алгоритм консенсуса для реплицируемого лога: выборы лидера, репликация лога, безопасность",
+            "term": "Raft"
+          },
+          {
+            "meaning": "Большинство узлов кластера; в этом диалоге зафиксировано: quorum = 3",
+            "term": "Кворум"
+          },
+          {
+            "meaning": "Случайный таймаут (рекоменд. 150–300 мс): фолловер без связи с лидером становится кандидатом",
+            "term": "Election timeout"
+          },
+          {
+            "meaning": "Запрос голоса, который кандидат рассылает другим серверам на выборах",
+            "term": "RequestVote RPC"
+          },
+          {
+            "meaning": "Время рассылки RPC, должно быть на порядок меньше election timeout; типично 0,5–20 мс",
+            "term": "Broadcast time"
+          },
+          {
+            "meaning": "Среднее время между отказами; election timeout должен быть на порядки меньше MTBF",
+            "term": "MTBF"
+          },
+          {
+            "meaning": "Разделение голосов, когда никто не набрал кворум; разрешается благодаря рандомизации таймаутов",
+            "term": "Split vote"
+          },
+          {
+            "meaning": "Запись считается committed, когда реплицирована на большинство; она durable и будет применена всеми state machines",
+            "term": "Committed запись"
+          },
+          {
+            "meaning": "Высший известный committed-индекс; лидер передаёт его в AppendEntries, фолловеры применяют записи по порядку",
+            "term": "Commit index"
+          },
+          {
+            "meaning": "Двухфазное изменение конфигурации: переходная конфигурация (старая+новая, отдельные большинства), затем новая; без даунтайма",
+            "term": "Joint consensus"
+          }
+        ]
+      },
+      "title": "Сервис конфигураций на Raft (raft-consensus.pdf)",
+      "turns": [
+        {
+          "card": {
+            "answer": "Raft — алгоритм консенсуса для реплицируемого лога: сначала выбирается выделенный лидер, который принимает записи от клиентов, реплицирует их на другие серверы и решает, когда их безопасно применять. Задача разбита на три относительно независимые подзадачи: выборы лидера (при отказе существующего выбирается новый, с рандомизированными таймерами), репликация лога и безопасность. [1][2][3]",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 4,
+              "quotes_ok": 4,
+              "sources": 4,
+              "sources_ok": 4,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1251,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 34200,
+            "nearest": [],
+            "prompt_tokens": 5863,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Raft implements consensus by first electing a distinguished leader, then giving the leader complete responsibility for managing the replicated log. The leader accepts log entries from clients, replicates them on other servers, and tells servers when it is safe to apply log entries to their state machines."
+              },
+              {
+                "found": "verbatim",
+                "n": 2,
+                "text": "Raft decomposes the consensus problem into three relatively independent subproblems, which are discussed in the subsections that follow: • Leader election: a new leader must be chosen when an existing leader fails"
+              },
+              {
+                "found": "verbatim",
+                "n": 3,
+                "text": "• Leader election: Raft uses randomized timers to elect leaders."
+              },
+              {
+                "found": "verbatim",
+                "n": 4,
+                "text": "including decomposition (Raft separates leader election, log replication, and safety)"
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Raft — алгоритм консенсуса для реплицируемого лога: сначала выбирается выделенный лидер, который принимает записи от клиентов, реплицирует их на другие серверы и решает, когда их безопасно применять. Задача разбита на три относительно независимые подзадачи: выборы лидера (при отказе существующего выбирается новый, с рандомизированными таймерами), репликация лога и безопасность. [1][2][3]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0017\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0018\"},{\"n\":3,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0000\"},{\"n\":4,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0005\"}],\"quotes\":[{\"n\":1,\"text\":\"Raft implements consensus by first electing a distinguished leader, then giving the leader complete responsibility for managing the replicated log. The leader accepts log entries from clients, replicates them on other servers, and tells servers when it is safe to apply log entries to their state machines.\"},{\"n\":2,\"text\":\"Raft decomposes the consensus problem into three relatively independent subproblems, which are discussed in the subsections that follow: • Leader election: a new leader must be chosen when an existing leader fails\"},{\"n\":3,\"text\":\"• Leader election: Raft uses randomized timers to elect leaders.\"},{\"n\":4,\"text\":\"including decomposition (Raft separates leader election, log replication, and safety)\"}]}",
+            "retried": [
+              "quote [2] «Raft decomposes the consensus problem into three relatively independent subproblems: • Leader election: a new leader must be chosen when an existing leader fails» is not in any excerpt — copy it character for character",
+              "судья: не в цитатах — утверждение, что задача Raft разбита именно на три подзадачи (выборы лидера, репликация лога и безопасность), в цитатах прямо не сформулировано"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0017",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 3",
+                "relevance": "llm 8",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0018",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 3",
+                "relevance": "llm 7",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0000",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 3,
+                "pages": "стр. 1",
+                "relevance": "llm 6",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0005",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 4,
+                "pages": "стр. 1",
+                "relevance": "llm 6",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#1 cos 0.9943 z 3.71 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 3 · 994 симв.",
+            "#4 cos 0.9933 z 3.42 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 3 · 999 симв.",
+            "#2 cos 0.9936 z 3.51 llm 6 (rewrite) · raft-consensus.pdf — Front matter, стр. 1 · 998 симв.",
+            "#5 cos 0.9931 z 3.37 llm 6 (rewrite) · raft-consensus.pdf — Front matter, стр. 1 · 994 симв."
+          ],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 1,
+          "numbers_ok": true,
+          "q": "Мы проектируем внутренний сервис конфигураций по статье о Raft: распределённый, переживает отказ узлов. С чего начать — как Raft вообще устроен, коротко?",
+          "quotes_ok": true,
+          "sources": 4,
+          "sources_ok": 4,
+          "state_checks": 1,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6061
+        },
+        {
+          "card": {
+            "answer": "Кластер из 5 узлов типичен и переживает отказ двух узлов; для кворума нужно большинство серверов — новые записи принимаются и применяются, пока большинство серверов работают, а лидером становится кандидат, получивший голоса большинства всего кластера [1][2][3].",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 1,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 3,
+              "sources_ok": 3,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 801,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 24986,
+            "nearest": [],
+            "prompt_tokens": 7029,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "A Raft cluster contains several servers; five is a typical number, which allows the system to tolerate two failures."
+              },
+              {
+                "found": {
+                  "elsewhere": 3
+                },
+                "n": 2,
+                "text": "Raft can accept, replicate, and apply new log entries as long as a majority of the servers are up"
+              },
+              {
+                "found": {
+                  "elsewhere": 2
+                },
+                "n": 3,
+                "text": "A candidate that receives votes from a majority of the full cluster becomes the new leader."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Кластер из 5 узлов типичен и переживает отказ двух узлов; для кворума нужно большинство серверов — новые записи принимаются и применяются, пока большинство серверов работают, а лидером становится кандидат, получивший голоса большинства всего кластера [1][2][3].\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0029\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0045\"},{\"n\":3,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0026\"}],\"quotes\":[{\"n\":1,\"text\":\"A Raft cluster contains several servers; five is a typical number, which allows the system to tolerate two failures.\"},{\"n\":2,\"text\":\"Raft can accept, replicate, and apply new log entries as long as a majority of the servers are up\"},{\"n\":3,\"text\":\"A candidate that receives votes from a majority of the full cluster becomes the new leader.\"}]}",
+            "retried": [
+              "numbers 3 of the answer are in none of the quotes — quote where they come from or drop them",
+              "судья: не в цитатах — для кворума нужно более половины от 5 узлов (число 3 не указано явно в цитатах, хотя следует из 'majority')"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0029",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 5",
+                "relevance": "llm 8",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0045",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 3,
+                "pages": "стр. 8",
+                "relevance": "llm 6",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0026",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 5",
+                "relevance": "llm 6",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#15 cos 0.9925 z 2.80 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 5 · 998 симв.",
+            "#11 cos 0.9927 z 2.86 llm 6 (rewrite) · raft-consensus.pdf — Front matter, стр. 5 · 999 симв.",
+            "#20 cos 0.9921 z 2.67 llm 6 (rewrite) · raft-consensus.pdf — Front matter, стр. 8 · 1000 симв.",
+            "#17 cos 0.9924 z 2.76 llm 5 (rewrite) · raft-consensus.pdf — Front matter, стр. 15–16 · 993 симв."
+          ],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 2,
+          "numbers_ok": true,
+          "q": "Ограничение фиксируем: кластер ровно из 5 узлов. Сколько узлов нужно для кворума и почему?",
+          "quotes_ok": true,
+          "sources": 3,
+          "sources_ok": 3,
+          "state_checks": 1,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6300
+        },
+        {
+          "card": {
+            "answer": "Выборы запускает последователь: если фолловер долго не получает связи от лидера (election timeout), он переходит в состояние кандидата, голосует за себя и параллельно рассылает RequestVote RPC другим серверам [1]. Таймауты выбираются случайно из фиксированного интервала (например, 150–300 мс), поэтому обычно успевает только один сервер: он выигрывает выборы и рассылает сердцебиения раньше остальных [4]. [1][4]",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 2,
+              "quotes": 4,
+              "quotes_ok": 4,
+              "sources": 2,
+              "sources_ok": 2,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1274,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 34407,
+            "nearest": [],
+            "prompt_tokens": 8977,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "If a follower receives no communication over a period of time called the election timeout, then it assumes there is no viable leader and begins an election to choose a new leader."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "To begin an election, a follower increments its current term and transitions to candidate state. It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers"
+              },
+              {
+                "found": "verbatim",
+                "n": 4,
+                "text": "election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms)."
+              },
+              {
+                "found": "verbatim",
+                "n": 4,
+                "text": "it wins the election and sends heartbeats before any other servers time out"
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Выборы запускает последователь: если фолловер долго не получает связи от лидера (election timeout), он переходит в состояние кандидата, голосует за себя и параллельно рассылает RequestVote RPC другим серверам [1]. Таймауты выбираются случайно из фиксированного интервала (например, 150–300 мс), поэтому обычно успевает только один сервер: он выигрывает выборы и рассылает сердцебиения раньше остальных [4]. [1][4]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0031\"},{\"n\":4,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0034\"}],\"quotes\":[{\"n\":1,\"text\":\"If a follower receives no communication over a period of time called the election timeout, then it assumes there is no viable leader and begins an election to choose a new leader.\"},{\"n\":1,\"text\":\"To begin an election, a follower increments its current term and transitions to candidate state. It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers\"},{\"n\":4,\"text\":\"election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms).\"},{\"n\":4,\"text\":\"it wins the election and sends heartbeats before any other servers time out\"}]}",
+            "retried": [
+              "numbers 150, 300 of the answer are in none of the quotes — quote where they come from or drop them",
+              "судья: не в цитатах — Кандидат побеждает, получив голоса большинства (в цитатах нет условия победы большинством); Кандидат сразу рассылает сердцебиения остальным (в цитатах не указано); Расщепление голосов становится редким и быстро разрешается благодаря рандомизированным таймаутам (в цитатах только сам факт рандомизации)"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0031",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 5–6",
+                "relevance": "llm 10",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0034",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 4,
+                "pages": "стр. 6",
+                "relevance": "llm 7",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#3 cos 0.9955 z 3.66 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 5–6 · 999 симв.",
+            "#8 cos 0.9945 z 3.36 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 6 · 998 симв.",
+            "#10 cos 0.9944 z 3.32 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 5 · 998 симв.",
+            "#13 cos 0.9941 z 3.23 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 6 · 998 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 3,
+          "numbers_ok": true,
+          "q": "Как выбирается лидер? Кто начинает выборы и как побеждает?",
+          "quotes_ok": true,
+          "sources": 2,
+          "sources_ok": 2,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6501
+        },
+        {
+          "card": {
+            "answer": "Таймауты выборов выбираются случайно из фиксированного интервала; рекомендован консервативный диапазон 150–300 мс [1][3]. Требования к таймингам: broadcast time должен быть на порядок меньше election timeout (чтобы сердцебиения успевали предотвращать выборы и split votes были редки), а election timeout — на порядки меньше MTBF; при типичном broadcast time 0,5–20 мс таймаут получается 10–500 мс [2].",
+            "attempts": 2,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 6,
+              "quotes": 4,
+              "quotes_ok": 4,
+              "sources": 3,
+              "sources_ok": 3,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 920,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 23036,
+            "nearest": [],
+            "prompt_tokens": 6755,
+            "quotes": [
+              {
+                "found": {
+                  "elsewhere": 2
+                },
+                "n": 1,
+                "text": "To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms)."
+              },
+              {
+                "found": {
+                  "elsewhere": 1
+                },
+                "n": 2,
+                "text": "The election timeout should be a few orders of magnitude less than MTBF so that the system makes steady progress."
+              },
+              {
+                "found": {
+                  "elsewhere": 1
+                },
+                "n": 2,
+                "text": "the broadcast time may range from 0.5ms to 20ms, depending on storage technology. As a result, the election timeout is likely to be somewhere between 10ms and 500ms."
+              },
+              {
+                "found": "verbatim",
+                "n": 3,
+                "text": "We recommend using a conservative election timeout such as 150–300ms; such timeouts are unlikely to cause unnecessary leader changes and will still provide good availability."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Таймауты выборов выбираются случайно из фиксированного интервала; рекомендован консервативный диапазон 150–300 мс [1][3]. Требования к таймингам: broadcast time должен быть на порядок меньше election timeout (чтобы сердцебиения успевали предотвращать выборы и split votes были редки), а election timeout — на порядки меньше MTBF; при типичном broadcast time 0,5–20 мс таймаут получается 10–500 мс [2].\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0034\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0063\"},{\"n\":3,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0092\"}],\"quotes\":[{\"n\":1,\"text\":\"To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms).\"},{\"n\":2,\"text\":\"The election timeout should be a few orders of magnitude less than MTBF so that the system makes steady progress.\"},{\"n\":2,\"text\":\"the broadcast time may range from 0.5ms to 20ms, depending on storage technology. As a result, the election timeout is likely to be somewhere between 10ms and 500ms.\"},{\"n\":3,\"text\":\"We recommend using a conservative election timeout such as 150–300ms; such timeouts are unlikely to cause unnecessary leader changes and will still provide good availability.\"}]}",
+            "retried": [
+              "судья: не в цитатах — требование, чтобы election timeout был на порядки меньше MTBF"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0034",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 6",
+                "relevance": "llm 9",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0063",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 10–11",
+                "relevance": "llm 10",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0092",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 3,
+                "pages": "стр. 15",
+                "relevance": "llm 9",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "требование, что broadcast time должен быть на порядок меньше election timeout (чтобы сердцебиения успевали предотвращать выборы и split votes были редки), — этого утверждения нет в цитатах"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#12 cos 0.9929 z 3.11 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 10–11 · 1000 симв.",
+            "#1 cos 0.9947 z 3.62 llm 9 (rewrite) · raft-consensus.pdf — Front matter, стр. 6 · 998 симв.",
+            "#15 cos 0.9928 z 3.08 llm 9 (rewrite) · raft-consensus.pdf — Front matter, стр. 15 · 996 симв.",
+            "#6 cos 0.9936 z 3.31 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 5–6 · 999 симв."
+          ],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 4,
+          "numbers_ok": true,
+          "q": "А таймауты?",
+          "quotes_ok": true,
+          "sources": 3,
+          "sources_ok": 3,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6674
+        },
+        {
+          "card": {
+            "answer": "Рандомизация таймаутов выборов нужна, чтобы split votes (разделение голосов) были редкими и быстро разрешались: таймауты выбираются случайно из фиксированного интервала (например, 150–300 мс), из-за чего обычно только один сервер успевает тайм-аут, выигрывает выборы и рассылает сердцебиения раньше остальных. Кроме того, каждый кандидат перезапускает свой случайный таймаут перед новой попыткой, что снижает вероятность повторного split vote. [1]",
+            "attempts": 1,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 2,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 316,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 12082,
+            "nearest": [],
+            "prompt_tokens": 3590,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Raft uses randomized election timeouts to ensure that split votes are rare and that they are resolved quickly."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms). This spreads out the servers so that in most cases only a single server will time out; it wins the election and sends heartbeats before any other servers time out."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Each candidate restarts its randomized election timeout at the start of an election, and it waits for that timeout to elapse before starting the next election; this reduces the likelihood of another split vote in the new election."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Рандомизация таймаутов выборов нужна, чтобы split votes (разделение голосов) были редкими и быстро разрешались: таймауты выбираются случайно из фиксированного интервала (например, 150–300 мс), из-за чего обычно только один сервер успевает тайм-аут, выигрывает выборы и рассылает сердцебиения раньше остальных. Кроме того, каждый кандидат перезапускает свой случайный таймаут перед новой попыткой, что снижает вероятность повторного split vote. [1]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0034\"}],\"quotes\":[{\"n\":1,\"text\":\"Raft uses randomized election timeouts to ensure that split votes are rare and that they are resolved quickly.\"},{\"n\":1,\"text\":\"election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms). This spreads out the servers so that in most cases only a single server will time out; it wins the election and sends heartbeats before any other servers time out.\"},{\"n\":1,\"text\":\"Each candidate restarts its randomized election timeout at the start of an election, and it waits for that timeout to elapse before starting the next election; this reduces the likelihood of another split vote in the new election.\"}]}",
+            "retried": [],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0034",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 6",
+                "relevance": "llm 10",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#1 cos 0.9961 z 4.15 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 6 · 998 симв.",
+            "#8 cos 0.9925 z 3.12 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 6 · 998 симв.",
+            "#2 cos 0.9935 z 3.42 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 10–11 · 1000 симв.",
+            "#12 cos 0.9917 z 2.90 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 15 · 994 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 5,
+          "numbers_ok": true,
+          "q": "Зачем таймауты выборов рандомизированы?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6872
+        },
+        {
+          "card": {
+            "answer": "Лидер считает запись committed, когда реплицировал её на большинство серверов; committed-записи гарантированно durable и будут выполнены всеми доступными state machines. При этом все предыдущие записи в логе лидера также считаются committed, лидер хранит высший известный committed-индекс и передаёт его в AppendEntries RPC (включая heartbeats), а фолловер, узнав о committed-записи, применяет её к своей state machine в порядке лога. [1]",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1221,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 31139,
+            "nearest": [],
+            "prompt_tokens": 12562,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "A log entry is committed once the leader that created the entry has replicated it on a majority of the servers"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "This also commits all preceding entries in the leader’s log"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Once a follower learns that a log entry is committed, it applies the entry to its local state machine (in log order)."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Лидер считает запись committed, когда реплицировал её на большинство серверов; committed-записи гарантированно durable и будут выполнены всеми доступными state machines. При этом все предыдущие записи в логе лидера также считаются committed, лидер хранит высший известный committed-индекс и передаёт его в AppendEntries RPC (включая heartbeats), а фолловер, узнав о committed-записи, применяет её к своей state machine в порядке лога. [1]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0038\"}],\"quotes\":[{\"n\":1,\"text\":\"A log entry is committed once the leader that created the entry has replicated it on a majority of the servers\"},{\"n\":1,\"text\":\"This also commits all preceding entries in the leader’s log\"},{\"n\":1,\"text\":\"Once a follower learns that a log entry is committed, it applies the entry to its local state machine (in log order).\"}]}",
+            "retried": [
+              "numbers 5 of the answer are in none of the quotes — quote where they come from or drop them",
+              "судья: не в цитатах — «Кворум — это большинство узлов кластера» — не подтверждено цитатами; «Лидер считает запись committed, когда реплицировал её на большинство серверов» — цитата [2] обрывается, репликация на большинство не показана; «Все предыдущие записи в логе лидера при этом также считаются committed» — отсутствует в цитатах; «Фолловеры применяют записи к своей state machine в порядке лога» — отсутствует в цитатах"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0038",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 7",
+                "relevance": "llm 10",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "committed-записи гарантированно durable и будут выполнены всеми доступными state machines",
+                "лидер хранит высший известный committed-индекс и передаёт его в AppendEntries RPC (включая heartbeats)"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#3 cos 0.9957 z 3.21 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 7 · 994 симв.",
+            "#17 cos 0.9943 z 2.80 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 6–7 · 997 симв.",
+            "#2 cos 0.9957 z 3.21 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 9 · 1000 симв.",
+            "#4 cos 0.9953 z 3.11 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 8 · 1000 симв."
+          ],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 6,
+          "numbers_ok": true,
+          "q": "Согласуем термин: для нас «quorum = 3». Как лидер надёжно фиксирует запись в логе?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 1,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 7031
+        },
+        {
+          "card": {
+            "answer": "Чтения можно обрабатывать без записи в лог, но без дополнительных мер есть риск возврата устаревших данных, если лидера уже сместил более новый лидер. Для линеаризуемых чтений нужны две меры: лидер должен знать актуальный commit-статус — для этого он в начале срока коммитит пустую no-op запись; и перед ответом на read-only запрос лидер обязан убедиться, что его не сместили, обменявшись heartbeat-сообщениями с большинством кластера. Альтернатива — lease через heartbeat, но она опирается на тайминги и допускает ограниченный skew часов. [1][2]",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 2,
+              "sources_ok": 2,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1282,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 31949,
+            "nearest": [],
+            "prompt_tokens": 13337,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 2,
+                "text": "Read-only operations can be handled without writing anything into the log. However, with no additional measures, this would run the risk of returning stale data, since the leader responding to the request might have been superseded by a newer leader of which it is unaware."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "a leader must check whether it has been deposed before processing a read-only request"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Raft handles this by having the leader exchange heartbeat messages with a majority of the cluster before responding to read-only requests. Alternatively, the leader could rely on the heartbeat mechanism to provide a form of lease [9], but this would rely on timing for safety (it assumes bounded clock skew)."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Чтения можно обрабатывать без записи в лог, но без дополнительных мер есть риск возврата устаревших данных, если лидера уже сместил более новый лидер. Для линеаризуемых чтений нужны две меры: лидер должен знать актуальный commit-статус — для этого он в начале срока коммитит пустую no-op запись; и перед ответом на read-only запрос лидер обязан убедиться, что его не сместили, обменявшись heartbeat-сообщениями с большинством кластера. Альтернатива — lease через heartbeat, но она опирается на тайминги и допускает ограниченный skew часов. [1][2]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0081\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0080\"}],\"quotes\":[{\"n\":2,\"text\":\"Read-only operations can be handled without writing anything into the log. However, with no additional measures, this would run the risk of returning stale data, since the leader responding to the request might have been superseded by a newer leader of which it is unaware.\"},{\"n\":1,\"text\":\"a leader must check whether it has been deposed before processing a read-only request\"},{\"n\":1,\"text\":\"Raft handles this by having the leader exchange heartbeat messages with a majority of the cluster before responding to read-only requests. Alternatively, the leader could rely on the heartbeat mechanism to provide a form of lease [9], but this would rely on timing for safety (it assumes bounded clock skew).\"}]}",
+            "retried": [
+              "numbers 3 of the answer are in none of the quotes — quote where they come from or drop them",
+              "судья: не в цитатах — перед ответом на read-only запрос лидер обязан убедиться, что его не сместили, обменявшись heartbeat-сообщениями с большинством кластера; альтернатива — lease через heartbeat, опирающаяся на тайминги и допускающая ограниченный skew часов"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0081",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 13",
+                "relevance": "llm 9",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0080",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 13",
+                "relevance": "llm 8",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "лидер в начале срока коммитит пустую no-op запись, чтобы знать актуальный commit-статус"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#10 cos 0.9887 z 2.65 llm 9 (rewrite) · raft-consensus.pdf — Front matter, стр. 13 · 996 симв.",
+            "#7 cos 0.9890 z 2.76 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 13 · 998 симв.",
+            "#2 cos 0.9893 z 2.90 llm 5 · raft-consensus.pdf — Front matter, стр. 8 · 995 симв."
+          ],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 7,
+          "numbers_ok": true,
+          "q": "Ещё требование: чтения должны быть строго актуальными, никаких устаревших значений. Что это меняет для нас по статье?",
+          "quotes_ok": true,
+          "sources": 2,
+          "sources_ok": 2,
+          "state_checks": 1,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 5536
+        },
+        {
+          "card": {
+            "answer": "Прямое переключение всех серверов со старой конфигурации на новую небезопасно — кластер может расколоться на два независимых большинства, поэтому изменения должны быть двухфазными. Raft использует joint consensus: сначала кластер переходит в переходную конфигурацию, объединяющую старую и новую, а после её коммита — в новую конфигурацию. Записи лога реплицируются на все серверы обеих конфигураций, а согласие требует отдельных большинства от старой и новой конфигураций. Это позволяет кластеру продолжать нормально работать во время изменения конфигурации. [4][2][1]",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 3,
+              "sources_ok": 3,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1124,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 29798,
+            "nearest": [],
+            "prompt_tokens": 15238,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 4,
+                "text": "any approach where servers switch directly from the old configuration to the new configuration is unsafe."
+              },
+              {
+                "found": "verbatim",
+                "n": 2,
+                "text": "In Raft the cluster first switches to a transitional configuration we call joint consensus; once the joint consensus has been committed, the system then transitions to the new configuration."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Agreement (for elections and entry commitment) requires separate majorities from both the old and new configurations."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Прямое переключение всех серверов со старой конфигурации на новую небезопасно — кластер может расколоться на два независимых большинства, поэтому изменения должны быть двухфазными. Raft использует joint consensus: сначала кластер переходит в переходную конфигурацию, объединяющую старую и новую, а после её коммита — в новую конфигурацию. Записи лога реплицируются на все серверы обеих конфигураций, а согласие требует отдельных большинства от старой и новой конфигураций. Это позволяет кластеру продолжать нормально работать во время изменения конфигурации. [4][2][1]\",\"sources\":[{\"n\":4,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0061\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0062\"},{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0067\"}],\"quotes\":[{\"n\":4,\"text\":\"any approach where servers switch directly from the old configuration to the new configuration is unsafe.\"},{\"n\":2,\"text\":\"In Raft the cluster first switches to a transitional configuration we call joint consensus; once the joint consensus has been committed, the system then transitions to the new configuration.\"},{\"n\":1,\"text\":\"Agreement (for elections and entry commitment) requires separate majorities from both the old and new configurations.\"}]}",
+            "retried": [
+              "\"quotes\" is empty: give 1–3 verbatim fragments",
+              "судья: не в цитатах — Записи лога реплицируются на все серверы обеих конфигураций; согласие требует отдельных большинства от старой и новой конфигураций"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0061",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 4,
+                "pages": "стр. 10",
+                "relevance": "llm 7",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0062",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 10",
+                "relevance": "llm 7",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0067",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 11",
+                "relevance": "llm 8",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "Записи лога реплицируются на все серверы обеих конфигураций"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#20 cos 0.9927 z 2.65 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 11 · 991 симв.",
+            "#1 cos 0.9952 z 3.38 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 10 · 997 симв.",
+            "#3 cos 0.9951 z 3.37 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 1 · 1000 симв.",
+            "#10 cos 0.9934 z 2.87 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 10 · 992 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 8,
+          "numbers_ok": true,
+          "q": "Состав кластера менять придётся, но без даунтайма. Как Raft меняет конфигурацию?",
+          "quotes_ok": true,
+          "sources": 3,
+          "sources_ok": 3,
+          "state_checks": 1,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 7255
+        },
+        {
+          "card": {
+            "answer": "Нет, сразу участвовать в кворуме он не может. Чтобы избежать провалов в доступности, Raft вводит дополнительную фазу: новый сервер присоединяется как non-voting member — лидер реплицирует ему записи лога, но при расчёте большинства он не учитывается. Только после того, как новый сервер догонит остальной кластер, изменение конфигурации продолжается как обычно. При старте любой сервер, кстати, начинает как фолловер. [1][2]",
+            "attempts": 1,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 2,
+              "sources_ok": 2,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 352,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 10138,
+            "nearest": [],
+            "prompt_tokens": 4747,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Raft introduces an additional phase before the configuration change, in which the new servers join the cluster as non-voting members (the leader replicates log entries to them, but they are not considered for majorities)."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Once the new servers have caught up with the rest of the cluster, the reconfiguration can proceed as described above."
+              },
+              {
+                "found": "verbatim",
+                "n": 2,
+                "text": "When servers start up, they begin as followers."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Нет, сразу участвовать в кворуме он не может. Чтобы избежать провалов в доступности, Raft вводит дополнительную фазу: новый сервер присоединяется как non-voting member — лидер реплицирует ему записи лога, но при расчёте большинства он не учитывается. Только после того, как новый сервер догонит остальной кластер, изменение конфигурации продолжается как обычно. При старте любой сервер, кстати, начинает как фолловер. [1][2]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0064\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0031\"}],\"quotes\":[{\"n\":1,\"text\":\"Raft introduces an additional phase before the configuration change, in which the new servers join the cluster as non-voting members (the leader replicates log entries to them, but they are not considered for majorities).\"},{\"n\":1,\"text\":\"Once the new servers have caught up with the rest of the cluster, the reconfiguration can proceed as described above.\"},{\"n\":2,\"text\":\"When servers start up, they begin as followers.\"}]}",
+            "retried": [],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0064",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 10–11",
+                "relevance": "llm 8",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0031",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 5–6",
+                "relevance": "llm 7",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#18 cos 0.9912 z 2.77 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 10–11 · 993 симв.",
+            "#5 cos 0.9924 z 3.07 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 5–6 · 999 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 9,
+          "numbers_ok": true,
+          "q": "А новый узел, который только поднялся, — он сразу голосует?",
+          "quotes_ok": true,
+          "sources": 2,
+          "sources_ok": 2,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 7411
+        },
+        {
+          "card": {
+            "answer": "Если фолловер отстал настолько, что лидер уже отбросил нужные ему записи лога, лидер отправляет ему снапшот по сети через новый RPC InstallSnapshot: он передаёт состояние на момент last included index вместо всех записей [1]. Это нетипично для нормальной работы — отставший фолловер обычно успевает получить записи через AppendEntries — но касается исключительно медленных фолловеров и новых серверов [1].",
+            "attempts": 1,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 260,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 12084,
+            "nearest": [],
+            "prompt_tokens": 5269,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "The leader uses a new RPC called InstallSnapshot to send snapshots to followers that are too far behind"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "This happens when the leader has already discarded the next log entry that it needs to send to a follower."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "an exceptionally slow follower or a new server joining the cluster (Section 6) would not."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Если фолловер отстал настолько, что лидер уже отбросил нужные ему записи лога, лидер отправляет ему снапшот по сети через новый RPC InstallSnapshot: он передаёт состояние на момент last included index вместо всех записей [1]. Это нетипично для нормальной работы — отставший фолловер обычно успевает получить записи через AppendEntries — но касается исключительно медленных фолловеров и новых серверов [1].\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0075\"}],\"quotes\":[{\"n\":1,\"text\":\"The leader uses a new RPC called InstallSnapshot to send snapshots to followers that are too far behind\"},{\"n\":1,\"text\":\"This happens when the leader has already discarded the next log entry that it needs to send to a follower.\"},{\"n\":1,\"text\":\"an exceptionally slow follower or a new server joining the cluster (Section 6) would not.\"}]}",
+            "retried": [],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0075",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 12",
+                "relevance": "llm 10",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#11 cos 0.9917 z 2.79 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 12 · 992 симв.",
+            "#9 cos 0.9918 z 2.80 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 7 · 998 симв.",
+            "#7 cos 0.9920 z 2.86 llm 6 (rewrite) · raft-consensus.pdf — Front matter, стр. 8 · 1000 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 10,
+          "numbers_ok": true,
+          "q": "Если узел отстал на очень много записей, как его наверстать?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 7314
+        },
+        {
+          "card": {
+            "answer": "В кластере 5 узлов — типичное число, которое допускает отказ двух серверов [1]. Кворум — большинство узлов кластера (как мы зафиксировали: 3 из 5). [1]",
+            "attempts": 2,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 2,
+              "quotes": 1,
+              "quotes_ok": 1,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": [
+                "5",
+                "3"
+              ]
+            },
+            "clarify": null,
+            "completion_tokens": 330,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 12381,
+            "nearest": [],
+            "prompt_tokens": 10340,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "A Raft cluster contains several servers; five is a typical number, which allows the system to tolerate two failures."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"В кластере 5 узлов — типичное число, которое допускает отказ двух серверов [1]. Кворум — большинство узлов кластера (как мы зафиксировали: 3 из 5). [1]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0029\"}],\"quotes\":[{\"n\":1,\"text\":\"A Raft cluster contains several servers; five is a typical number, which allows the system to tolerate two failures.\"}]}",
+            "retried": [
+              "numbers 5, 3 of the answer are in none of the quotes — quote where they come from or drop them"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0029",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 5",
+                "relevance": "llm 10",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "Кворум зафиксирован как 3 из 5 — это не указано в цитатах"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#1 cos 0.9920 z 3.62 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 5 · 998 симв.",
+            "#12 cos 0.9902 z 3.05 llm 5 (rewrite) · raft-consensus.pdf — Front matter, стр. 15–16 · 993 симв."
+          ],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 11,
+          "numbers_ok": false,
+          "q": "Напомни, сколько у нас узлов в кластере и какой кворум?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 7158
+        },
+        {
+          "card": {
+            "answer": "",
+            "attempts": 0,
+            "by": "gate",
+            "check": null,
+            "clarify": "о каком документе или системе вопрос «Что статья о Raft говорит про шардирование PostgreSQL?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+            "completion_tokens": 0,
+            "finish_reason": null,
+            "from_memory": false,
+            "ms": 0,
+            "nearest": [
+              "raft-consensus.pdf — Front matter, стр. 3 (llm 0)",
+              "raft-consensus.pdf — Front matter, стр. 1 (llm 0)",
+              "raft-consensus.pdf — Front matter, стр. 15 (llm 0)"
+            ],
+            "prompt_tokens": 0,
+            "quotes": [],
+            "raw": "",
+            "retried": [],
+            "sources": [],
+            "status": "unknown",
+            "support": null,
+            "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — llm 0)"
+          },
+          "context": [],
+          "covered": 0,
+          "error": null,
+          "expect": "unknown",
+          "judge": "—",
+          "made_up": [],
+          "mem_error": null,
+          "must": 0,
+          "n": 12,
+          "numbers_ok": false,
+          "q": "Что статья о Raft говорит про шардирование PostgreSQL?",
+          "quotes_ok": false,
+          "sources": 0,
+          "sources_ok": 0,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "unknown",
+          "tokens": 5757
+        },
+        {
+          "card": {
+            "answer": "Переходная конфигурация при смене состава кластера называется joint consensus [1]. [1]",
+            "attempts": 1,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 1,
+              "quotes_ok": 1,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 124,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 5835,
+            "nearest": [],
+            "prompt_tokens": 5948,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "In Raft the cluster first switches to a transitional configuration we call joint consensus; once the joint consensus has been committed, the system then transitions to the new configuration."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Переходная конфигурация при смене состава кластера называется joint consensus [1]. [1]\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0062\"}],\"quotes\":[{\"n\":1,\"text\":\"In Raft the cluster first switches to a transitional configuration we call joint consensus; once the joint consensus has been committed, the system then transitions to the new configuration.\"}]}",
+            "retried": [],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0062",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 10",
+                "relevance": "llm 10",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#1 cos 0.9927 z 4.03 llm 10 (rewrite) · raft-consensus.pdf — Front matter, стр. 10 · 997 симв.",
+            "#4 cos 0.9917 z 3.75 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 11 · 991 симв.",
+            "#6 cos 0.9905 z 3.38 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 1 · 1000 симв.",
+            "#14 cos 0.9885 z 2.81 llm 8 (rewrite) · raft-consensus.pdf — Front matter, стр. 11 · 991 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 13,
+          "numbers_ok": true,
+          "q": "Как называется переходная конфигурация при смене состава кластера?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 7101
+        },
+        {
+          "card": {
+            "answer": "Цель проекта: спроектировать внутренний распределённый сервис конфигураций на основе Raft, устойчивый к отказам узлов.\n\nЗафиксированные ограничения:\n- Кластер из 5 узлов, кворум = 3.\n- Строго актуальные (линеаризуемые) чтения.\n- Смена состава кластера без даунтайма.\n\nСогласованные термины:\n- Raft — алгоритм консенсуса для реплицируемого лога: выборы лидера, репликация лога, безопасность.\n- Кворум — большинство узлов кластера; в этом диалоге зафиксировано quorum = 3.\n- Election timeout — случайный таймаут: фолловер без связи с лидером становится кандидатом.\n- RequestVote RPC — запрос голоса, который кандидат рассылает другим серверам на выборах [4].\n- Broadcast time — время рассылки RPC, должно быть на порядок меньше election timeout [2].\n- MTBF — среднее время между отказами; election timeout должен быть на порядки меньше MTBF [2].\n- Split vote — разделение голосов; разрешается благодаря рандомизации таймаутов выборов.\n- Committed запись — реплицирована на большинство; durable и будет применена всеми state machines.\n- Commit index — высший известный committed-индекс; передаётся в AppendEntries, фолловеры применяют записи по порядку.\n- Joint consensus — двухфазное изменение конфигурации: переходная конфигурация (старая+новая, отдельные большинства), затем новая; без даунтайма [1][3].",
+            "attempts": 2,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 2,
+              "quotes": 4,
+              "quotes_ok": 4,
+              "sources": 4,
+              "sources_ok": 4,
+              "unbacked": [
+                "5",
+                "3"
+              ]
+            },
+            "clarify": null,
+            "completion_tokens": 1787,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 42495,
+            "nearest": [],
+            "prompt_tokens": 13144,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "first switches to a transitional configuration we call joint consensus; once the joint consensus has been committed, the system then transitions to the new configuration."
+              },
+              {
+                "found": {
+                  "elsewhere": 1
+                },
+                "n": 2,
+                "text": "The broadcast time should be an order of magnitude less than the election timeout so that leaders can reliably send the heartbeat messages"
+              },
+              {
+                "found": "verbatim",
+                "n": 3,
+                "text": "Raft’s mechanism for changing the set of servers in the cluster uses a new joint consensus approach where the majorities of two different configurations overlap during transitions."
+              },
+              {
+                "found": "verbatim",
+                "n": 4,
+                "text": "RequestVote RPCs are initiated by candidates during elections"
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Цель проекта: спроектировать внутренний распределённый сервис конфигураций на основе Raft, устойчивый к отказам узлов.\\n\\nЗафиксированные ограничения:\\n- Кластер из 5 узлов, кворум = 3.\\n- Строго актуальные (линеаризуемые) чтения.\\n- Смена состава кластера без даунтайма.\\n\\nСогласованные термины:\\n- Raft — алгоритм консенсуса для реплицируемого лога: выборы лидера, репликация лога, безопасность.\\n- Кворум — большинство узлов кластера; в этом диалоге зафиксировано quorum = 3.\\n- Election timeout — случайный таймаут: фолловер без связи с лидером становится кандидатом.\\n- RequestVote RPC — запрос голоса, который кандидат рассылает другим серверам на выборах [4].\\n- Broadcast time — время рассылки RPC, должно быть на порядок меньше election timeout [2].\\n- MTBF — среднее время между отказами; election timeout должен быть на порядки меньше MTBF [2].\\n- Split vote — разделение голосов; разрешается благодаря рандомизации таймаутов выборов.\\n- Committed запись — реплицирована на большинство; durable и будет применена всеми state machines.\\n- Commit index — высший известный committed-индекс; передаётся в AppendEntries, фолловеры применяют записи по порядку.\\n- Joint consensus — двухфазное изменение конфигурации: переходная конфигурация (старая+новая, отдельные большинства), затем новая; без даунтайма [1][3].\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0062\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0060\"},{\"n\":3,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0001\"},{\"n\":4,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0029\"}],\"quotes\":[{\"n\":1,\"text\":\"first switches to a transitional configuration we call joint consensus; once the joint consensus has been committed, the system then transitions to the new configuration.\"},{\"n\":2,\"text\":\"The broadcast time should be an order of magnitude less than the election timeout so that leaders can reliably send the heartbeat messages\"},{\"n\":3,\"text\":\"Raft’s mechanism for changing the set of servers in the cluster uses a new joint consensus approach where the majorities of two different configurations overlap during transitions.\"},{\"n\":4,\"text\":\"RequestVote RPCs are initiated by candidates during elections\"}]}",
+            "retried": [
+              "numbers 5, 3, 150, 300, 05, 20 of the answer are in none of the quotes — quote where they come from or drop them"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-raft-consensus-0062",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 10",
+                "relevance": "llm 7",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0060",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 10",
+                "relevance": "llm 7",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0001",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 3,
+                "pages": "стр. 1",
+                "relevance": "llm 6",
+                "section": "Front matter"
+              },
+              {
+                "chunk_id": "fixed-raft-consensus-0029",
+                "file": "raft-consensus.pdf",
+                "id_ok": true,
+                "n": 4,
+                "pages": "стр. 5",
+                "relevance": "llm 6",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "Цель проекта: спроектировать внутренний распределённый сервис конфигураций на основе Raft, устойчивый к отказам узлов",
+                "Кластер из 5 узлов, кворум = 3",
+                "Строго актуальные (линеаризуемые) чтения",
+                "Смена состава кластера без даунтайма",
+                "Raft — алгоритм консенсуса для реплицируемого лога: выборы лидера, репликация лога, безопасность",
+                "Кворум — большинство узлов кластера",
+                "Election timeout — случайный таймаут: фолловер без связи с лидером становится кандидатом",
+                "Broadcast time — время рассылки RPC",
+                "MTBF — среднее время между отказами; election timeout должен быть на порядки меньше MTBF",
+                "Split vote — разделение голосов; разрешается благодаря рандомизации таймаутов выборов",
+                "Committed запись — реплицирована на большинство; durable и будет применена всеми state machines",
+                "Commit index — высший известный committed-индекс; передаётся в AppendEntries, фолловеры применяют записи по порядку",
+                "Joint consensus — переходная конфигурация с отдельными большинствами и без даунтайма"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#2 cos 0.9924 z 3.09 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 10 · 997 симв.",
+            "#4 cos 0.9919 z 2.93 llm 7 (rewrite) · raft-consensus.pdf — Front matter, стр. 10 · 1000 симв.",
+            "#8 cos 0.9916 z 2.83 llm 6 (rewrite) · raft-consensus.pdf — Front matter, стр. 1 · 1000 симв.",
+            "#9 cos 0.9877 z 2.74 llm 6 · raft-consensus.pdf — Front matter, стр. 5 · 998 симв."
+          ],
+          "covered": 4,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 4,
+          "n": 14,
+          "numbers_ok": false,
+          "q": "Собери итог списком: цель проекта и все зафиксированные ограничения и термины.",
+          "quotes_ok": true,
+          "sources": 4,
+          "sources_ok": 4,
+          "state_checks": 4,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6353
+        }
+      ]
+    },
+    {
+      "goal": "собрать по обзору RAG production-чат, отвечающий по документации компании с обязательными источниками: 10k чанков, обязательный реранкер",
+      "goal_covered": 2,
+      "goal_must": 2,
+      "goal_text": "Собрать production-чат, отвечающий по внутренней документации компании, используя RAG, и понять парадигмы RAG из обзора.",
+      "id": 2,
+      "mem": {
+        "clarified": [
+          "Чат работает по внутренней документации компании",
+          "Цель — production-внедрение",
+          "RAG сравнивается с fine-tuning: RAG лучше для точного извлечения и свежих знаний",
+          "Оптимизацию индексации берём из обзора (иерархия, метаданные, время)",
+          "Интересуют эмбеддинг-модели, рассматриваемые обзором",
+          "Реранкер в пайплайне — обязательное решение",
+          "Интересует улучшение запроса до поиска (pre-retrieval)",
+          "Качество чата оценивается метриками retrieval и generation"
+        ],
+        "constraints": [
+          "Каждый ответ должен содержать источники",
+          "Реранкер обязателен в пайплайне"
+        ],
+        "goal": "Собрать production-чат, отвечающий по внутренней документации компании, используя RAG, и понять парадигмы RAG из обзора.",
+        "terms": [
+          {
+            "meaning": "Базовая парадигма RAG, имеет ограничения",
+            "term": "Naive RAG"
+          },
+          {
+            "meaning": "Парадигма, развившаяся как ответ на ограничения Naive RAG",
+            "term": "Advanced RAG"
+          },
+          {
+            "meaning": "Парадигма с модульной архитектурой, эволюция Advanced RAG",
+            "term": "Modular RAG"
+          },
+          {
+            "meaning": "Этап RAG-пайплайна: чанкинг документов, векторизация, сохранение в векторную БД",
+            "term": "Indexing"
+          },
+          {
+            "meaning": "Этап извлечения Top-k чанков, релевантных вопросу по семантической близости",
+            "term": "Retrieval"
+          },
+          {
+            "meaning": "Этап передачи вопроса и извлечённых чанков в LLM для финального ответа",
+            "term": "Generation"
+          },
+          {
+            "meaning": "Дообучение модели: нужно для кастомизации поведения и стиля, не взаимно исключает RAG",
+            "term": "Fine-tuning"
+          },
+          {
+            "meaning": "Иерархическая структура индекса: мелкие чанки для поиска, крупные — для контекста",
+            "term": "Родитель-потомок чанкинг"
+          },
+          {
+            "meaning": "Метаданные индекса: краткие содержания абзацев и гипотетические вопросы для улучшения поиска",
+            "term": "Reverse HyDE"
+          },
+          {
+            "meaning": "Две цели оценки качества RAG: retrieval — Hit Rate, MRR, NDCG; generation — faithfulness, relevance, non-harmfulness, EM/F1, Accuracy, BLEU/ROUGE",
+            "term": "Retrieval/Generation Quality"
+          }
+        ]
+      },
+      "title": "Production-чат по документации компании (rag-survey-2312.10997.pdf)",
+      "turns": [
+        {
+          "card": {
+            "answer": "Обзор выделяет три парадигмы RAG: Naive RAG, Advanced RAG и Modular RAG [1][4]. Развитие Advanced RAG и Modular RAG стало ответом на ограничения Naive RAG [1].",
+            "attempts": 1,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 2,
+              "sources_ok": 2,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 304,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 9013,
+            "nearest": [],
+            "prompt_tokens": 1657,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "we categorize it into three stages: Naive RAG, Advanced\nRAG, and Modular RAG"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "The development of Advanced RAG and Modular RAG is\na response to these specific shortcomings in Naive RAG."
+              },
+              {
+                "found": "verbatim",
+                "n": 4,
+                "text": "encompassing\nthe Naive RAG, the Advanced RAG, and the Modular RAG."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Обзор выделяет три парадигмы RAG: Naive RAG, Advanced RAG и Modular RAG [1][4]. Развитие Advanced RAG и Modular RAG стало ответом на ограничения Naive RAG [1].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0010\"},{\"n\":4,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0001\"}],\"quotes\":[{\"n\":1,\"text\":\"we categorize it into three stages: Naive RAG, Advanced\\nRAG, and Modular RAG\"},{\"n\":1,\"text\":\"The development of Advanced RAG and Modular RAG is\\na response to these specific shortcomings in Naive RAG.\"},{\"n\":4,\"text\":\"encompassing\\nthe Naive RAG, the Advanced RAG, and the Modular RAG.\"}]}",
+            "retried": [],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0010",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 2–3",
+                "relevance": "llm 8",
+                "section": "II. OVERVIEW OF RAG"
+              },
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0001",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 4,
+                "pages": "стр. 1",
+                "relevance": "llm 8",
+                "section": "Front matter"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#3 cos 0.9921 z 3.40 llm 8 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG, стр. 2–3 · 995 симв.",
+            "#4 cos 0.9918 z 3.29 llm 8 (rewrite) · rag-survey-2312.10997.pdf — I. INTRODUCTION, стр. 2 · 994 симв.",
+            "#5 cos 0.9918 z 3.28 llm 8 (rewrite) · rag-survey-2312.10997.pdf — I. INTRODUCTION, стр. 1–2 · 999 симв.",
+            "#6 cos 0.9917 z 3.24 llm 8 (rewrite) · rag-survey-2312.10997.pdf — Front matter, стр. 1 · 998 симв."
+          ],
+          "covered": 3,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 3,
+          "n": 1,
+          "numbers_ok": true,
+          "q": "Собираем production-чат, который отвечает по внутренней документации компании, через RAG. Какие парадигмы RAG выделяет обзор?",
+          "quotes_ok": true,
+          "sources": 2,
+          "sources_ok": 2,
+          "state_checks": 2,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6396
+        },
+        {
+          "card": {
+            "answer": "",
+            "attempts": 0,
+            "by": "gate",
+            "check": null,
+            "clarify": "о каком документе или системе вопрос «Уточнение: объём небольшой, порядка 10k чанков. С какой парадигмы разумно начать?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+            "completion_tokens": 0,
+            "finish_reason": null,
+            "from_memory": false,
+            "ms": 0,
+            "nearest": [
+              "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > A. Naive RAG, стр. 3 (llm 5)",
+              "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG, стр. 2–3 (llm 4)",
+              "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > B. Advanced RAG, стр. 3–4 (llm 4)"
+            ],
+            "prompt_tokens": 0,
+            "quotes": [],
+            "raw": "",
+            "retried": [],
+            "sources": [],
+            "status": "unknown",
+            "support": null,
+            "why": "лучший фрагмент — llm 5 < порога 7"
+          },
+          "context": [
+            "#13 cos 0.9888 z 3.09 llm 5 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > A. Naive RAG, стр. 3 · 998 симв."
+          ],
+          "covered": 0,
+          "error": null,
+          "expect": "answer",
+          "judge": "—",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 2,
+          "numbers_ok": false,
+          "q": "Уточнение: объём небольшой, порядка 10k чанков. С какой парадигмы разумно начать?",
+          "quotes_ok": false,
+          "sources": 0,
+          "sources_ok": 0,
+          "state_checks": 1,
+          "state_missing": [
+            "10k|10 k|10 000|10 тыс"
+          ],
+          "status": "unknown",
+          "tokens": 6095
+        },
+        {
+          "card": {
+            "answer": "Классический (Naive) RAG-пайплайн состоит из трёх этапов: 1) индексация (Indexing) — документы разбиваются на чанки, кодируются в векторы и сохраняются в векторную БД; 2) извлечение (Retrieval) — Top-k чанков, наиболее релевантных вопросу по семантической близости; 3) генерация (Generation) — исходный вопрос и извлечённые чанки передаются в LLM для финального ответа [1][2].",
+            "attempts": 1,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 3,
+              "quotes": 2,
+              "quotes_ok": 2,
+              "sources": 2,
+              "sources_ok": 2,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 366,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 9419,
+            "nearest": [],
+            "prompt_tokens": 2241,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "1) Indexing. Documents are split into chunks, encoded into vectors, and stored in a vector database. 2) Retrieval. Retrieve the Top k chunks most relevant to the question based on semantic similarity. 3) Generation. Input the original question and the retrieved chunks together into LLM to generate the final answer."
+              },
+              {
+                "found": "verbatim",
+                "n": 2,
+                "text": "The Naive RAG follows a traditional process that includes indexing, retrieval, and generation"
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Классический (Naive) RAG-пайплайн состоит из трёх этапов: 1) индексация (Indexing) — документы разбиваются на чанки, кодируются в векторы и сохраняются в векторную БД; 2) извлечение (Retrieval) — Top-k чанков, наиболее релевантных вопросу по семантической близости; 3) генерация (Generation) — исходный вопрос и извлечённые чанки передаются в LLM для финального ответа [1][2].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0010\"},{\"n\":2,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG > A. Naive RAG\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0011\"}],\"quotes\":[{\"n\":1,\"text\":\"1) Indexing. Documents are split into chunks, encoded into vectors, and stored in a vector database. 2) Retrieval. Retrieve the Top k chunks most relevant to the question based on semantic similarity. 3) Generation. Input the original question and the retrieved chunks together into LLM to generate the final answer.\"},{\"n\":2,\"text\":\"The Naive RAG follows a traditional process that includes indexing, retrieval, and generation\"}]}",
+            "retried": [],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0010",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 2–3",
+                "relevance": "llm 10",
+                "section": "II. OVERVIEW OF RAG"
+              },
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0011",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 3",
+                "relevance": "llm 10",
+                "section": "II. OVERVIEW OF RAG > A. Naive RAG"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#1 cos 0.9959 z 4.44 llm 10 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG, стр. 2–3 · 995 симв.",
+            "#6 cos 0.9928 z 3.35 llm 10 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > A. Naive RAG, стр. 3 · 998 симв.",
+            "#2 cos 0.9948 z 4.07 llm 7 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > B. Advanced RAG, стр. 3–4 · 1000 симв."
+          ],
+          "covered": 3,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 3,
+          "n": 3,
+          "numbers_ok": true,
+          "q": "Фиксируем требование: каждый ответ — с источниками. Из каких трёх этапов состоит классический RAG-пайплайн?",
+          "quotes_ok": true,
+          "sources": 2,
+          "sources_ok": 2,
+          "state_checks": 1,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6758
+        },
+        {
+          "card": {
+            "answer": "RAG лучше подходит для задач точного извлечения информации: он обеспечивает обновление знаний в реальном времени, эффективное использование внешних источников с высокой интерпретируемостью и стабильно превосходит несупервизированное дообучение на знаниеёмких задачах — как по знаниям из обучения, так и по совершенно новым [1][2]. Fine-tuning нужен, когда требуется глубокая кастомизация поведения и стиля модели — например, воспроизведение специфических структур, стилей или форматов; выбор зависит от динамики данных, потребности в кастомизации и вычислительных ресурсов, а RAG и FT не взаимоисключающи и могут дополнять друг друга, вплоть до совместного использования для оптимального результата [1][2][3].",
+            "attempts": 2,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 3,
+              "sources_ok": 3,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1088,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 23864,
+            "nearest": [],
+            "prompt_tokens": 6195,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 2,
+                "text": "RAG can be likened to providing a model with a tailored textbook for information retrieval, ideal for precise information retrieval tasks. In contrast, FT is comparable to a student internalizing knowledge over time, suitable for scenarios requiring replication of specific structures, styles, or formats."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "RAG excels in dynamic environments by offering realtime knowledge updates and effective utilization of external knowledge sources with high interpretability."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "while unsupervised fine-tuning shows some improvement, RAG consistently outperforms it, for both existing knowledge encountered during training and entirely new knowledge."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"RAG лучше подходит для задач точного извлечения информации: он обеспечивает обновление знаний в реальном времени, эффективное использование внешних источников с высокой интерпретируемостью и стабильно превосходит несупервизированное дообучение на знаниеёмких задачах — как по знаниям из обучения, так и по совершенно новым [1][2]. Fine-tuning нужен, когда требуется глубокая кастомизация поведения и стиля модели — например, воспроизведение специфических структур, стилей или форматов; выбор зависит от динамики данных, потребности в кастомизации и вычислительных ресурсов, а RAG и FT не взаимоисключающи и могут дополнять друг друга, вплоть до совместного использования для оптимального результата [1][2][3].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG > D. RAG vs Fine-tuning\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0025\"},{\"n\":2,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG > D. RAG vs Fine-tuning\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0024\"},{\"n\":3,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG > D. RAG vs Fine-tuning\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0026\"}],\"quotes\":[{\"n\":2,\"text\":\"RAG can be likened to providing a model with a tailored textbook for information retrieval, ideal for precise information retrieval tasks. In contrast, FT is comparable to a student internalizing knowledge over time, suitable for scenarios requiring replication of specific structures, styles, or formats.\"},{\"n\":1,\"text\":\"RAG excels in dynamic environments by offering realtime knowledge updates and effective utilization of external knowledge sources with high interpretability.\"},{\"n\":1,\"text\":\"while unsupervised fine-tuning shows some improvement, RAG consistently outperforms it, for both existing knowledge encountered during training and entirely new knowledge.\"}]}",
+            "retried": [
+              "quote [3] «while unsupervised fine-tuning shows some improvement, RAG consistently outperforms it, for both existing knowledge encountered during training and entirely new knowledge. Additionally, it was found that LLMs struggle to learn new factual information through unsupervised finetuning.» is not in any excerpt — copy it character for character"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0025",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 5",
+                "relevance": "llm 10",
+                "section": "II. OVERVIEW OF RAG > D. RAG vs Fine-tuning"
+              },
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0024",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 2,
+                "pages": "стр. 5",
+                "relevance": "llm 9",
+                "section": "II. OVERVIEW OF RAG > D. RAG vs Fine-tuning"
+              },
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0026",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 3,
+                "pages": "стр. 5",
+                "relevance": "llm 9",
+                "section": "II. OVERVIEW OF RAG > D. RAG vs Fine-tuning"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#9 cos 0.9927 z 2.81 llm 10 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > D. RAG vs Fine-tuning, стр. 5 · 995 симв.",
+            "#11 cos 0.9911 z 2.77 llm 9 · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > D. RAG vs Fine-tuning, стр. 5 · 994 симв.",
+            "#13 cos 0.9923 z 2.70 llm 9 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > D. RAG vs Fine-tuning, стр. 5 · 998 симв.",
+            "#4 cos 0.9932 z 2.98 llm 7 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > C. Modular RAG, стр. 5 · 992 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 4,
+          "numbers_ok": true,
+          "q": "Чем RAG лучше дообучения модели, и когда всё-таки нужен fine-tuning?",
+          "quotes_ok": true,
+          "sources": 3,
+          "sources_ok": 3,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 7090
+        },
+        {
+          "card": {
+            "answer": "По обзору оптимизация индексации включает: установку иерархической структуры «родитель-потомок», добавление искусственно созданных метаданных — кратких содержаний абзацев и гипотетических вопросов (Reverse HyDE), а также взвешивание меток времени документов для time-aware RAG, обеспечивающего свежесть знаний [1].",
+            "attempts": 2,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 962,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 29300,
+            "nearest": [],
+            "prompt_tokens": 7454,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Hierarchical index structure. File are arranged in parentchild"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "metadata can also be artificially constructed. For example, adding summaries of paragraph, as well as introducing hypothetical questions. This method is also known as Reverse HyDE."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Assigning different weights to document timestamps during retrieval can achieve time-aware RAG, ensuring the freshness of knowledge and avoiding outdated information."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"По обзору оптимизация индексации включает: установку иерархической структуры «родитель-потомок», добавление искусственно созданных метаданных — кратких содержаний абзацев и гипотетических вопросов (Reverse HyDE), а также взвешивание меток времени документов для time-aware RAG, обеспечивающего свежесть знаний [1].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"III. RETRIEVAL > B. Indexing Optimization\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0041\"}],\"quotes\":[{\"n\":1,\"text\":\"Hierarchical index structure. File are arranged in parentchild\"},{\"n\":1,\"text\":\"metadata can also be artificially constructed. For example, adding summaries of paragraph, as well as introducing hypothetical questions. This method is also known as Reverse HyDE.\"},{\"n\":1,\"text\":\"Assigning different weights to document timestamps during retrieval can achieve time-aware RAG, ensuring the freshness of knowledge and avoiding outdated information.\"}]}",
+            "retried": [
+              "судья: не в цитатах — иерархическая структура «родитель-потомок»; искусственно созданные метаданные: краткие содержания абзацев, гипотетические вопросы, Reverse HyDE; time-aware RAG и свежесть знаний через метки времени при взвешивании"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0041",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 8",
+                "relevance": "llm 7",
+                "section": "III. RETRIEVAL > B. Indexing Optimization"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#3 cos 0.9931 z 2.65 llm 7 (rewrite) · rag-survey-2312.10997.pdf — III. RETRIEVAL > B. Indexing Optimization, стр. 8 · 1000 симв.",
+            "#4 cos 0.9931 z 2.63 llm 7 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > B. Advanced RAG, стр. 3–4 · 1000 симв.",
+            "#5 cos 0.9930 z 2.61 llm 7 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > B. Advanced RAG, стр. 4 · 997 симв.",
+            "#2 cos 0.9933 z 2.71 llm 5 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > A. Naive RAG, стр. 3 · 998 симв."
+          ],
+          "covered": 0,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 5,
+          "numbers_ok": true,
+          "q": "Чанкование: как оптимизировать индекс по обзору?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 4547
+        },
+        {
+          "card": {
+            "answer": "Обзор выделяет два типа эмбеддинг-моделей: разреженный энкодер (BM25) и плотный ретривер на базе BERT-архитектуры; также упоминаются современные модели AngIE, Voyage, BGE, которые выигрывают от multi-task instruct tuning. Рекомендаций «какая модель лучше» нет — выбор зависит от конкретного сценария [1].",
+            "attempts": 2,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 599,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 18640,
+            "nearest": [],
+            "prompt_tokens": 6563,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "This mainly includes a sparse encoder (BM25) and a dense retriever (BERT architecture Pre-training language models)."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Recent research has introduced prominent embedding models such as AngIE, Voyage, BGE,etc [94]–[96], which are benefit from multi-task instruct tuning."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "There is no one-size-fits-all answer to “which embedding model to use.”"
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Обзор выделяет два типа эмбеддинг-моделей: разреженный энкодер (BM25) и плотный ретривер на базе BERT-архитектуры; также упоминаются современные модели AngIE, Voyage, BGE, которые выигрывают от multi-task instruct tuning. Рекомендаций «какая модель лучше» нет — выбор зависит от конкретного сценария [1].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"III. RETRIEVAL > C. Query Optimization\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0051\"}],\"quotes\":[{\"n\":1,\"text\":\"This mainly includes a sparse encoder (BM25) and a dense retriever (BERT architecture Pre-training language models).\"},{\"n\":1,\"text\":\"Recent research has introduced prominent embedding models such as AngIE, Voyage, BGE,etc [94]–[96], which are benefit from multi-task instruct tuning.\"},{\"n\":1,\"text\":\"There is no one-size-fits-all answer to “which embedding model to use.”\"}]}",
+            "retried": [
+              "судья: не в цитатах — модели AngIE, Voyage, BGE улучшены за счёт multi-task instruct tuning — в цитатах лишь сказано, что это «prominent embedding models», без указания способа улучшения"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0051",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 9",
+                "relevance": "llm 10",
+                "section": "III. RETRIEVAL > C. Query Optimization"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#2 cos 0.9909 z 3.43 llm 10 (rewrite) · rag-survey-2312.10997.pdf — III. RETRIEVAL > C. Query Optimization, стр. 9 · 1000 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 6,
+          "numbers_ok": true,
+          "q": "Какие эмбеддинг-модели рассматривает обзор?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 4627
+        },
+        {
+          "card": {
+            "answer": "Обзор описывает реранкинг так: наиболее подходящие результаты ставятся первыми, что сокращает общий пул документов и служит двойной цели — усилителя и фильтра, давая LLM более точные входы [1]. Реранкинг может выполняться rule-based методами (метрики Diversity, Relevance, MRR) или model-based: Encoder-Decoder модели серии BERT (например, SpanBERT), специализированные реранкеры вроде Cohere rerank или bge-raranker-large, а также общие LLM типа GPT [1]. [1]",
+            "attempts": 2,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 793,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 27753,
+            "nearest": [],
+            "prompt_tokens": 7444,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "most pertinent results first, effectively reducing the overall document pool, severing a dual purpose in information retrieval, acting as both an enhancer and a filter"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "delivering refined inputs for more precise language model processing [70]"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Reranking can be performed using rule-based methods that depend on predefined metrics like Diversity, Relevance, and MRR, or model-based approaches like Encoder-Decoder models from the BERT series (e.g., SpanBERT), specialized reranking models such as Cohere rerank or bge-raranker-large, and general large language models like GPT"
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Обзор описывает реранкинг так: наиболее подходящие результаты ставятся первыми, что сокращает общий пул документов и служит двойной цели — усилителя и фильтра, давая LLM более точные входы [1]. Реранкинг может выполняться rule-based методами (метрики Diversity, Relevance, MRR) или model-based: Encoder-Decoder модели серии BERT (например, SpanBERT), специализированные реранкеры вроде Cohere rerank или bge-raranker-large, а также общие LLM типа GPT [1]. [1]\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"IV. GENERATION > A. Context Curation\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0056\"}],\"quotes\":[{\"n\":1,\"text\":\"most pertinent results first, effectively reducing the overall document pool, severing a dual purpose in information retrieval, acting as both an enhancer and a filter\"},{\"n\":1,\"text\":\"delivering refined inputs for more precise language model processing [70]\"},{\"n\":1,\"text\":\"Reranking can be performed using rule-based methods that depend on predefined metrics like Diversity, Relevance, and MRR, or model-based approaches like Encoder-Decoder models from the BERT series (e.g., SpanBERT), specialized reranking models such as Cohere rerank or bge-raranker-large, and general large language models like GPT\"}]}",
+            "retried": [
+              "судья: не в цитатах — реранкинг перерабатывает результаты извлечения так, чтобы наиболее подходящие шли первыми; сокращает общий пул документов; служит двойной цели — усилителя и фильтра"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0056",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 10",
+                "relevance": "llm 10",
+                "section": "IV. GENERATION > A. Context Curation"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#1 cos 0.9934 z 3.12 llm 10 (rewrite) · rag-survey-2312.10997.pdf — IV. GENERATION > A. Context Curation, стр. 10 · 999 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 7,
+          "numbers_ok": true,
+          "q": "Решение зафиксировано: реранкер обязателен. Что обзор говорит про reranking?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 1,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 6935
+        },
+        {
+          "card": {
+            "answer": "До поиска запрос можно улучшить на этапе pre-retrieval query optimization: сделать исходный вопрос пользователя более ясным и подходящим для retrieval-задачи. Обзор называет методы: query rewriting, query transformation, query expansion и другие техники [1].",
+            "attempts": 1,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 2,
+              "quotes_ok": 2,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 198,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 7066,
+            "nearest": [],
+            "prompt_tokens": 4537,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "While the goal of query optimization is to make the user’s original question clearer and more suitable for the retrieval task. Common methods include query rewriting query transformation, query expansion and other techniques"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "the primary focus is on optimizing the indexing structure and the original query."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"До поиска запрос можно улучшить на этапе pre-retrieval query optimization: сделать исходный вопрос пользователя более ясным и подходящим для retrieval-задачи. Обзор называет методы: query rewriting, query transformation, query expansion и другие техники [1].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG > B. Advanced RAG\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0016\"}],\"quotes\":[{\"n\":1,\"text\":\"While the goal of query optimization is to make the user’s original question clearer and more suitable for the retrieval task. Common methods include query rewriting query transformation, query expansion and other techniques\"},{\"n\":1,\"text\":\"the primary focus is on optimizing the indexing structure and the original query.\"}]}",
+            "retried": [],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0016",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 4",
+                "relevance": "llm 8",
+                "section": "II. OVERVIEW OF RAG > B. Advanced RAG"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [],
+              "verdict": "yes"
+            },
+            "why": null
+          },
+          "context": [
+            "#9 cos 0.9894 z 2.53 llm 8 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > B. Advanced RAG, стр. 4 · 997 симв.",
+            "#7 cos 0.9895 z 2.59 llm 7 (rewrite) · rag-survey-2312.10997.pdf — III. RETRIEVAL > C. Query Optimization, стр. 9 · 1000 симв.",
+            "#8 cos 0.9895 z 2.57 llm 6 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > C. Modular RAG, стр. 5 · 998 симв.",
+            "#11 cos 0.9893 z 2.51 llm 6 (rewrite) · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > C. Modular RAG, стр. 5 · 995 симв."
+          ],
+          "covered": 0,
+          "error": null,
+          "expect": "answer",
+          "judge": "yes",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 8,
+          "numbers_ok": true,
+          "q": "Как можно улучшить сам запрос до поиска?",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 5078
+        },
+        {
+          "card": {
+            "answer": "",
+            "attempts": 0,
+            "by": "gate",
+            "check": null,
+            "clarify": "о каком документе или системе вопрос «Что обзор говорит про цены на GPU у AWS в 2026 году?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+            "completion_tokens": 0,
+            "finish_reason": null,
+            "from_memory": false,
+            "ms": 0,
+            "nearest": [
+              "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > B. Advanced RAG, стр. 3–4 (llm 0)",
+              "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG, стр. 2–3 (llm 0)",
+              "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > B. Advanced RAG, стр. 4 (llm 0)"
+            ],
+            "prompt_tokens": 0,
+            "quotes": [],
+            "raw": "",
+            "retried": [],
+            "sources": [],
+            "status": "unknown",
+            "support": null,
+            "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — llm 0)"
+          },
+          "context": [],
+          "covered": 0,
+          "error": null,
+          "expect": "unknown",
+          "judge": "—",
+          "made_up": [],
+          "mem_error": null,
+          "must": 0,
+          "n": 9,
+          "numbers_ok": false,
+          "q": "Что обзор говорит про цены на GPU у AWS в 2026 году?",
+          "quotes_ok": false,
+          "sources": 0,
+          "sources_ok": 0,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "unknown",
+          "tokens": 2988
+        },
+        {
+          "card": {
+            "answer": "Качество оценивается по двум целям: Retrieval Quality и Generation Quality [1][4]. Для retrieval используются стандартные метрики поисковых/рекомендательных систем: Hit Rate, MRR, NDCG [1]. Для генерации — на безразмеченном контенте faithfulness, relevance и non-harmfulness; на размеченном — точность информации [1]. Для задач QA — EM и F1, фактчекинг — Accuracy, качество текста — BLEU/ROUGE [4].",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 2,
+              "sources_ok": 2,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1827,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 40649,
+            "nearest": [],
+            "prompt_tokens": 17394,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Metrics such as Hit Rate, MRR, and NDCG are commonly utilized for this purpose"
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "the evaluation encompasses the faithfulness, relevance, and non-harmfulness of the generated answers. In contrast, for labeled content, the focus is on the accuracy of the information produced by the model"
+              },
+              {
+                "found": "verbatim",
+                "n": 4,
+                "text": "question answering evaluations might rely on EM and F1 scores [7], [45], [59], [72], whereas fact-checking tasks often hinge on Accuracy as the primary metric [4], [14], [42]. BLEU and ROUGE metrics are also commonly used to evaluate answer quality [26], [32], [52], [78]."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Качество оценивается по двум целям: Retrieval Quality и Generation Quality [1][4]. Для retrieval используются стандартные метрики поисковых/рекомендательных систем: Hit Rate, MRR, NDCG [1]. Для генерации — на безразмеченном контенте faithfulness, relevance и non-harmfulness; на размеченном — точность информации [1]. Для задач QA — EM и F1, фактчекинг — Accuracy, качество текста — BLEU/ROUGE [4].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"VI. TASK AND EVALUATION > B. Evaluation Target\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0070\"},{\"n\":4,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"VI. TASK AND EVALUATION > A. Downstream Task\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0069\"}],\"quotes\":[{\"n\":1,\"text\":\"Metrics such as Hit Rate, MRR, and NDCG are commonly utilized for this purpose\"},{\"n\":1,\"text\":\"the evaluation encompasses the faithfulness, relevance, and non-harmfulness of the generated answers. In contrast, for labeled content, the focus is on the accuracy of the information produced by the model\"},{\"n\":4,\"text\":\"question answering evaluations might rely on EM and F1 scores [7], [45], [59], [72], whereas fact-checking tasks often hinge on Accuracy as the primary metric [4], [14], [42]. BLEU and ROUGE metrics are also commonly used to evaluate answer quality [26], [32], [52], [78].\"}]}",
+            "retried": [
+              "quote [4] «question answering evaluations might rely on EM and F1 scores, whereas fact-checking tasks often hinge on Accuracy as the primary metric. BLEU and ROUGE metrics are also commonly used to evaluate answer quality» is not in any excerpt — copy it character for character",
+              "судья: не в цитатах — RAGAS/ARES/TruLens (Context Relevance, Faithfulness, Answer Relevance) not in quotes; RGB (Noise Robustness, Negative Rejection, Information Integration, Counterfactual Robustness) not in quotes; CRUD (BLEU, ROUGE-L, BertScore, RAGQuestEval) not in quotes"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0070",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 12",
+                "relevance": "llm 10",
+                "section": "VI. TASK AND EVALUATION > B. Evaluation Target"
+              },
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0069",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 4,
+                "pages": "стр. 12",
+                "relevance": "llm 8",
+                "section": "VI. TASK AND EVALUATION > A. Downstream Task"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "Качество оценивается по двум целям: Retrieval Quality и Generation Quality — это разделение не сформулировано в цитатах напрямую"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#1 cos 0.9942 z 3.08 llm 10 (rewrite) · rag-survey-2312.10997.pdf — VI. TASK AND EVALUATION > B. Evaluation Target, стр. 12 · 993 симв.",
+            "#5 cos 0.9930 z 2.65 llm 9 (rewrite) · rag-survey-2312.10997.pdf — VII. DISCUSSION AND FUTURE PROSPECTS > B. RAG Robustness, стр. 14–15 · 992 симв.",
+            "#9 cos 0.9927 z 2.53 llm 9 (rewrite) · rag-survey-2312.10997.pdf — VII. DISCUSSION AND FUTURE PROSPECTS > C. Hybrid Approaches, стр. 15 · 998 симв.",
+            "#7 cos 0.9929 z 2.60 llm 8 (rewrite) · rag-survey-2312.10997.pdf — VI. TASK AND EVALUATION > A. Downstream Task, стр. 12 · 998 симв."
+          ],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 10,
+          "numbers_ok": true,
+          "q": "Метрики: по каким оценивать качество нашего чата?",
+          "quotes_ok": true,
+          "sources": 2,
+          "sources_ok": 2,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 4938
+        },
+        {
+          "card": {
+            "answer": "",
+            "attempts": 0,
+            "by": "gate",
+            "check": null,
+            "clarify": "о каком документе или системе вопрос «На каких фреймворках можно собрать прототип?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+            "completion_tokens": 0,
+            "finish_reason": null,
+            "from_memory": false,
+            "ms": 0,
+            "nearest": [
+              "rag-survey-2312.10997.pdf — Front matter, стр. 1 (llm 0)",
+              "rag-survey-2312.10997.pdf — III. RETRIEVAL > B. Indexing Optimization, стр. 8 (llm 0)",
+              "rag-survey-2312.10997.pdf — III. RETRIEVAL > A. Retrieval Source, стр. 7 (llm 0)"
+            ],
+            "prompt_tokens": 0,
+            "quotes": [],
+            "raw": "",
+            "retried": [],
+            "sources": [],
+            "status": "unknown",
+            "support": null,
+            "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — llm 0)"
+          },
+          "context": [],
+          "covered": 0,
+          "error": null,
+          "expect": "answer",
+          "judge": "—",
+          "made_up": [],
+          "mem_error": null,
+          "must": 1,
+          "n": 11,
+          "numbers_ok": false,
+          "q": "На каких фреймворках можно собрать прототип?",
+          "quotes_ok": false,
+          "sources": 0,
+          "sources_ok": 0,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "unknown",
+          "tokens": 6035
+        },
+        {
+          "card": {
+            "answer": "Из истории диалога:\n\n- **Реранкер:** мы зафиксировали требование, что реранкер **обязателен** в пайплайне, но конкретную модель не выбирали. Обзор упоминал варианты: rule-based методы, модели серии BERT (SpanBERT), специализированные реранкеры (Cohere rerank, bge-raranker-large) и общие LLM (GPT).\n- **Объём базы:** порядка **10k чанков** (вы уточняли это в контексте выбора парадигмы RAG для старта).",
+            "attempts": 0,
+            "by": null,
+            "check": null,
+            "clarify": null,
+            "completion_tokens": 175,
+            "finish_reason": null,
+            "from_memory": true,
+            "ms": 8501,
+            "nearest": [],
+            "prompt_tokens": 4228,
+            "quotes": [],
+            "raw": "",
+            "retried": [],
+            "sources": [],
+            "status": "answer",
+            "support": null,
+            "why": null
+          },
+          "context": [],
+          "covered": 2,
+          "error": null,
+          "expect": "answer",
+          "judge": "—",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 12,
+          "numbers_ok": false,
+          "q": "Напомни, какой реранкер мы зафиксировали и каков объём базы?",
+          "quotes_ok": false,
+          "sources": 0,
+          "sources_ok": 0,
+          "state_checks": 0,
+          "state_missing": [],
+          "status": "answer",
+          "tokens": 1950
+        },
+        {
+          "card": {
+            "answer": "Финальный план production-чата по внутренней документации: Шаг «Индекс» — очистить и извлечь сырые данные в форматах PDF, HTML, Word, Markdown, привести к единому тексту, сегментировать на чанки с иерархией «родитель-потомок» и метаданными (Reverse HyDE, time-aware веса), закодировать эмбеддинг-моделью и сохранить в векторную БД. Шаг «Поиск» — тем же энкодером кодировать запрос пользователя с pre-retrieval оптимизацией (rewriting, transformation, expansion) и извлечь Top-k чанков по семантической близости. Шаг «Реранк» — обязательный реранкинг для сокращения пула документов перед генерацией. Шаг «Генерация» — передать исходный вопрос и извлечённые чанки в LLM для финального ответа. Шаг «Источники» — каждый ответ сопровождать источниками и оценивать качество по Retrieval Quality (Hit Rate, MRR, NDCG) и Generation Quality (faithfulness, relevance, non-harmfulness, EM/F1, Accuracy, BLEU/ROUGE).",
+            "attempts": 3,
+            "by": null,
+            "check": {
+              "json_ok": true,
+              "numbers": 0,
+              "quotes": 3,
+              "quotes_ok": 3,
+              "sources": 1,
+              "sources_ok": 1,
+              "unbacked": []
+            },
+            "clarify": null,
+            "completion_tokens": 1900,
+            "finish_reason": "stop",
+            "from_memory": false,
+            "ms": 38811,
+            "nearest": [],
+            "prompt_tokens": 17929,
+            "quotes": [
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Indexing starts with the cleaning and extraction of raw data in diverse formats like PDF, HTML, Word, and Markdown, which is then converted into a uniform plain text format."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "Chunks are then encoded into vector representations using an embedding model and stored in vector database."
+              },
+              {
+                "found": "verbatim",
+                "n": 1,
+                "text": "3) Generation. Input the original question and the retrieved chunks together into LLM to generate the final answer."
+              }
+            ],
+            "raw": "{\"status\":\"answer\",\"answer\":\"Финальный план production-чата по внутренней документации: Шаг «Индекс» — очистить и извлечь сырые данные в форматах PDF, HTML, Word, Markdown, привести к единому тексту, сегментировать на чанки с иерархией «родитель-потомок» и метаданными (Reverse HyDE, time-aware веса), закодировать эмбеддинг-моделью и сохранить в векторную БД. Шаг «Поиск» — тем же энкодером кодировать запрос пользователя с pre-retrieval оптимизацией (rewriting, transformation, expansion) и извлечь Top-k чанков по семантической близости. Шаг «Реранк» — обязательный реранкинг для сокращения пула документов перед генерацией. Шаг «Генерация» — передать исходный вопрос и извлечённые чанки в LLM для финального ответа. Шаг «Источники» — каждый ответ сопровождать источниками и оценивать качество по Retrieval Quality (Hit Rate, MRR, NDCG) и Generation Quality (faithfulness, relevance, non-harmfulness, EM/F1, Accuracy, BLEU/ROUGE).\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"II. OVERVIEW OF RAG > A. Naive RAG\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0011\"}],\"quotes\":[{\"n\":1,\"text\":\"Indexing starts with the cleaning and extraction of raw data in diverse formats like PDF, HTML, Word, and Markdown, which is then converted into a uniform plain text format.\"},{\"n\":1,\"text\":\"Chunks are then encoded into vector representations using an embedding model and stored in vector database.\"},{\"n\":1,\"text\":\"3) Generation. Input the original question and the retrieved chunks together into LLM to generate the final answer.\"}]}",
+            "retried": [
+              "numbers 1, 2, 10, 3, 4 of the answer are in none of the quotes — quote where they come from or drop them",
+              "судья: не в цитатах — сегментация на чанки с иерархией «родитель-потомок»; метаданные (Reverse HyDE, time-aware веса); pre-retrieval оптимизация (rewriting, transformation, expansion); извлечение Top-k чанков по семантической близости тем же энкодером; обязательный реранкинг для сокращения пула документов; сопровождение каждого ответа источниками; оценка качества по Retrieval Quality (Hit Rate, MRR, NDCG) и Generation Quality (faithfulness, relevance, non-harmfulness, EM/F1, Accuracy, BLEU/ROUGE)",
+              "после повтора судьи формат сломался — оставлен предыдущий ответ"
+            ],
+            "sources": [
+              {
+                "chunk_id": "fixed-rag-survey-2312.10997-0011",
+                "file": "rag-survey-2312.10997.pdf",
+                "id_ok": true,
+                "n": 1,
+                "pages": "стр. 3",
+                "relevance": "llm 8",
+                "section": "II. OVERVIEW OF RAG > A. Naive RAG"
+              }
+            ],
+            "status": "answer",
+            "support": {
+              "unsupported": [
+                "сегментация на чанки с иерархией «родитель-потомок»",
+                "метаданные (Reverse HyDE, time-aware веса)",
+                "pre-retrieval оптимизация (rewriting, transformation, expansion)",
+                "извлечение Top-k чанков по семантической близости тем же энкодером",
+                "обязательный реранкинг для сокращения пула документов",
+                "сопровождение каждого ответа источниками",
+                "оценка качества по Retrieval Quality (Hit Rate, MRR, NDCG) и Generation Quality (faithfulness, relevance, non-harmfulness, EM/F1, Accuracy, BLEU/ROUGE)"
+              ],
+              "verdict": "partial"
+            },
+            "why": null
+          },
+          "context": [
+            "#3 cos 0.9897 z 2.53 llm 8 · rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > A. Naive RAG, стр. 3 · 998 симв.",
+            "#2 cos 0.9899 z 2.62 llm 5 · rag-survey-2312.10997.pdf — III. RETRIEVAL > A. Retrieval Source, стр. 7 · 993 симв."
+          ],
+          "covered": 1,
+          "error": null,
+          "expect": "answer",
+          "judge": "partial",
+          "made_up": [],
+          "mem_error": null,
+          "must": 2,
+          "n": 13,
+          "numbers_ok": true,
+          "q": "Дай финальный план в 5 шагов: индекс, поиск, реранк, генерация, источники — с учётом всего, что записано.",
+          "quotes_ok": true,
+          "sources": 1,
+          "sources_ok": 1,
+          "state_checks": 3,
+          "state_missing": [
+            "10k|10 000"
+          ],
+          "status": "answer",
+          "tokens": 3366
+        }
+      ]
+    }
+  ]
+}

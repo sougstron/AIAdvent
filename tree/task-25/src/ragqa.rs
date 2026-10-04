@@ -263,7 +263,7 @@ pub fn prepare_with(question: &str, settings: &Settings, p: &Pipeline) -> Res<Pr
     let judge = if p.needs_llm() { Some(Judge::new(settings, &r)?) } else { None };
     let got = rerank::run(&r, p, judge.as_ref(), question)?;
     // task 24: what goes out is the grounded-answer prompt (`cite.rs`)
-    let added = crate::cite::prompt(question, &got.kept).chars().count().saturating_sub(question.chars().count());
+    let added = crate::cite::prompt(question, &got.kept, None).chars().count().saturating_sub(question.chars().count());
     Ok(Prepared { note: sources_note(&r, p, &got, added), hits: got.kept.clone(), added, retrieval: got, pipeline: p.clone() })
 }
 
