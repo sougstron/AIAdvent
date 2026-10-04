@@ -475,6 +475,23 @@ pub struct Settings {
     /// Из какой стратегии индекса брать чанки: `structure` или `fixed`.
     #[serde(default = "default_rag_strategy")]
     pub rag_strategy: String,
+    /// Задача 23: перед поиском LLM переписывает вопрос в поисковый запрос
+    /// (`rerank.rs`); ищем по обоим, у чанка берём лучший из двух скоров.
+    #[serde(default)]
+    pub rag_rewrite: bool,
+    /// Второй этап после поиска: `off` (top-k как есть), `sim` (порог по
+    /// z-скору косинуса), `llm` (LLM-реранкер с порогом 0–10), `both`.
+    #[serde(default = "default_rag_filter")]
+    pub rag_filter: String,
+    /// Сколько кандидатов достаём до фильтра (top-K до); `rag_k` — после.
+    #[serde(default = "default_rag_pool")]
+    pub rag_pool: usize,
+    /// Порог similarity: z-скор косинуса чанка среди всех чанков индекса.
+    #[serde(default = "default_rag_min_sim")]
+    pub rag_min_sim: f32,
+    /// Порог реранкера: оценка релевантности 0–10 от LLM.
+    #[serde(default = "default_rag_min_llm")]
+    pub rag_min_llm: u8,
     /// Кто подписывает план (`run.rs`). Гейт утверждения работает всегда;
     /// эта настройка решает только, ждём ли мы человека или подписываем
     /// автоматически (и пишем в журнал `approved-by=auto`). По умолчанию —
@@ -562,6 +579,22 @@ fn default_rag_strategy() -> String {
     crate::ragqa::DEFAULT_STRATEGY.to_string()
 }
 
+fn default_rag_filter() -> String {
+    crate::rerank::DEFAULT_FILTER.to_string()
+}
+
+fn default_rag_pool() -> usize {
+    crate::rerank::DEFAULT_POOL
+}
+
+fn default_rag_min_sim() -> f32 {
+    crate::rerank::DEFAULT_MIN_Z
+}
+
+fn default_rag_min_llm() -> u8 {
+    crate::rerank::DEFAULT_MIN_LLM
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -573,6 +606,11 @@ impl Default for Settings {
             rag: false,
             rag_k: default_rag_k(),
             rag_strategy: default_rag_strategy(),
+            rag_rewrite: false,
+            rag_filter: default_rag_filter(),
+            rag_pool: default_rag_pool(),
+            rag_min_sim: default_rag_min_sim(),
+            rag_min_llm: default_rag_min_llm(),
             invariants: true,
             context_enabled: true,
             context_strategy: ContextStrategy::default(),
@@ -611,6 +649,14 @@ impl Settings {
         if !matches!(self.rag_strategy.as_str(), "fixed" | "structure") {
             self.rag_strategy = default_rag_strategy();
         }
+        if crate::rerank::Filter::parse(&self.rag_filter).is_err() {
+            self.rag_filter = default_rag_filter();
+        }
+        self.rag_pool = self.rag_pool.clamp(self.rag_k, crate::rerank::MAX_POOL);
+        if !self.rag_min_sim.is_finite() {
+            self.rag_min_sim = default_rag_min_sim();
+        }
+        self.rag_min_llm = self.rag_min_llm.min(10);
         self.effort = match self.effort {
             Effort::None => Effort::Low,
             Effort::Medium => Effort::High,
@@ -676,7 +722,18 @@ impl Settings {
             }
         ));
         parts.push(format!("todo={}", if self.todo { "on" } else { "off" }));
-        parts.push(if self.rag { format!("rag=on(k={},{})", self.rag_k, self.rag_strategy) } else { "rag=off".into() });
+        parts.push(if self.rag {
+            format!(
+                "rag=on(k={},{},filter={},pool={},rewrite={})",
+                self.rag_k,
+                self.rag_strategy,
+                self.rag_filter,
+                self.rag_pool,
+                if self.rag_rewrite { "on" } else { "off" }
+            )
+        } else {
+            "rag=off".into()
+        });
         parts.push(format!(
             "invariants={}",
             if self.invariants { "on" } else { "off" }

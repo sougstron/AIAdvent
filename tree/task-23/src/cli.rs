@@ -74,7 +74,9 @@ use crate::verify;
         ask --rag-index docs --chunk-strategy fixed --chunk-size 500 --chunk-overlap 100\n  \
         ask --rag-compare docs                re-print the chunking comparison from the saved index\n  \
         ask --rag \"what is HyDE?\"            answer with the nearest chunks of rag/index.sqlite (task 22)\n  \
-        ask --rag-eval                        10 control questions: plain vs RAG vs raw reading over MCP → rag/eval.md\n  \
+        ask --rag-eval                        20 control questions: plain / base / sim / llm / rewrite / full → rag/eval.md\n  \
+        ask --rag-tune                        top-K and threshold sweeps for the second stage → rag/tune.md\n  \
+        ask --rag --rag-rewrite --rag-filter both \"q\"   rewrite + similarity threshold + LLM reranker (task 23)\n  \
         ask --strategy window --keep-recent 6 send only the last N messages\n  \
         ask --sessions                        list saved chat sessions\n  \
         ask --resume ID                       resume a saved session\n  \
@@ -394,20 +396,49 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub rag_k: Option<usize>,
 
-    /// Which strategy of the index RAG retrieves from: `structure`
-    /// (default) or `fixed`.
+    /// Which strategy of the index RAG retrieves from: `fixed` (default
+    /// since task 23) or `structure`.
     #[arg(long, value_name = "structure|fixed")]
     pub rag_strategy: Option<String>,
 
-    /// Task 22: run the control questions `DIR/control.json` with and
-    /// without RAG (and with raw reading through the docs MCP server),
-    /// score every answer against its expectation, write `rag/eval.md`.
+    /// Task 23: rewrite the question into a search query with the LLM
+    /// before retrieval (searches both, keeps the better score per chunk).
+    #[arg(long)]
+    pub rag_rewrite: bool,
+
+    /// Task 23: second stage after retrieval — `off`, `sim` (similarity
+    /// threshold), `llm` (LLM reranker with a threshold) or `both`.
+    #[arg(long, value_name = "off|sim|llm|both")]
+    pub rag_filter: Option<String>,
+
+    /// Candidates retrieved before the filter (top-K before; `--rag-k` is
+    /// top-K after). Default 20.
+    #[arg(long, value_name = "N")]
+    pub rag_pool: Option<usize>,
+
+    /// Similarity threshold: z-score of a chunk's cosine among all chunks.
+    #[arg(long, value_name = "Z")]
+    pub rag_min_sim: Option<f32>,
+
+    /// Reranker threshold: LLM relevance score 0–10.
+    #[arg(long, value_name = "0..10")]
+    pub rag_min_llm: Option<u8>,
+
+    /// Task 22/23: run the control questions `DIR/control.json` in every
+    /// mode, score every answer against its expectation, write `rag/eval.md`.
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
     pub rag_eval: Option<String>,
 
-    /// Modes for `--rag-eval`: any of `plain`, `rag`, `mcp`.
-    #[arg(long, value_name = "MODES", default_value = "plain,rag,mcp")]
+    /// Modes for `--rag-eval`: `plain`, `base` (task 22's top-k), `sim`,
+    /// `llm`, `rewrite`, `full` (rewrite + sim + llm), `mcp`.
+    #[arg(long, value_name = "MODES", default_value = "plain,base,sim,llm,rewrite,full")]
     pub rag_eval_modes: String,
+
+    /// Task 23: tune the second stage on the control questions without
+    /// generating answers — recall of top-K before, similarity and reranker
+    /// threshold sweeps → `rag/tune.md`.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs")]
+    pub rag_tune: Option<String>,
 
     /// Only these control question ids, e.g. `1,9`.
     #[arg(long, value_name = "IDS", value_delimiter = ',')]
@@ -611,6 +642,27 @@ impl Cli {
                 return Err(format!("--rag-strategy: structure или fixed, получено `{st}`"));
             }
             s.rag_strategy = st.clone();
+        }
+        if self.rag_rewrite {
+            s.rag_rewrite = true;
+        }
+        if let Some(f) = &self.rag_filter {
+            s.rag_filter = crate::rerank::Filter::parse(f).map_err(|e| format!("--rag-filter: {e}"))?.name().into();
+        }
+        if let Some(n) = self.rag_pool {
+            if !(s.rag_k..=crate::rerank::MAX_POOL).contains(&n) {
+                return Err(format!("--rag-pool: от --rag-k ({}) до {}, получено {n}", s.rag_k, crate::rerank::MAX_POOL));
+            }
+            s.rag_pool = n;
+        }
+        if let Some(z) = self.rag_min_sim {
+            s.rag_min_sim = z;
+        }
+        if let Some(n) = self.rag_min_llm {
+            if n > 10 {
+                return Err(format!("--rag-min-llm: от 0 до 10, получено {n}"));
+            }
+            s.rag_min_llm = n;
         }
         // Кто подписывает план. Без флага: в TUI ждём человека, а в
         // неинтерактивном заходе спросить некого — подпись ставит `auto`,
@@ -896,12 +948,17 @@ pub fn run() -> Res<()> {
         let settings = cli.to_settings()?;
         let opts = ragqa::EvalOpts {
             paths: rag::Config::locate(dir, &cli.rag_db),
-            k: settings.rag_k,
             strategy: settings.rag_strategy.clone(),
             modes: ragqa::Mode::parse_list(&cli.rag_eval_modes)?,
             only: cli.rag_eval_only.clone(),
+            tuned: crate::rerank::Pipeline::from_settings(&settings),
         };
         return ragqa::eval(&settings, &opts);
+    }
+
+    if let Some(dir) = cli.rag_tune.as_deref() {
+        let settings = cli.to_settings()?;
+        return crate::rerank::tune(&settings, &rag::Config::locate(dir, &cli.rag_db), &cli.rag_eval_only);
     }
 
     if let Some(which) = cli.verify_pipeline.as_deref() {
@@ -1309,7 +1366,7 @@ fn one_shot(
     // Задача 22: с RAG на провод уходит вопрос вместе с найденными чанками.
     // Только этот запрос — сессия и память получают вопрос как он набран.
     let rag = |q: &str| -> Res<String> {
-        let p = ragqa::prepare(q, settings.rag_k, &settings.rag_strategy)?;
+        let p = ragqa::prepare(q, &settings)?;
         eprintln!("{}", p.note);
         Ok(p.wire)
     };

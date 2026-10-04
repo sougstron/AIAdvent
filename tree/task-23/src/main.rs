@@ -25,6 +25,7 @@ mod scheduler;
 mod pipeline;
 mod rag;
 mod ragqa;
+mod rerank;
 mod session;
 mod strategy;
 mod todo;
