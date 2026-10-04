@@ -57,7 +57,7 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-21/`.** — a verbatim copy of
+**The active snapshot is `tree/task-22/`.** — a verbatim copy of
 `tree/task-19/` made for task 20 (no new functionality yet). It is a working agent: a ratatui
 chat TUI over z.ai's plain OpenAI-compatible API, built around a first-class
 `Agent` entity (settings, history, AGENTS.md in the system message) rather
