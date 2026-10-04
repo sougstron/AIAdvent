@@ -85,7 +85,7 @@ const PROFILE_USAGE: &str =
 const TODO_USAGE: &str = "/todo [show|on|off|start <задача>|approve [коммент]|reject <причина>|\
                           pause [почему]|resume|abort <причина>|log|reset|prompt]";
 const RAG_USAGE: &str = "/rag [show|on|off|k N|pool N|rewrite on|off|filter off|sim|llm|both|min-sim Z|min-llm N|\
-                         idk N|idk-z Z|strategy fixed|structure|questions|search <вопрос>|compare <N|вопрос>|mem [on|off|reset]]";
+                         idk N|idk-z Z|strategy fixed|structure|questions|search <вопрос>|compare <N|вопрос>|mem [show|on|off|reset]]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -2897,9 +2897,9 @@ impl App {
     ///
     /// Задача 25: память задачи (`chatmem.rs`). `mem` — состояние на входе
     /// хода (None, когда настройка выключена): блок `<task-state>` едет в
-    /// запрос, а после отвеченного хода экстрактор обновляет состояние в
-    /// сессии. «Не знаю» память не трогает: вопрос без ответа нечего
-    /// фиксировать. Отказ экстрактора не ломает ход и не затирает старое
+    /// запрос, а после хода экстрактор обновляет состояние в сессии — и
+    /// после «не знаю» тоже: ответа в корпусе нет, но пользователь мог
+    /// сказать о цели или о себе. Отказ экстрактора не ломает ход и не затирает старое
     /// состояние — просто подпись в статусе.
     fn cited_turn(
         &mut self,
@@ -2921,19 +2921,21 @@ impl App {
         let checker = crate::cite::Checker::new(&self.settings).ok();
         let q = question.to_string();
         let mem_in = mem.clone();
-        let hist_in = history.clone();
+        // история до текущего вопроса: recall допишет его сам, своим промптом
+        let hist_in = history[..history.len().saturating_sub(1)].to_vec();
         let result = self.with_spinner(terminal, "ответ с источниками и цитатами", move || {
             crate::cite::answer(&agent, checker.as_ref(), &history, &q, &got, idk, mem_in.as_ref())
         });
         // Задача 25: вопрос был про договорённости диалога — корпуса под ним
         // нет, порог честно сказал «не знаю». При непустой памяти задачи
         // отвечаем из состояния и истории (chatmem::recall), без источников
-        // и с явной подписью, вместо потери цели.
+        // и с явной подписью, вместо потери цели. Пустая память — не повод
+        // молчать: то, что сказано в диалоге, есть в истории.
         let result = match result {
             Some(Ok(card))
                 if card.status == crate::cite::Status::Unknown
                     && mem.is_some()
-                    && !self.session.task_mem().is_empty() =>
+                    && !(self.session.task_mem().is_empty() && hist_in.is_empty()) =>
             {
                 let agent2 = self.prepared_agent();
                 let q2 = question.to_string();
@@ -2949,11 +2951,13 @@ impl App {
             Some(Ok(card)) => {
                 self.session.push_assistant(card.to_text());
                 let mut mem_note = String::new();
-                if mem.is_some() && card.status == crate::cite::Status::Answer && !card.from_memory {
+                if mem.is_some() && !card.from_memory {
                     match crate::chatmem::Extractor::new(&self.settings) {
                         Ok(extractor) => {
                             let cur = mem.unwrap_or_default();
-                            let (q2, ans) = (question.to_string(), card.answer.clone());
+                            // «Не знаю» ничего не утверждает — экстрактору только слова пользователя.
+                            let ans = if card.status == crate::cite::Status::Answer { card.answer.clone() } else { String::new() };
+                            let q2 = question.to_string();
                             match self.with_spinner(terminal, "память задачи", move || extractor.update(&cur, &q2, &ans)) {
                                 Some(Ok((new, _))) => self.session.set_task_mem(new),
                                 Some(Err(e)) => mem_note = format!(" · память не обновилась: {e}"),
@@ -2968,7 +2972,7 @@ impl App {
                 }
                 self.status = format!(
                     "{} · попыток {} · tokens: prompt={} completion={} · {}ms{mem_note}",
-                    if card.status == crate::cite::Status::Unknown { "не знаю" } else if card.grounded() { "ответ подтверждён цитатами" } else { "ответ НЕ подтверждён" },
+                    if card.status == crate::cite::Status::Unknown { "не знаю" } else if card.from_memory { "ответ из памяти задачи" } else if card.grounded() { "ответ подтверждён цитатами" } else { "ответ НЕ подтверждён" },
                     card.attempts,
                     card.prompt_tokens,
                     card.completion_tokens,
@@ -3142,8 +3146,8 @@ impl App {
                     self.save_session();
                     self.status = "память задачи RAG-чата очищена".into();
                 }
-                "" => self.entries.push(Entry::Info(self.session.task_mem().card())),
-                _ => self.status = "/rag mem [on|off|reset] — память задачи RAG-чата: цель, уточнения, ограничения, термины".into(),
+                "" | "show" => self.entries.push(Entry::Info(self.session.task_mem().card())),
+                _ => self.status = "/rag mem [show|on|off|reset] — память задачи RAG-чата: цель, уточнения, ограничения, термины".into(),
             },
             _ => self.status = RAG_USAGE.into(),
         }
@@ -5451,6 +5455,20 @@ fn cited_lines(card: &crate::cite::Card) -> Vec<Line<'static>> {
             out.push(rail("  \u{2502}  ", vec![Span::styled("\u{2192} ", muted()), Span::styled(n.clone(), muted())]));
         }
         out.push(rail("  \u{2570}\u{2500} ", vec![Span::styled("ответ из собственных знаний модели не выдаётся", muted())]));
+        return out;
+    }
+    // Задача 25: ответ из памяти задачи — источников-фрагментов у него нет
+    // по определению, так что вместо красных ✗ честная подпись, откуда он.
+    if card.from_memory {
+        for (i, line) in card.answer.lines().enumerate() {
+            let mut spans = vec![if i == 0 { Span::styled("\u{25cf} ", muted()) } else { Span::raw("  ") }];
+            spans.extend(with_marks(line, Style::default()));
+            out.push(Line::from(spans));
+        }
+        out.push(rail(
+            "  \u{2570}\u{2500} ",
+            vec![Span::styled("из памяти задачи: цель, договорённости и история этого диалога, а не фрагменты корпуса — источников нет", muted())],
+        ));
         return out;
     }
     let grounded = card.grounded();

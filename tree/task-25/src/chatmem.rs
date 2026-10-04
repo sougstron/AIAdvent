@@ -234,17 +234,20 @@ impl Extractor {
              Rules:\n\
              - goal: the user's overall objective in this dialogue, one sentence, in the user's language. Set it from \
              the first messages; change it only when the user explicitly changes the objective.\n\
-             - clarified: what the user has clarified about the task so far — short items, user's language. Add new \
-             ones, do not repeat.\n\
+             - clarified: what the user has clarified so far — about the task and about themselves and their \
+             situation (name, what they own or work on, background) — short items, user's language. Add new ones, \
+             do not repeat.\n\
              - constraints: fixed requirements the user stated (sizes, budget, latency, stack, format…). Never drop \
              one unless the user explicitly cancels it.\n\
-             - terms: terms this dialogue gave an agreed meaning to.\n\
+             - terms: terms this dialogue gave an agreed meaning to — the meaning must be stated by the user or by \
+             the assistant's answer; never fill a meaning from your own knowledge.\n\
+             - The assistant may have had no answer (shown as «(no answer)») — the user's statements still count.\n\
              - Keep every item under 200 characters; at most {MAX_CLARIFIED} clarified, {MAX_CONSTRAINTS} constraints, \
              {MAX_TERMS} terms.\n\n\
              Current memory:\n{}\n\nUser: {}\n\nAssistant: {}",
             serde_json::to_string(mem).unwrap_or_default(),
             question.trim(),
-            answer.trim()
+            if answer.trim().is_empty() { "(no answer)" } else { answer.trim() }
         );
         let o = self.agent.complete_outcome(&[ChatMessage::user(p)])?;
         let text = o.text();
@@ -265,8 +268,8 @@ const NOT_IN_MEMORY: &str = "NOT-IN-MEMORY";
 pub fn recall_prompt(question: &str, mem: &TaskMem) -> String {
     format!(
         "Answer the question using ONLY the task memory below and the conversation history above. \
-         The question is about what THIS dialogue agreed on (the goal, the fixed constraints, the terms, \
-         the clarifications) — not about the documents. Never add facts from your own knowledge. \
+         The question is about what THIS dialogue agreed on or what the user told in it (the goal, the fixed \
+         constraints, the terms, the clarifications, facts about the user) — not about the documents. Never add facts from your own knowledge. \
          Reply in the language of the question, short and to the point. \
          If the answer is not in the memory or the history, reply with exactly: {NOT_IN_MEMORY}\n\n{}\nQuestion: {}",
         mem.block().unwrap_or_default(),
@@ -354,12 +357,12 @@ impl Chat {
     }
 
     /// One turn. Retrieval sees the question plus the memory line; the model
-    /// sees the `<task-state>` block; after an answered turn the extractor
-    /// moves the state. A turn that ends in «не знаю» does not touch the
-    /// memory: a question without an answer carries nothing to fix. Особый
+    /// sees the `<task-state>` block; after every turn the extractor
+    /// moves the state — «не знаю» included: the user's message may still
+    /// carry the goal or facts about themselves. Особый
     /// случай: вопрос был о самих договорённостях («напомни, какой реранкер
     /// мы зафиксировали») — корпуса под ним нет по определению, поэтому порог
-    /// релевантности честно отвечает «не знаю». Тогда, при непустой памяти,
+    /// релевантности честно отвечает «не знаю». Тогда, при непустой памяти или истории,
     /// срабатывает [`recall`]: ответ строится из
     /// состояния и истории, без источников и с явной подписью — вместо
     /// потери цели диалога.
@@ -374,7 +377,7 @@ impl Chat {
         let mut card = cite::answer(&self.agent, self.checker.as_ref(), &wire, question, &got, self.idk, mem)?;
         let stage_tokens = got.prompt_tokens + got.completion_tokens;
         let context = got.kept.iter().map(ragqa::hit_line).collect();
-        if mem_on && card.status == Status::Unknown && !self.mem.is_empty() {
+        if mem_on && card.status == Status::Unknown && !(self.mem.is_empty() && self.history.is_empty()) {
             // Отказ recall (сеть, модель ответила NOT-IN-MEMORY) оставляет
             // честное «не знаю» — он строго безопаснее выдумки.
             if let Ok(Some(rc)) = recall(&self.agent, &self.history, &self.mem, question) {
@@ -384,9 +387,13 @@ impl Chat {
         let mut mem_error = None;
         let mut mem_tokens = 0;
         // Ход «из памяти» сам память не двигает: в нём нет ничего нового,
-        // он только пересказывает уже зафиксированное.
-        if mem_on && card.status == Status::Answer && !card.from_memory {
-            match self.extractor.update(&self.mem, question, &card.answer) {
+        // он только пересказывает уже зафиксированное. «Не знаю» — двигает:
+        // ответа в корпусе нет, но пользователь мог сказать о цели или о
+        // себе («меня зовут Шурик»), и это должно дожить до следующего хода.
+        if mem_on && !card.from_memory {
+            // «Не знаю» ничего не утверждает — экстрактору только слова пользователя.
+            let answer = if card.status == Status::Answer { card.answer.as_str() } else { "" };
+            match self.extractor.update(&self.mem, question, answer) {
                 Ok((new, u)) => {
                     self.mem = new;
                     mem_tokens = u.prompt_tokens + u.completion_tokens;
@@ -828,7 +835,7 @@ mod tests {
         assert!(p.contains("</task-state>"));
         assert!(p.contains("Goal of this dialogue: спроектировать Raft-сервис конфигураций"));
         assert!(p.ends_with("Question: какой кворум?"));
-        // пустое состояние → блока нет (recall тогда и не вызывается)
+        // пустое состояние → блока нет (recall тогда идёт по одной истории)
         let e = recall_prompt("q", &TaskMem::default());
         assert!(!e.contains("<task-state>"));
     }
