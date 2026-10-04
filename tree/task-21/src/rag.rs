@@ -10,6 +10,9 @@
 //!   `III. RETRIEVAL` / `A. Retrieval Source`, Markdown `#`); a section longer
 //!   than `struct_max` is split at sentence ends into `(part i/n)`.
 //!
+//! Every vector — document or query — is min-max normalized into `[0, 1]`
+//! ([`normalize`]) before it is stored or compared.
+//!
 //! Every chunk carries `chunk_id`, `source`, `file`, `title`, `section`
 //! (where it starts), `sections` (all it touches), pages and character
 //! offsets. [`compare`] measures both strategies on the same text: sizes,
@@ -91,8 +94,8 @@ impl Config {
 
     fn params(&self, s: Strategy) -> Value {
         match s {
-            Strategy::Fixed => json!({"size": self.size, "overlap": self.overlap}),
-            Strategy::Structure => json!({"struct_max": self.struct_max}),
+            Strategy::Fixed => json!({"size": self.size, "overlap": self.overlap, "norm": NORM}),
+            Strategy::Structure => json!({"struct_max": self.struct_max, "norm": NORM}),
         }
     }
 }
@@ -503,6 +506,26 @@ impl Embedder {
     }
 }
 
+/// Recorded in `runs.params`, so the index says how its vectors were scaled.
+pub const NORM: &str = "minmax-0-1";
+
+/// Min-max normalization of one vector into `[0, 1]`: `(x - min) / (max - min)`.
+/// Plain division by the largest component is not enough — embedding
+/// components are negative as often as positive, and those would stay below 0.
+/// A constant vector carries no direction and becomes all zeros.
+pub fn normalize(v: &mut [f32]) {
+    let (lo, hi) = v.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+    let span = hi - lo;
+    for x in v.iter_mut() {
+        *x = if span > 0.0 { (*x - lo) / span } else { 0.0 };
+    }
+}
+
+/// Smallest and largest component over a set of vectors.
+pub fn range(vs: &[Vec<f32>]) -> (f32, f32) {
+    vs.iter().flatten().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &x| (lo.min(x), hi.max(x)))
+}
+
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
     for (x, y) in a.iter().zip(b) {
@@ -694,8 +717,12 @@ pub fn index(cfg: &Config) -> Res<()> {
         println!("стратегия {} {}: {} чанков, эмбеддинги {} …", s.name(), cfg.params(s), chunks.len(), cfg.model);
         let inputs: Vec<String> = chunks.iter().map(|c| format!("{DOC_PREFIX}{}", c.text)).collect();
         let t = Instant::now();
-        let embs = embedder.embed(&inputs)?;
+        let mut embs = embedder.embed(&inputs)?;
         let embed_ms = t.elapsed().as_millis() as u64;
+        let (raw_lo, raw_hi) = range(&embs);
+        embs.iter_mut().for_each(|v| normalize(v));
+        let (lo, hi) = range(&embs);
+        println!("  нормализация min-max: компоненты [{raw_lo:.3}; {raw_hi:.3}] → [{lo:.3}; {hi:.3}]");
         let dim = embs.first().map(|v| v.len()).unwrap_or(0);
         let run = Run {
             strategy: s.name().into(),
@@ -824,6 +851,18 @@ pub fn compare(cfg: &Config) -> Res<()> {
     if runs.is_empty() {
         return Err(format!("{}: index is empty, run --rag-index first", cfg.db.display()));
     }
+    // Checked on the stored data, not on a flag: an index built before
+    // normalization would be compared against normalized queries.
+    for (r, _, embs) in &runs {
+        let (lo, hi) = range(embs);
+        if lo < 0.0 || hi > 1.0 {
+            return Err(format!(
+                "{}: strategy {} has components in [{lo:.3}; {hi:.3}], not normalized — run --rag-index again",
+                cfg.db.display(),
+                r.strategy
+            ));
+        }
+    }
     let qpath = cfg.dir.join("questions.json");
     let questions: Vec<Question> = match std::fs::read_to_string(&qpath) {
         Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{}: {e}", qpath.display()))?,
@@ -850,6 +889,10 @@ pub fn compare(cfg: &Config) -> Res<()> {
     row("избыточность (Σ чанков / текст)", &|i| format!("{:.2}×", st[i].redundancy));
     row("пересекают границу раздела", &|i| pct(st[i].crossing, st[i].chunks));
     row("обрываются посреди предложения", &|i| pct(st[i].mid_sentence, st[i].chunks));
+    row("компоненты векторов min / max (нормализация min-max)", &|i| {
+        let (lo, hi) = range(&runs[i].2);
+        format!("{lo:.3} / {hi:.3}")
+    });
     row("время эмбеддингов", &|i| {
         format!("{} мс ({:.0} мс/чанк)", runs[i].0.embed_ms, runs[i].0.embed_ms as f64 / st[i].chunks.max(1) as f64)
     });
@@ -858,7 +901,8 @@ pub fn compare(cfg: &Config) -> Res<()> {
     if !questions.is_empty() {
         let embedder = Embedder::new(&cfg.url, &runs[0].0.model);
         let inputs: Vec<String> = questions.iter().map(|q| format!("{QUERY_PREFIX}{}", q.q)).collect();
-        let qvecs = embedder.embed(&inputs)?;
+        let mut qvecs = embedder.embed(&inputs)?;
+        qvecs.iter_mut().for_each(|v| normalize(v));
         for (_, chunks, embs) in &runs {
             probes.push(probe(&questions, &qvecs, chunks, embs));
         }
@@ -1022,6 +1066,21 @@ mod tests {
         let (text, pages) = join_pages("page one\n\u{c}page two\n\u{c}");
         assert_eq!(pages, vec![0, 9]);
         assert_eq!(&text[9..17], "page two");
+    }
+
+    #[test]
+    fn normalize_maps_components_into_unit_range() {
+        let mut v = vec![-0.5, 0.0, 1.5, 0.25];
+        normalize(&mut v);
+        assert_eq!(v, vec![0.0, 0.25, 1.0, 0.375]);
+        // dividing by the max alone would leave -0.5 / 1.5 < 0
+        let mut flat = vec![0.3; 4];
+        normalize(&mut flat);
+        assert_eq!(flat, vec![0.0; 4]);
+        let mut vs = vec![vec![-2.0, 3.0, 0.5], vec![0.01, -0.02, 0.07]];
+        vs.iter_mut().for_each(|v| normalize(v));
+        assert_eq!(range(&vs), (0.0, 1.0));
+        assert!(vs.iter().all(|v| v.contains(&0.0) && v.contains(&1.0)));
     }
 
     #[test]
