@@ -262,28 +262,100 @@ impl Extractor {
 /// Маркер отказа: ответа в памяти и истории нет.
 const NOT_IN_MEMORY: &str = "NOT-IN-MEMORY";
 
-/// The recall prompt: the whole dialogue plus the state block plus a strict
-/// «только из памяти» contract. Отдельная чистая функция — чтобы офлайн-тест
-/// видел контракт и границы блока.
-pub fn recall_prompt(question: &str, mem: &TaskMem) -> String {
+/// Записи памяти диалога, на которые может сослаться ответ из памяти:
+/// пункты состояния задачи и реплики пользователя из истории, по порядку.
+/// Номер записи в промпте — `[M{i+1}]`.
+pub fn memory_entries(mem: &TaskMem, history: &[ChatMessage]) -> Vec<(String, String)> {
+    let mut out = vec![];
+    if !mem.goal.is_empty() {
+        out.push(("цель".to_string(), mem.goal.clone()));
+    }
+    out.extend(mem.clarified.iter().map(|x| ("уточнено".to_string(), x.clone())));
+    out.extend(mem.constraints.iter().map(|x| ("ограничение".to_string(), x.clone())));
+    out.extend(mem.terms.iter().map(|t| ("термин".to_string(), format!("{} = {}", t.term, t.meaning))));
+    let users = history.iter().filter(|m| m.role == crate::api::Role::User);
+    out.extend(users.enumerate().map(|(k, m)| (format!("реплика пользователя №{}", k + 1), clean(&m.content))));
+    out
+}
+
+/// The recall prompt: the numbered memory entries plus a strict «только из
+/// памяти, со ссылкой на запись и дословной цитатой» contract. Отдельная
+/// чистая функция — чтобы офлайн-тест видел контракт и нумерацию.
+pub fn recall_prompt(question: &str, entries: &[(String, String)]) -> String {
+    let list: String = entries.iter().enumerate().map(|(i, (kind, text))| format!("[M{}] {kind}: {text}\n", i + 1)).collect();
     format!(
-        "Answer the question using ONLY the task memory below and the conversation history above. \
-         The question is about what THIS dialogue agreed on or what the user told in it (the goal, the fixed \
-         constraints, the terms, the clarifications, facts about the user) — not about the documents. Never add facts from your own knowledge. \
-         Reply in the language of the question, short and to the point. \
-         If the answer is not in the memory or the history, reply with exactly: {NOT_IN_MEMORY}\n\n{}\nQuestion: {}",
-        mem.block().unwrap_or_default(),
+        "Answer the question using ONLY the numbered memory entries of this dialogue below (the task memory and \
+         the user's own messages). The question is about what THIS dialogue agreed on or what the user told in it \
+         (the goal, the fixed constraints, the terms, the clarifications, facts about the user) — not about the \
+         documents. Never add facts from your own knowledge. Reply with ONE JSON object and nothing else:\n\
+         {{\"answer\":\"…\",\"sources\":[{{\"n\":1,\"quote\":\"…\"}}]}}\n\
+         - answer: in the language of the question, short and to the point.\n\
+         - sources: every entry the answer relies on — n is the entry number (M1 → 1), quote copies the supporting \
+         words of THAT entry verbatim.\n\
+         If the answer is not in the entries, reply with exactly: {NOT_IN_MEMORY}\n\n\
+         Memory entries:\n{list}\nQuestion: {}",
         question.trim()
     )
 }
 
+#[derive(Deserialize)]
+struct RawRecall {
+    #[serde(default)]
+    answer: String,
+    #[serde(default)]
+    sources: Vec<RawMemRef>,
+}
+
+#[derive(Deserialize)]
+struct RawMemRef {
+    #[serde(default)]
+    n: Value,
+    #[serde(default)]
+    quote: String,
+}
+
+/// Минимум букв/цифр в цитате из памяти: записи памяти короткие («зовут
+/// Шурик»), порог корпусных цитат тут не подходит, но одна-две буквы не
+/// доказывают ничего.
+const MIN_MEM_QUOTE: usize = 3;
+
+/// The model proposes, the code disposes: the recall reply → the answer and
+/// the memory sources it cited, each quote checked against its entry.
+/// Ссылки на несуществующие записи отбрасываются. Ответ не в JSON — текст
+/// целиком как ответ без источников (карточка покажет «НЕ подтверждён»).
+pub fn parse_recall(text: &str, entries: &[(String, String)]) -> (String, Vec<cite::MemSource>) {
+    let raw = text.find('{').zip(text.rfind('}')).and_then(|(a, b)| serde_json::from_str::<RawRecall>(text.get(a..=b)?).ok());
+    let Some(raw) = raw.filter(|r| !r.answer.trim().is_empty()) else { return (text.trim().to_string(), vec![]) };
+    let mut out: Vec<cite::MemSource> = vec![];
+    for r in raw.sources {
+        let n = match &r.n {
+            Value::Number(x) => x.as_u64().map(|x| x as usize),
+            Value::String(x) => x.trim().trim_start_matches(['M', 'm', 'М', 'м']).parse().ok(),
+            _ => None,
+        };
+        let Some((n, (kind, entry))) = n.and_then(|n| Some((n, entries.get(n.checked_sub(1)?)?))) else { continue };
+        if out.iter().any(|m| m.n == n) {
+            continue;
+        }
+        let q = cite::compact(&r.quote);
+        let quote_ok = q.chars().count() >= MIN_MEM_QUOTE && cite::compact(entry).contains(&q);
+        out.push(cite::MemSource { n, kind: kind.clone(), text: entry.clone(), quote: clean(&r.quote), quote_ok });
+    }
+    (raw.answer.trim().to_string(), out)
+}
+
 /// Ответ «из памяти задачи»: вопрос про договорённости, а не про корпус.
+/// Источники ответа — записи памяти диалога (`memory_entries`) с цитатами.
 /// `Ok(None)` — модель честно сказала, что в памяти этого нет: вызывающий
 /// оставляет исходное «не знаю». Та же модель, что у ответов; температура 0,
 /// чтобы пересказ состояния был буквальным.
 pub fn recall(agent: &Agent, history: &[ChatMessage], mem: &TaskMem, question: &str) -> Res<Option<Card>> {
+    let entries = memory_entries(mem, history);
+    if entries.is_empty() {
+        return Ok(None);
+    }
     let mut wire = history.to_vec();
-    wire.push(ChatMessage::user(recall_prompt(question, mem)));
+    wire.push(ChatMessage::user(recall_prompt(question, &entries)));
     // Пересказ зафиксированного — задача буквальная, температура 0.
     let mut agent = agent.clone();
     agent.settings_mut().temperature = Some(0.0);
@@ -293,7 +365,8 @@ pub fn recall(agent: &Agent, history: &[ChatMessage], mem: &TaskMem, question: &
     if text.contains(NOT_IN_MEMORY) {
         return Ok(None);
     }
-    Ok(Some(Card::recall(&text, &o.usage, start.elapsed().as_millis())))
+    let (answer, sources) = parse_recall(&text, &entries);
+    Ok(Some(Card::recall(&answer, sources, &o.usage, start.elapsed().as_millis())))
 }
 
 // ---------------------------------------------------------------- the chat
@@ -364,7 +437,7 @@ impl Chat {
     /// мы зафиксировали») — корпуса под ним нет по определению, поэтому порог
     /// релевантности честно отвечает «не знаю». Тогда, при непустой памяти или истории,
     /// срабатывает [`recall`]: ответ строится из
-    /// состояния и истории, без источников и с явной подписью — вместо
+    /// состояния и истории, с записями памяти диалога как источниками — вместо
     /// потери цели диалога.
     pub fn turn(&mut self, question: &str) -> Res<Turn> {
         let mem_on = self.settings.chatmem;
@@ -600,8 +673,9 @@ pub fn eval(settings: &Settings, paths: &crate::rag::Config, only: &[usize]) -> 
                             Status::Answer => "answer".into(),
                             Status::Unknown => "unknown".into(),
                         },
-                        sources: c.sources.len(),
-                        sources_ok: c.sources.iter().filter(|s| s.id_ok).count(),
+                        // ответ из памяти: источники — записи памяти диалога
+                        sources: if c.from_memory { c.mem_sources.len() } else { c.sources.len() },
+                        sources_ok: if c.from_memory { c.mem_sources.iter().filter(|m| m.quote_ok).count() } else { c.sources.iter().filter(|s| s.id_ok).count() },
                         quotes_ok: c.check.as_ref().is_some_and(|k| k.quotes > 0 && k.quotes_ok == k.quotes),
                         numbers_ok: c.check.as_ref().is_some_and(|k| k.unbacked.is_empty()),
                         judge: judge_label(c),
@@ -825,28 +899,65 @@ mod tests {
     }
 
     #[test]
-    fn recall_prompt_carries_the_contract_and_the_exact_state_block() {
-        let p = recall_prompt("какой кворум?", &mem());
-        assert!(p.contains("ONLY the task memory"));
-        assert!(p.contains(NOT_IN_MEMORY));
-        // блок состояния вставлен ровно один раз и целиком, от <task-state>
-        // до </task-state> — граница та же, что у генерационного промпта.
-        assert_eq!(p.matches("<task-state>").count(), 1);
-        assert!(p.contains("</task-state>"));
-        assert!(p.contains("Goal of this dialogue: спроектировать Raft-сервис конфигураций"));
-        assert!(p.ends_with("Question: какой кворум?"));
-        // пустое состояние → блока нет (recall тогда идёт по одной истории)
-        let e = recall_prompt("q", &TaskMem::default());
-        assert!(!e.contains("<task-state>"));
+    fn memory_entries_number_the_state_and_the_user_replies_only() {
+        let hist = vec![ChatMessage::user("меня  зовут Шурик"), ChatMessage::assistant("Не знаю: …"), ChatMessage::user("какой кворум?")];
+        let e = memory_entries(&mem(), &hist);
+        assert_eq!(e[0], ("цель".to_string(), "спроектировать Raft-сервис конфигураций".to_string()));
+        assert!(e.iter().any(|(k, t)| k == "ограничение" && t == "ровно 5 узлов"));
+        assert!(e.iter().any(|(k, t)| k == "термин" && t == "кворум = 3 из 5"));
+        // ответы ассистента — не записи памяти; реплики пользователя — да, по порядку
+        assert!(!e.iter().any(|(_, t)| t.starts_with("Не знаю")));
+        assert_eq!(e[e.len() - 2], ("реплика пользователя №1".to_string(), "меня зовут Шурик".to_string()));
+        assert_eq!(e.last().unwrap().0, "реплика пользователя №2");
+        assert!(memory_entries(&TaskMem::default(), &[]).is_empty());
     }
 
     #[test]
-    fn recall_card_is_marked_and_to_text_has_no_fake_sources() {
-        let c = Card::recall("кворум — 3, как договорились", &Usage::default(), 7);
-        assert!(c.from_memory && c.sources.is_empty());
+    fn recall_prompt_carries_the_contract_and_the_numbered_entries() {
+        let e = memory_entries(&mem(), &[ChatMessage::user("меня зовут Шурик")]);
+        let p = recall_prompt("какой кворум?", &e);
+        assert!(p.contains("ONLY the numbered memory entries"));
+        assert!(p.contains(NOT_IN_MEMORY));
+        assert!(p.contains("\"sources\""));
+        assert!(p.contains("[M1] цель: спроектировать Raft-сервис конфигураций\n"));
+        assert!(p.contains(&format!("[M{}] реплика пользователя №1: меня зовут Шурик\n", e.len())));
+        assert!(p.ends_with("Question: какой кворум?"));
+    }
+
+    #[test]
+    fn parse_recall_checks_every_memory_quote_against_its_entry() {
+        let e = memory_entries(&mem(), &[ChatMessage::user("меня зовут Шурик")]);
+        let last = e.len();
+        let reply = format!(
+            "```json\n{{\"answer\":\"Вас зовут Шурик, кворум — 3 из 5.\",\"sources\":[\
+             {{\"n\":{last},\"quote\":\"зовут Шурик\"}},{{\"n\":\"M{last}\",\"quote\":\"dup\"}},\
+             {{\"n\":1,\"quote\":\"кворум 3 из 5\"}},{{\"n\":99,\"quote\":\"нет такой записи\"}}]}}```"
+        );
+        let (answer, src) = parse_recall(&reply, &e);
+        assert_eq!(answer, "Вас зовут Шурик, кворум — 3 из 5.");
+        // M99 отброшен, дубликат M{last} тоже; цитата к цели — не из цели
+        assert_eq!(src.len(), 2);
+        assert!(src[0].n == last && src[0].quote_ok && src[0].kind == "реплика пользователя №1");
+        assert!(src[1].n == 1 && !src[1].quote_ok);
+        // не JSON — ответ без источников, не выдуманные ссылки
+        let (a, s) = parse_recall("Вас зовут Шурик", &e);
+        assert_eq!(a, "Вас зовут Шурик");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn recall_card_lists_memory_sources_and_never_corpus_ones() {
+        let src = cite::MemSource { n: 2, kind: "термин".into(), text: "кворум = 3 из 5".into(), quote: "3 из 5".into(), quote_ok: true };
+        let c = Card::recall("кворум — 3, как договорились", vec![src], &Usage::default(), 7);
+        assert!(c.from_memory && c.sources.is_empty() && c.memory_backed());
         let t = c.to_text();
-        assert!(t.contains("Из памяти задачи"));
-        assert!(!t.contains("Источники:") && !t.contains("Проверка:"));
+        assert!(t.contains("Источники (память диалога):\n  [M2] термин: кворум = 3 из 5 · «3 из 5» ✓"));
+        assert!(t.contains("Из памяти задачи: ответ дан из памяти этого диалога"));
+        assert!(!t.contains("Проверка:"));
+        // без записи памяти — честное «НЕ подтверждён»
+        let bare = Card::recall("кворум — 3", vec![], &Usage::default(), 7);
+        assert!(!bare.memory_backed());
+        assert!(bare.to_text().contains("НЕ подтверждён"));
     }
 
     #[test]

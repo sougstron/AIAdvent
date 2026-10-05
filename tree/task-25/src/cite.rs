@@ -232,7 +232,7 @@ pub fn parse(text: &str) -> Option<Raw> {
 
 /// Letters and digits only, lowercased: what survives pdftotext's line
 /// breaks, hyphenation and the model's choice of quote marks and dashes.
-fn compact(s: &str) -> String {
+pub(crate) fn compact(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
@@ -334,6 +334,23 @@ pub struct Source {
     pub relevance: String,
 }
 
+/// Задача 25: источник ответа «из памяти задачи» — запись памяти диалога
+/// (пункт состояния задачи или реплика пользователя), на которую сослалась
+/// модель, и дословная цитата из неё.
+#[derive(Clone, Debug, Serialize)]
+pub struct MemSource {
+    /// Номер записи в списке, который видела модель (`[M1]`…).
+    pub n: usize,
+    /// «цель», «уточнено», «ограничение», «термин», «реплика пользователя №k».
+    pub kind: String,
+    /// Запись памяти целиком.
+    pub text: String,
+    /// Что модель привела в подтверждение.
+    pub quote: String,
+    /// Цитата действительно есть в этой записи (буквы и цифры, без регистра).
+    pub quote_ok: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Quote {
     pub n: usize,
@@ -432,6 +449,10 @@ pub struct Card {
     /// `chatmem::Chat::recall`, когда вопрос — о договорённостях.
     #[serde(default)]
     pub from_memory: bool,
+    /// Источники ответа из памяти: записи памяти диалога с проверенными
+    /// цитатами. Пусто у обычных ответов.
+    #[serde(default)]
+    pub mem_sources: Vec<MemSource>,
     /// Usage of the first attempt alone — the one whose prompt the chat
     /// measured, for the footer's chars-per-token calibration.
     #[serde(skip)]
@@ -461,15 +482,21 @@ impl Card {
             finish_reason: None,
             raw: String::new(),
             from_memory: false,
+            mem_sources: vec![],
             first_usage: Usage::default(),
         }
     }
 
     /// Задача 25: карточка ответа «из памяти задачи» (chatmem.rs). Вопрос
     /// был о договорённостях диалога: корпуса под ним нет по определению,
-    /// поэтому источников нет и строка «Проверка» заменена подписью.
-    pub fn recall(answer: &str, usage: &Usage, ms: u128) -> Card {
-        Card { status: Status::Answer, by: None, answer: answer.trim().to_string(), sources: vec![], quotes: vec![], clarify: None, why: None, nearest: vec![], check: None, support: None, retried: vec![], attempts: 0, prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, ms, finish_reason: None, raw: String::new(), from_memory: true, first_usage: *usage }
+    /// поэтому источники — записи памяти диалога, а не фрагменты.
+    pub fn recall(answer: &str, mem_sources: Vec<MemSource>, usage: &Usage, ms: u128) -> Card {
+        Card { status: Status::Answer, by: None, answer: answer.trim().to_string(), sources: vec![], quotes: vec![], clarify: None, why: None, nearest: vec![], check: None, support: None, retried: vec![], attempts: 0, prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, ms, finish_reason: None, raw: String::new(), from_memory: true, mem_sources, first_usage: *usage }
+    }
+
+    /// Ответ из памяти, и каждая его ссылка на память подтверждена цитатой.
+    pub fn memory_backed(&self) -> bool {
+        self.from_memory && !self.mem_sources.is_empty() && self.mem_sources.iter().all(|m| m.quote_ok)
     }
 
     /// Answered, and every part of the answer checks out.
@@ -545,9 +572,19 @@ impl Card {
             }
         }
         if self.from_memory {
-            // Из памяти задачи: источники-фрагменты сюда не приложишь, так
-            // что подпись честно говорит, откуда ответ.
-            s += "\n\nИз памяти задачи: ответ дан из цели и договорённостей этого диалога, а не из фрагментов корпуса — источников нет.";
+            // Из памяти задачи: источники — записи памяти диалога, а не
+            // фрагменты корпуса; подпись честно говорит, откуда ответ.
+            if !self.mem_sources.is_empty() {
+                s += "\n\nИсточники (память диалога):";
+                for m in &self.mem_sources {
+                    s += &format!("\n  [M{}] {}: {} · «{}» {}", m.n, m.kind, m.text, m.quote.trim(), if m.quote_ok { '✓' } else { '✗' });
+                }
+            }
+            s += if self.memory_backed() {
+                "\n\nИз памяти задачи: ответ дан из памяти этого диалога, а не из фрагментов корпуса."
+            } else {
+                "\n\nИз памяти задачи: ответ НЕ подтверждён — модель не привела запись памяти с дословной цитатой."
+            };
         } else {
             let v = self.verdict();
             if !v.is_empty() {
@@ -650,6 +687,7 @@ pub fn verify(text: &str, question: &str, hits: &[Hit]) -> Card {
         finish_reason: None,
         raw: text.to_string(),
         from_memory: false,
+        mem_sources: vec![],
         first_usage: Usage::default(),
     }
 }

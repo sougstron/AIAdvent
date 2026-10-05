@@ -2928,8 +2928,8 @@ impl App {
         });
         // Задача 25: вопрос был про договорённости диалога — корпуса под ним
         // нет, порог честно сказал «не знаю». При непустой памяти задачи
-        // отвечаем из состояния и истории (chatmem::recall), без источников
-        // и с явной подписью, вместо потери цели. Пустая память — не повод
+        // отвечаем из состояния и истории (chatmem::recall); источники ответа —
+        // записи памяти диалога с цитатами. Пустая память — не повод
         // молчать: то, что сказано в диалоге, есть в истории.
         let result = match result {
             Some(Ok(card))
@@ -2972,7 +2972,7 @@ impl App {
                 }
                 self.status = format!(
                     "{} · попыток {} · tokens: prompt={} completion={} · {}ms{mem_note}",
-                    if card.status == crate::cite::Status::Unknown { "не знаю" } else if card.from_memory { "ответ из памяти задачи" } else if card.grounded() { "ответ подтверждён цитатами" } else { "ответ НЕ подтверждён" },
+                    if card.status == crate::cite::Status::Unknown { "не знаю" } else if card.memory_backed() { "ответ из памяти задачи, подтверждён записями памяти" } else if card.from_memory { "ответ из памяти задачи НЕ подтверждён" } else if card.grounded() { "ответ подтверждён цитатами" } else { "ответ НЕ подтверждён" },
                     card.attempts,
                     card.prompt_tokens,
                     card.completion_tokens,
@@ -5457,17 +5457,48 @@ fn cited_lines(card: &crate::cite::Card) -> Vec<Line<'static>> {
         out.push(rail("  \u{2570}\u{2500} ", vec![Span::styled("ответ из собственных знаний модели не выдаётся", muted())]));
         return out;
     }
-    // Задача 25: ответ из памяти задачи — источников-фрагментов у него нет
-    // по определению, так что вместо красных ✗ честная подпись, откуда он.
+    // Задача 25: ответ из памяти задачи — его источники не фрагменты корпуса,
+    // а записи памяти диалога с дословными цитатами из них.
     if card.from_memory {
+        let backed = card.memory_backed();
+        let marker = Span::styled("\u{25cf} ", if backed { accent() } else { warn() });
         for (i, line) in card.answer.lines().enumerate() {
-            let mut spans = vec![if i == 0 { Span::styled("\u{25cf} ", muted()) } else { Span::raw("  ") }];
+            let mut spans = vec![if i == 0 { marker.clone() } else { Span::raw("  ") }];
             spans.extend(with_marks(line, Style::default()));
             out.push(Line::from(spans));
         }
+        out.push(rail("  \u{256d}\u{2500} ", vec![Span::styled("источники: память диалога", accent().add_modifier(Modifier::BOLD))]));
+        if card.mem_sources.is_empty() {
+            out.push(rail("  \u{2502} ", vec![Span::styled("\u{2717} модель не указала ни одной записи памяти", bad())]));
+        }
+        for m in &card.mem_sources {
+            out.push(rail(
+                "  \u{2502} ",
+                vec![
+                    Span::styled(format!("[M{}] ", m.n), accent().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{}: ", m.kind), muted()),
+                    Span::raw(m.text.clone()),
+                ],
+            ));
+            out.push(rail(
+                "  \u{2502}   ",
+                vec![
+                    if m.quote_ok { Span::styled("\u{2713} ", good()) } else { Span::styled("\u{2717} ", bad()) },
+                    Span::styled(format!("«{}»", m.quote), muted()),
+                    if m.quote_ok { Span::raw("") } else { Span::styled("  нет в этой записи дословно", bad()) },
+                ],
+            ));
+        }
         out.push(rail(
             "  \u{2570}\u{2500} ",
-            vec![Span::styled("из памяти задачи: цель, договорённости и история этого диалога, а не фрагменты корпуса — источников нет", muted())],
+            vec![Span::styled(
+                if backed {
+                    "из памяти задачи: ответ из памяти этого диалога, а не из фрагментов корпуса"
+                } else {
+                    "из памяти задачи: ответ НЕ подтверждён записью памяти"
+                },
+                if backed { muted() } else { warn() },
+            )],
         ));
         return out;
     }
