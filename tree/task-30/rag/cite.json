@@ -1,0 +1,1086 @@
+{
+  "idk": {
+    "llm": 7,
+    "z": 3.0
+  },
+  "model": "glm-5.3-flash",
+  "pipeline": {
+    "filter": "both",
+    "k": 4,
+    "min_llm": 5,
+    "min_z": 2.5,
+    "pool": 20,
+    "rewrite": false
+  },
+  "rows": [
+    {
+      "card": {
+        "answer": "Raft recommends a conservative election timeout of 150–300ms [2]. Timeouts are chosen randomly from this fixed interval to prevent split votes: randomization spreads out servers so usually only one times out first, wins, and sends heartbeats before others time out, and candidates restart their randomized timeout before retrying, reducing the chance of another split vote [1]. Randomization also makes split votes unlikely given the timing requirement (broadcast time an order of magnitude below the election timeout) [3].",
+        "attempts": 2,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 2,
+          "quotes": 5,
+          "quotes_ok": 5,
+          "sources": 3,
+          "sources_ok": 3,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 805,
+        "finish_reason": "stop",
+        "ms": 19046,
+        "nearest": [],
+        "prompt_tokens": 3890,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms)."
+          },
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "This spreads out the servers so that in most cases only a single server will time out; it wins the election and sends heartbeats before any other servers time out."
+          },
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "Each candidate restarts its randomized election timeout at the start of an election, and it waits for that timeout to elapse before starting the next election; this reduces the likelihood of another split vote in the new election."
+          },
+          {
+            "found": "verbatim",
+            "n": 2,
+            "text": "We recommend using a conservative election timeout such as 150–300ms; such timeouts are unlikely to cause unnecessary leader changes and will still provide good availability."
+          },
+          {
+            "found": "verbatim",
+            "n": 3,
+            "text": "given the randomized approach used for election timeouts, this inequality also makes split votes unlikely."
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"Raft recommends a conservative election timeout of 150–300ms [2]. Timeouts are chosen randomly from this fixed interval to prevent split votes: randomization spreads out servers so usually only one times out first, wins, and sends heartbeats before others time out, and candidates restart their randomized timeout before retrying, reducing the chance of another split vote [1]. Randomization also makes split votes unlikely given the timing requirement (broadcast time an order of magnitude below the election timeout) [3].\",\"sources\":[{\"n\":1,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0034\"},{\"n\":2,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0092\"},{\"n\":3,\"source\":\"raft-consensus.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-raft-consensus-0063\"}],\"quotes\":[{\"n\":1,\"text\":\"To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms).\"},{\"n\":1,\"text\":\"This spreads out the servers so that in most cases only a single server will time out; it wins the election and sends heartbeats before any other servers time out.\"},{\"n\":1,\"text\":\"Each candidate restarts its randomized election timeout at the start of an election, and it waits for that timeout to elapse before starting the next election; this reduces the likelihood of another split vote in the new election.\"},{\"n\":2,\"text\":\"We recommend using a conservative election timeout such as 150–300ms; such timeouts are unlikely to cause unnecessary leader changes and will still provide good availability.\"},{\"n\":3,\"text\":\"given the randomized approach used for election timeouts, this inequality also makes split votes unlikely.\"}]}",
+        "retried": [
+          "судья: не в цитатах — candidates restart their randomized timeout before retrying, reducing the chance of another split vote; usually only one server times out first, wins, and sends heartbeats before others time out"
+        ],
+        "sources": [
+          {
+            "chunk_id": "fixed-raft-consensus-0034",
+            "file": "raft-consensus.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 6",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          },
+          {
+            "chunk_id": "fixed-raft-consensus-0092",
+            "file": "raft-consensus.pdf",
+            "id_ok": true,
+            "n": 2,
+            "pages": "стр. 15",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          },
+          {
+            "chunk_id": "fixed-raft-consensus-0063",
+            "file": "raft-consensus.pdf",
+            "id_ok": true,
+            "n": 3,
+            "pages": "стр. 10–11",
+            "relevance": "llm 7",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#1 cos 0.9960 z 3.74 llm 10 · raft-consensus.pdf — Front matter, стр. 6 · 998 симв.",
+        "#2 cos 0.9948 z 3.35 llm 10 · raft-consensus.pdf — Front matter, стр. 15 · 996 симв.",
+        "#3 cos 0.9946 z 3.31 llm 7 · raft-consensus.pdf — Front matter, стр. 10–11 · 1000 симв.",
+        "#4 cos 0.9939 z 3.09 llm 7 · raft-consensus.pdf — Front matter, стр. 15 · 994 симв."
+      ],
+      "covered": 3,
+      "error": null,
+      "expect": "Election timeouts are chosen randomly from a fixed interval such as 150–300 ms, so that split votes are rare and resolved quickly (usually a single server times out first and wins).",
+      "id": "1",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "150",
+        "300",
+        "split vote"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What randomized election timeout range does Raft recommend, and why are the timeouts randomized?",
+      "stage_tokens": 3425
+    },
+    {
+      "card": {
+        "answer": "The initial black holes had masses of 36 M☉ and 29 M☉, the final black hole had a mass of 62 M☉, and 3.0 M☉ c² was radiated in gravitational waves [1].",
+        "attempts": 2,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 4,
+          "quotes": 3,
+          "quotes_ok": 2,
+          "sources": 1,
+          "sources_ok": 1,
+          "unbacked": [
+            "62"
+          ]
+        },
+        "clarify": null,
+        "completion_tokens": 531,
+        "finish_reason": "stop",
+        "ms": 14234,
+        "nearest": [],
+        "prompt_tokens": 2627,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "the initial black hole masses are 36−4 M⊙ and 29−4 M ⊙ , and the final black hole mass is"
+          },
+          {
+            "found": "short",
+            "n": 1,
+            "text": "62þ4"
+          },
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "−4 M ⊙ , with 3.0−0.5 M ⊙ c radiated in gravitational waves."
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"The initial black holes had masses of 36 M☉ and 29 M☉, the final black hole had a mass of 62 M☉, and 3.0 M☉ c² was radiated in gravitational waves [1].\",\"sources\":[{\"n\":1,\"source\":\"gw150914-ligo-1602.03837.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-gw150914-ligo-1602.03837-0001\"}],\"quotes\":[{\"n\":1,\"text\":\"the initial black hole masses are 36−4 M⊙ and 29−4 M ⊙ , and the final black hole mass is\"},{\"n\":1,\"text\":\"62þ4\"},{\"n\":1,\"text\":\"−4 M ⊙ , with 3.0−0.5 M ⊙ c radiated in gravitational waves.\"}]}",
+        "retried": [
+          "quote [1] «the initial black hole masses are 36−4 M⊙ and 29−4 M ⊙ , and the final black hole mass is 62þ4 −4 M ⊙ , with 3.0−0.5 M ⊙ c radiated in gravitational waves.» is not in any excerpt — copy it character for character",
+          "numbers 36, 29, 62, 30 of the answer are in none of the quotes — quote where they come from or drop them"
+        ],
+        "sources": [
+          {
+            "chunk_id": "fixed-gw150914-ligo-1602.03837-0001",
+            "file": "gw150914-ligo-1602.03837.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 1",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#3 cos 0.9876 z 4.25 llm 10 · gw150914-ligo-1602.03837.pdf — Front matter, стр. 1 · 994 симв.",
+        "#4 cos 0.9872 z 4.12 llm 7 · gw150914-ligo-1602.03837.pdf — V. SEARCHES > B. Binary coalescence search, стр. 7 · 993 симв."
+      ],
+      "covered": 4,
+      "error": null,
+      "expect": "Initial black holes of 36 and 29 solar masses, a final black hole of 62 solar masses, and about 3.0 solar masses radiated in gravitational waves.",
+      "id": "3",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "36",
+        "29",
+        "62",
+        "3.0|3 solar|three solar|3 m"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What were the masses of the two black holes in GW150914, the mass of the final black hole, and how much mass was radiated as gravitational waves?",
+      "stage_tokens": 6100
+    },
+    {
+      "card": {
+        "answer": "AlphaZero searches 80 thousand positions per second in chess and 40 thousand in shogi, compared to 70 million for Stockfish and 35 million for Elmo [1].",
+        "attempts": 1,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 4,
+          "quotes": 1,
+          "quotes_ok": 1,
+          "sources": 1,
+          "sources_ok": 1,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 157,
+        "finish_reason": "stop",
+        "ms": 5934,
+        "nearest": [],
+        "prompt_tokens": 1758,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "AlphaZero searches just 80 thousand positions per second in chess and 40 thousand in shogi, compared to 70 million for Stockfish and 35 million for Elmo."
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"AlphaZero searches 80 thousand positions per second in chess and 40 thousand in shogi, compared to 70 million for Stockfish and 35 million for Elmo [1].\",\"sources\":[{\"n\":1,\"source\":\"alphazero-chess-shogi-1712.01815.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-alphazero-chess-shogi-1712.01815-0016\"}],\"quotes\":[{\"n\":1,\"text\":\"AlphaZero searches just 80 thousand positions per second in chess and 40 thousand in shogi, compared to 70 million for Stockfish and 35 million for Elmo.\"}]}",
+        "retried": [],
+        "sources": [
+          {
+            "chunk_id": "fixed-alphazero-chess-shogi-1712.01815-0016",
+            "file": "alphazero-chess-shogi-1712.01815.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 5",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#1 cos 0.9978 z 4.69 llm 10 · alphazero-chess-shogi-1712.01815.pdf — Front matter, стр. 5 · 999 симв.",
+        "#2 cos 0.9958 z 4.05 llm 10 · alphazero-chess-shogi-1712.01815.pdf — Front matter, стр. 5 · 999 симв.",
+        "#4 cos 0.9953 z 3.90 llm 10 · alphazero-chess-shogi-1712.01815.pdf — Front matter, стр. 18–19 · 909 симв."
+      ],
+      "covered": 4,
+      "error": null,
+      "expect": "AlphaZero searches about 80 thousand positions per second in chess and 40 thousand in shogi, versus 70 million for Stockfish and 35 million for Elmo.",
+      "id": "5",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "80",
+        "40",
+        "70 million|70,000,000|70m",
+        "35 million|35,000,000|35m"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "How many positions per second does AlphaZero search in chess and shogi, compared with Stockfish and Elmo?",
+      "stage_tokens": 6192
+    },
+    {
+      "card": {
+        "answer": "NISQ stands for Noisy Intermediate-Scale Quantum [2]. Such noisy devices are expected to execute circuits with no more than about 1000 gates (1000 fundamental two-qubit operations) before noise overwhelms the signal [1].",
+        "attempts": 1,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 1,
+          "quotes": 2,
+          "quotes_ok": 2,
+          "sources": 2,
+          "sources_ok": 2,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 227,
+        "finish_reason": "stop",
+        "ms": 7069,
+        "nearest": [],
+        "prompt_tokens": 1400,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 2,
+            "text": "This stands for Noisy IntermediateScale Quantum"
+          },
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "we don’t expect to be able to execute a circuit that contains many more than about 1000 gates — that is,\n1000 fundamental two-qubit operations — because the noise will overwhelm the signal"
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"NISQ stands for Noisy Intermediate-Scale Quantum [2]. Such noisy devices are expected to execute circuits with no more than about 1000 gates (1000 fundamental two-qubit operations) before noise overwhelms the signal [1].\",\"sources\":[{\"n\":1,\"source\":\"nisq-preskill-1801.00862.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-nisq-preskill-1801.00862-0019\"},{\"n\":2,\"source\":\"nisq-preskill-1801.00862.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-nisq-preskill-1801.00862-0017\"}],\"quotes\":[{\"n\":2,\"text\":\"This stands for Noisy IntermediateScale Quantum\"},{\"n\":1,\"text\":\"we don’t expect to be able to execute a circuit that contains many more than about 1000 gates — that is,\\n1000 fundamental two-qubit operations — because the noise will overwhelm the signal\"}]}",
+        "retried": [],
+        "sources": [
+          {
+            "chunk_id": "fixed-nisq-preskill-1801.00862-0019",
+            "file": "nisq-preskill-1801.00862.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 5",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          },
+          {
+            "chunk_id": "fixed-nisq-preskill-1801.00862-0017",
+            "file": "nisq-preskill-1801.00862.pdf",
+            "id_ok": true,
+            "n": 2,
+            "pages": "стр. 4–5",
+            "relevance": "llm 7",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#3 cos 0.9909 z 3.26 llm 10 · nisq-preskill-1801.00862.pdf — Front matter, стр. 5 · 998 симв.",
+        "#2 cos 0.9909 z 3.28 llm 7 · nisq-preskill-1801.00862.pdf — Front matter, стр. 4–5 · 1000 симв.",
+        "#6 cos 0.9900 z 2.95 llm 7 · nisq-preskill-1801.00862.pdf — Front matter, стр. 4 · 999 симв."
+      ],
+      "covered": 3,
+      "error": null,
+      "expect": "Noisy Intermediate-Scale Quantum (about 50–100 qubits); circuits of not many more than about 1000 two-qubit gates before noise overwhelms the signal.",
+      "id": "7",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "noisy",
+        "intermediate",
+        "1000|1,000|thousand"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What does NISQ stand for, and roughly how many gates can such a device execute before noise overwhelms the signal?",
+      "stage_tokens": 2227
+    },
+    {
+      "card": {
+        "answer": "Bayesian optimization is best suited for optimization over continuous domains of fewer than 20 dimensions, with a simple feasible set (such as a hyper-rectangle) where membership is easy to assess, a continuous objective function, and it tolerates stochastic noise in function evaluations [1][2].",
+        "attempts": 2,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 1,
+          "quotes": 3,
+          "quotes_ok": 3,
+          "sources": 2,
+          "sources_ok": 2,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 1072,
+        "finish_reason": "stop",
+        "ms": 28350,
+        "nearest": [],
+        "prompt_tokens": 3163,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "It is best-suited for optimization over continuous domains of less than 20 dimensions, and tolerates stochastic noise in function evaluations."
+          },
+          {
+            "found": "verbatim",
+            "n": 2,
+            "text": "The feasible set A is a simple set, in which it is easy to assess membership."
+          },
+          {
+            "found": "verbatim",
+            "n": 2,
+            "text": "The objective function f is continuous."
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"Bayesian optimization is best suited for optimization over continuous domains of fewer than 20 dimensions, with a simple feasible set (such as a hyper-rectangle) where membership is easy to assess, a continuous objective function, and it tolerates stochastic noise in function evaluations [1][2].\",\"sources\":[{\"n\":1,\"source\":\"bayesian-optimization-tutorial-1807.02811.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-bayesian-optimization-tutorial-1807.02811-0000\"},{\"n\":2,\"source\":\"bayesian-optimization-tutorial-1807.02811.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-bayesian-optimization-tutorial-1807.02811-0002\"}],\"quotes\":[{\"n\":1,\"text\":\"It is best-suited for optimization over continuous domains of less than 20 dimensions, and tolerates stochastic noise in function evaluations.\"},{\"n\":2,\"text\":\"The feasible set A is a simple set, in which it is easy to assess membership.\"},{\"n\":2,\"text\":\"The objective function f is continuous.\"}]}",
+        "retried": [
+          "судья: не в цитатах — objective functions take minutes or hours to evaluate; simple feasible set (e.g., a hyper-rectangle or simplex) where membership is easy to assess; a continuous objective"
+        ],
+        "sources": [
+          {
+            "chunk_id": "fixed-bayesian-optimization-tutorial-1807.02811-0000",
+            "file": "bayesian-optimization-tutorial-1807.02811.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 1",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          },
+          {
+            "chunk_id": "fixed-bayesian-optimization-tutorial-1807.02811-0002",
+            "file": "bayesian-optimization-tutorial-1807.02811.pdf",
+            "id_ok": true,
+            "n": 2,
+            "pages": "стр. 1",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#1 cos 0.9912 z 3.92 llm 10 · bayesian-optimization-tutorial-1807.02811.pdf — Front matter, стр. 1 · 991 симв.",
+        "#9 cos 0.9891 z 3.24 llm 10 · bayesian-optimization-tutorial-1807.02811.pdf — Front matter, стр. 1 · 999 симв.",
+        "#3 cos 0.9904 z 3.68 llm 5 · bayesian-optimization-tutorial-1807.02811.pdf — Front matter, стр. 12 · 998 симв."
+      ],
+      "covered": 2,
+      "error": null,
+      "expect": "Objective functions that are expensive to evaluate (minutes or hours), over continuous domains of less than 20 dimensions, tolerating stochastic noise in evaluations.",
+      "id": "9",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "20",
+        "continuous",
+        "expensive|long time|minutes|hours"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "For what kind of optimization problems is Bayesian optimization best suited, according to the tutorial?",
+      "stage_tokens": 5855
+    },
+    {
+      "card": {
+        "answer": "Based on the β values, 80% of US workers are in occupations with at least 10% of tasks exposed to LLMs, while 19% are in occupations where over half of tasks are exposed [1].",
+        "attempts": 1,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 3,
+          "quotes": 1,
+          "quotes_ok": 1,
+          "sources": 1,
+          "sources_ok": 1,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 186,
+        "finish_reason": "stop",
+        "ms": 6041,
+        "nearest": [],
+        "prompt_tokens": 1657,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "Based on the 𝛽 values, we estimate that 80% of workers belong to an occupation with at least 10% of its tasks exposed to LLMs, while 19% of workers are in an occupation where over half of its tasks are labeled as exposed."
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"Based on the β values, 80% of US workers are in occupations with at least 10% of tasks exposed to LLMs, while 19% are in occupations where over half of tasks are exposed [1].\",\"sources\":[{\"n\":1,\"source\":\"gpts-are-gpts-labor-2303.10130.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-gpts-are-gpts-labor-2303.10130-0047\"}],\"quotes\":[{\"n\":1,\"text\":\"Based on the 𝛽 values, we estimate that 80% of workers belong to an occupation with at least 10% of its tasks exposed to LLMs, while 19% of workers are in an occupation where over half of its tasks are labeled as exposed.\"}]}",
+        "retried": [],
+        "sources": [
+          {
+            "chunk_id": "fixed-gpts-are-gpts-labor-2303.10130-0047",
+            "file": "gpts-are-gpts-labor-2303.10130.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 11",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#2 cos 0.9930 z 3.62 llm 10 · gpts-are-gpts-labor-2303.10130.pdf — Front matter, стр. 11 · 994 симв.",
+        "#1 cos 0.9935 z 3.77 llm 8 · gpts-are-gpts-labor-2303.10130.pdf — Front matter, стр. 1 · 991 симв.",
+        "#4 cos 0.9921 z 3.30 llm 6 · gpts-are-gpts-labor-2303.10130.pdf — Front matter, стр. 23 · 999 симв.",
+        "#7 cos 0.9913 z 3.02 llm 6 · gpts-are-gpts-labor-2303.10130.pdf — Front matter, стр. 3 · 999 симв."
+      ],
+      "covered": 2,
+      "error": null,
+      "expect": "Around 80% of the U.S. workforce could have at least 10% of their tasks affected; about 19% of workers may see at least 50% of their tasks impacted.",
+      "id": "11",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "80",
+        "19"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What share of the US workforce could have at least 10% of their work tasks affected by LLMs, and what share at least 50%?",
+      "stage_tokens": 4960
+    },
+    {
+      "card": {
+        "answer": "Cement and steel production together account for over 10% of all global GHG emissions [1].",
+        "attempts": 2,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 1,
+          "quotes": 1,
+          "quotes_ok": 1,
+          "sources": 1,
+          "sources_ok": 1,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 357,
+        "finish_reason": "stop",
+        "ms": 10752,
+        "nearest": [],
+        "prompt_tokens": 1500,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "steel production together account for over 10% of all global GHG emissions [378]"
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"Cement and steel production together account for over 10% of all global GHG emissions [1].\",\"sources\":[{\"n\":1,\"source\":\"climate-change-ml-1906.05433.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-climate-change-ml-1906.05433-0114\"}],\"quotes\":[{\"n\":1,\"text\":\"steel production together account for over 10% of all global GHG emissions [378]\"}]}",
+        "retried": [
+          "судья: не в цитатах — Cement is part of the over-10% share (quote only mentions steel production)",
+          "после повтора судьи формат сломался — оставлен предыдущий ответ"
+        ],
+        "sources": [
+          {
+            "chunk_id": "fixed-climate-change-ml-1906.05433-0114",
+            "file": "climate-change-ml-1906.05433.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 27–28",
+            "relevance": "llm 7",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [
+            "Cement is part of the over-10% share (quote only mentions steel production)"
+          ],
+          "verdict": "partial"
+        },
+        "why": null
+      },
+      "context": [
+        "#1 cos 0.9924 z 3.00 llm 7 · climate-change-ml-1906.05433.pdf — Front matter, стр. 27–28 · 998 симв."
+      ],
+      "covered": 1,
+      "error": null,
+      "expect": "Cement and steel production together account for over 10% of all global GHG emissions.",
+      "id": "14",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "10%|10 %|10 percent|ten percent"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What share of global greenhouse gas emissions comes from cement and steel production?",
+      "stage_tokens": 393
+    },
+    {
+      "card": {
+        "answer": "The study used open models MPT-30B-Instruct and LongChat-13B (16K), and closed models OpenAI's GPT-3.5-Turbo and Anthropic's Claude-1.3, and studied a synthetic key-value retrieval task where models must return the value associated with a specific key in JSON-formatted key-value pairs [3][1].",
+        "attempts": 1,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 1,
+          "quotes": 2,
+          "quotes_ok": 2,
+          "sources": 2,
+          "sources_ok": 2,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 280,
+        "finish_reason": "stop",
+        "ms": 6978,
+        "nearest": [],
+        "prompt_tokens": 1705,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 3,
+            "text": "open (MPT-30B-Instruct, LongChat-13B\n(16K)) and closed (OpenAI’s GPT-3.5-Turbo and\nAnthropic’s Claude-1.3) language models"
+          },
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "models\nare given a collection of JSON-formatted key-value\npairs and must return the value associated with a\nspecific key"
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"The study used open models MPT-30B-Instruct and LongChat-13B (16K), and closed models OpenAI's GPT-3.5-Turbo and Anthropic's Claude-1.3, and studied a synthetic key-value retrieval task where models must return the value associated with a specific key in JSON-formatted key-value pairs [3][1].\",\"sources\":[{\"n\":1,\"source\":\"lost-in-the-middle-2307.03172.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-lost-in-the-middle-2307.03172-0008\"},{\"n\":3,\"source\":\"lost-in-the-middle-2307.03172.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-lost-in-the-middle-2307.03172-0004\"}],\"quotes\":[{\"n\":3,\"text\":\"open (MPT-30B-Instruct, LongChat-13B\\n(16K)) and closed (OpenAI’s GPT-3.5-Turbo and\\nAnthropic’s Claude-1.3) language models\"},{\"n\":1,\"text\":\"models\\nare given a collection of JSON-formatted key-value\\npairs and must return the value associated with a\\nspecific key\"}]}",
+        "retried": [],
+        "sources": [
+          {
+            "chunk_id": "fixed-lost-in-the-middle-2307.03172-0008",
+            "file": "lost-in-the-middle-2307.03172.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 2",
+            "relevance": "llm 8",
+            "section": "Front matter"
+          },
+          {
+            "chunk_id": "fixed-lost-in-the-middle-2307.03172-0004",
+            "file": "lost-in-the-middle-2307.03172.pdf",
+            "id_ok": true,
+            "n": 3,
+            "pages": "стр. 1–2",
+            "relevance": "llm 8",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#4 cos 0.9906 z 2.89 llm 8 · lost-in-the-middle-2307.03172.pdf — Front matter, стр. 2 · 998 симв.",
+        "#5 cos 0.9904 z 2.81 llm 8 · lost-in-the-middle-2307.03172.pdf — Front matter, стр. 2 · 999 симв.",
+        "#12 cos 0.9897 z 2.57 llm 8 · lost-in-the-middle-2307.03172.pdf — Front matter, стр. 1–2 · 996 симв.",
+        "#2 cos 0.9914 z 3.15 llm 7 · lost-in-the-middle-2307.03172.pdf — Front matter, стр. 1 · 998 симв."
+      ],
+      "covered": 5,
+      "error": null,
+      "expect": "Open MPT-30B-Instruct and LongChat-13B (16K), closed GPT-3.5-Turbo and Claude-1.3; besides multi-document QA they used a synthetic key-value retrieval task.",
+      "id": "15",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "mpt",
+        "longchat",
+        "gpt-3.5",
+        "claude",
+        "key-value|key value"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "Which language models and which synthetic task were used in the study showing that models get lost in the middle of long contexts?",
+      "stage_tokens": 4408
+    },
+    {
+      "card": {
+        "answer": "Unexpectedly, including irrelevant documents can increase accuracy by over 30%, contradicting the assumption that quality would decrease [1].",
+        "attempts": 1,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 1,
+          "quotes": 1,
+          "quotes_ok": 1,
+          "sources": 1,
+          "sources_ok": 1,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 147,
+        "finish_reason": "stop",
+        "ms": 5632,
+        "nearest": [],
+        "prompt_tokens": 798,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "The research findings reveal that including irrelevant documents can unexpectedly increase accuracy by over 30%, contradicting the initial assumption of reduced quality."
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"Unexpectedly, including irrelevant documents can increase accuracy by over 30%, contradicting the assumption that quality would decrease [1].\",\"sources\":[{\"n\":1,\"source\":\"rag-survey-2312.10997.pdf\",\"section\":\"VII. DISCUSSION AND FUTURE PROSPECTS > A. RAG vs Long Context\",\"chunk_id\":\"fixed-rag-survey-2312.10997-0081\"}],\"quotes\":[{\"n\":1,\"text\":\"The research findings reveal that including irrelevant documents can unexpectedly increase accuracy by over 30%, contradicting the initial assumption of reduced quality.\"}]}",
+        "retried": [],
+        "sources": [
+          {
+            "chunk_id": "fixed-rag-survey-2312.10997-0081",
+            "file": "rag-survey-2312.10997.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 14",
+            "relevance": "llm 10",
+            "section": "VII. DISCUSSION AND FUTURE PROSPECTS > A. RAG vs Long Context"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#1 cos 0.9927 z 4.32 llm 10 · rag-survey-2312.10997.pdf — VII. DISCUSSION AND FUTURE PROSPECTS > A. RAG vs Long Context, стр. 14 · 998 симв."
+      ],
+      "covered": 2,
+      "error": null,
+      "expect": "Unexpectedly, including irrelevant documents can increase accuracy by over 30%, contradicting the assumption that it reduces quality.",
+      "id": "17",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "30",
+        "increase|improv|higher|boost"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "According to the RAG survey, how does adding irrelevant documents to the context affect the accuracy of RAG?",
+      "stage_tokens": 5399
+    },
+    {
+      "card": {
+        "answer": "Yes. Spectre attacks can be mounted via portable JavaScript code from a browser, violating browser sandboxing; the authors wrote a JavaScript program that successfully reads data from the address space of the browser process running it [1].",
+        "attempts": 1,
+        "by": null,
+        "check": {
+          "json_ok": true,
+          "numbers": 0,
+          "quotes": 2,
+          "quotes_ok": 2,
+          "sources": 1,
+          "sources_ok": 1,
+          "unbacked": []
+        },
+        "clarify": null,
+        "completion_tokens": 171,
+        "finish_reason": "stop",
+        "ms": 5836,
+        "nearest": [],
+        "prompt_tokens": 1429,
+        "quotes": [
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "Spectre attacks can also be used to violate browser sandboxing, by mounting them via portable JavaScript code."
+          },
+          {
+            "found": "verbatim",
+            "n": 1,
+            "text": "We wrote a JavaScript program that successfully reads data from the address space of the browser process running it."
+          }
+        ],
+        "raw": "{\"status\":\"answer\",\"answer\":\"Yes. Spectre attacks can be mounted via portable JavaScript code from a browser, violating browser sandboxing; the authors wrote a JavaScript program that successfully reads data from the address space of the browser process running it [1].\",\"sources\":[{\"n\":1,\"source\":\"spectre-attacks-1801.01203.pdf\",\"section\":\"Front matter\",\"chunk_id\":\"fixed-spectre-attacks-1801.01203-0010\"}],\"quotes\":[{\"n\":1,\"text\":\"Spectre attacks can also be used to violate browser sandboxing, by mounting them via portable JavaScript code.\"},{\"n\":1,\"text\":\"We wrote a JavaScript program that successfully reads data from the address space of the browser process running it.\"}]}",
+        "retried": [],
+        "sources": [
+          {
+            "chunk_id": "fixed-spectre-attacks-1801.01203-0010",
+            "file": "spectre-attacks-1801.01203.pdf",
+            "id_ok": true,
+            "n": 1,
+            "pages": "стр. 2",
+            "relevance": "llm 10",
+            "section": "Front matter"
+          }
+        ],
+        "status": "answer",
+        "support": {
+          "unsupported": [],
+          "verdict": "yes"
+        },
+        "why": null
+      },
+      "context": [
+        "#5 cos 0.9906 z 2.95 llm 10 · spectre-attacks-1801.01203.pdf — Front matter, стр. 2 · 994 симв.",
+        "#4 cos 0.9909 z 3.04 llm 7 · spectre-attacks-1801.01203.pdf — Front matter, стр. 2 · 995 симв.",
+        "#9 cos 0.9897 z 2.64 llm 7 · spectre-attacks-1801.01203.pdf — Front matter, стр. 6–7 · 997 симв."
+      ],
+      "covered": 2,
+      "error": null,
+      "expect": "Yes: the authors wrote a JavaScript program that, run in the browser (Chrome), reads private memory of the browser process — violating browser sandboxing.",
+      "id": "20",
+      "kind": "answer",
+      "made_up": [],
+      "must": [
+        "javascript",
+        "sandbox|browser"
+      ],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "Can a Spectre attack be mounted from a web page?",
+      "stage_tokens": 3030
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «What is the recommended ibuprofen dose for a five-year-old child?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "lost-in-the-middle-2307.03172.pdf — Front matter, стр. 16–17 (llm 0)",
+          "gw150914-ligo-1602.03837.pdf — V. SEARCHES > A. Generic transient search, стр. 6 (z 2.19)",
+          "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > D. RAG vs Fine-tuning, стр. 5 (z 2.11)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — llm 0)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "Not in the corpus — the answer should say the documents do not cover it.",
+      "id": "22",
+      "kind": "unknown",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What is the recommended ibuprofen dose for a five-year-old child?",
+      "stage_tokens": 512
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «What block time does Bitcoin target, and how is its mining difficulty adjusted?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "gw150914-ligo-1602.03837.pdf — V. SEARCHES > B. Binary coalescence search, стр. 7 (z 2.30)",
+          "lost-in-the-middle-2307.03172.pdf — Front matter, стр. 9 (z 2.01)",
+          "gw150914-ligo-1602.03837.pdf — III. DETECTORS, стр. 5 (z 1.99)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — z 2.30)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "Not in the corpus (Raft and the other consensus text never describe Bitcoin) — the answer should say the documents do not cover it.",
+      "id": "23",
+      "kind": "unknown",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What block time does Bitcoin target, and how is its mining difficulty adjusted?",
+      "stage_tokens": 0
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «Which national team won the 2018 FIFA World Cup?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "alphazero-chess-shogi-1712.01815.pdf — Front matter, стр. 11 (z 2.31)",
+          "alphazero-chess-shogi-1712.01815.pdf — Front matter, стр. 2 (z 2.04)",
+          "alphazero-chess-shogi-1712.01815.pdf — Front matter, стр. 6–7 (z 2.01)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — z 2.31)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "Not in the corpus — the answer should say the documents do not cover it.",
+      "id": "24",
+      "kind": "unknown",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "Which national team won the 2018 FIFA World Cup?",
+      "stage_tokens": 0
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «How many qubits did Google's Sycamore processor use in its 2019 quantum supremacy experiment?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "nisq-preskill-1801.00862.pdf — Front matter, стр. 5 (llm 4)",
+          "nisq-preskill-1801.00862.pdf — Front matter, стр. 17 (llm 0)",
+          "nisq-preskill-1801.00862.pdf — Front matter, стр. 7 (llm 0)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — llm 4)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "Not in the corpus (Preskill's NISQ essay predates Sycamore) — the answer should say the documents do not cover it.",
+      "id": "25",
+      "kind": "unknown",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "How many qubits did Google's Sycamore processor use in its 2019 quantum supremacy experiment?",
+      "stage_tokens": 1121
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «What was the signal-to-noise ratio of the binary neutron star merger GW170817?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "gw150914-ligo-1602.03837.pdf — II. OBSERVATION, стр. 2 (llm 4)",
+          "gw150914-ligo-1602.03837.pdf — V. SEARCHES > B. Binary coalescence search, стр. 7 (llm 4)",
+          "gw150914-ligo-1602.03837.pdf — II. OBSERVATION, стр. 2–3 (llm 4)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — llm 4)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "Not in the corpus (the LIGO paper is about GW150914, a black hole merger) — the answer should say the documents do not cover it.",
+      "id": "26",
+      "kind": "unknown",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What was the signal-to-noise ratio of the binary neutron star merger GW170817?",
+      "stage_tokens": 4635
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «How fast is it?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "raft-consensus.pdf — Front matter, стр. 15 (z 2.30)",
+          "gw150914-ligo-1602.03837.pdf — V. SEARCHES > B. Binary coalescence search, стр. 7 (z 2.28)",
+          "gw150914-ligo-1602.03837.pdf — V. SEARCHES > A. Generic transient search, стр. 6 (z 2.22)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — z 2.30)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "не ясно, о каком документе речь: «не знаю» и просьба уточнить",
+      "id": "v1",
+      "kind": "vague",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "How fast is it?",
+      "stage_tokens": 0
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «What was the final result?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "raft-consensus.pdf — Front matter, стр. 15 (z 2.37)",
+          "raft-consensus.pdf — Front matter, стр. 4 (z 2.34)",
+          "alphazero-chess-shogi-1712.01815.pdf — Front matter, стр. 11 (z 2.33)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — z 2.37)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "не ясно, о каком документе речь: «не знаю» и просьба уточнить",
+      "id": "v2",
+      "kind": "vague",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "What was the final result?",
+      "stage_tokens": 0
+    },
+    {
+      "card": {
+        "answer": "",
+        "attempts": 0,
+        "by": "gate",
+        "check": null,
+        "clarify": "о каком документе или системе вопрос «Which method works best?», и что именно нужно узнать (термин, число, раздел)? Например, речь о чём-то из этого?",
+        "completion_tokens": 0,
+        "finish_reason": null,
+        "ms": 0,
+        "nearest": [
+          "rag-survey-2312.10997.pdf — II. OVERVIEW OF RAG > D. RAG vs Fine-tuning, стр. 5 (z 2.11)",
+          "rag-survey-2312.10997.pdf — IV. GENERATION > A. Context Curation, стр. 10 (z 2.10)",
+          "raft-consensus.pdf — Front matter, стр. 1 (z 2.02)"
+        ],
+        "prompt_tokens": 0,
+        "quotes": [],
+        "raw": "",
+        "retried": [],
+        "sources": [],
+        "status": "unknown",
+        "support": null,
+        "why": "ни один фрагмент не прошёл фильтр (лучший кандидат — z 2.11)"
+      },
+      "context": [],
+      "covered": 0,
+      "error": null,
+      "expect": "не ясно, о каком документе речь: «не знаю» и просьба уточнить",
+      "id": "v3",
+      "kind": "vague",
+      "made_up": [],
+      "must": [],
+      "pipeline": "sim z≥2.5 + llm ≥5 · 20→4",
+      "q": "Which method works best?",
+      "stage_tokens": 0
+    }
+  ]
+}
