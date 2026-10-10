@@ -1,0 +1,337 @@
+[
+  {
+    "id": 1,
+    "q": "What randomized election timeout range does Raft recommend, and why are the timeouts randomized?",
+    "expect": "Election timeouts are chosen randomly from a fixed interval such as 150–300 ms, so that split votes are rare and resolved quickly (usually a single server times out first and wins).",
+    "must": [
+      "150",
+      "300",
+      "split vote"
+    ],
+    "where": [
+      "raft-consensus.pdf:6",
+      "raft-consensus.pdf:15"
+    ]
+  },
+  {
+    "id": 2,
+    "q": "raft cluster membership change?",
+    "expect": "Raft changes the configuration in two phases through a transitional joint consensus configuration C_old,new, in which agreement needs separate majorities of both the old and the new configurations.",
+    "must": [
+      "joint consensus",
+      "old and new|c_old,new|cold,new|both configurations|two configurations|both the old"
+    ],
+    "where": [
+      "raft-consensus.pdf:10",
+      "raft-consensus.pdf:11"
+    ]
+  },
+  {
+    "id": 3,
+    "q": "What were the masses of the two black holes in GW150914, the mass of the final black hole, and how much mass was radiated as gravitational waves?",
+    "expect": "Initial black holes of 36 and 29 solar masses, a final black hole of 62 solar masses, and about 3.0 solar masses radiated in gravitational waves.",
+    "must": [
+      "36",
+      "29",
+      "62",
+      "3.0|3 solar|three solar|3 m"
+    ],
+    "where": [
+      "gw150914-ligo-1602.03837.pdf:1",
+      "gw150914-ligo-1602.03837.pdf:7",
+      "gw150914-ligo-1602.03837.pdf:8"
+    ]
+  },
+  {
+    "id": 4,
+    "q": "How long are the arms of the Advanced LIGO detectors and how much laser power circulates in each arm cavity?",
+    "expect": "Each arm is 4 km long; 20 W of laser input becomes 700 W on the beam splitter and 100 kW circulating in each arm cavity.",
+    "must": [
+      "4 km|4-km|4 kilomet|four kilomet",
+      "100 kw|100 kilowatt"
+    ],
+    "where": [
+      "gw150914-ligo-1602.03837.pdf:3",
+      "gw150914-ligo-1602.03837.pdf:4"
+    ]
+  },
+  {
+    "id": 5,
+    "q": "How many positions per second does AlphaZero search in chess and shogi, compared with Stockfish and Elmo?",
+    "expect": "AlphaZero searches about 80 thousand positions per second in chess and 40 thousand in shogi, versus 70 million for Stockfish and 35 million for Elmo.",
+    "must": [
+      "80",
+      "40",
+      "70 million|70,000,000|70m",
+      "35 million|35,000,000|35m"
+    ],
+    "where": [
+      "alphazero-chess-shogi-1712.01815.pdf:5"
+    ]
+  },
+  {
+    "id": 6,
+    "q": "alphazero training hardware?",
+    "expect": "Training ran 700,000 steps with mini-batches of 4,096; 5,000 first-generation TPUs generated self-play games and 64 second-generation TPUs trained the neural networks.",
+    "must": [
+      "5,000|5000|5 000",
+      "64",
+      "tpu"
+    ],
+    "where": [
+      "alphazero-chess-shogi-1712.01815.pdf:4"
+    ]
+  },
+  {
+    "id": 7,
+    "q": "What does NISQ stand for, and roughly how many gates can such a device execute before noise overwhelms the signal?",
+    "expect": "Noisy Intermediate-Scale Quantum (about 50–100 qubits); circuits of not many more than about 1000 two-qubit gates before noise overwhelms the signal.",
+    "must": [
+      "noisy",
+      "intermediate",
+      "1000|1,000|thousand"
+    ],
+    "where": [
+      "nisq-preskill-1801.00862.pdf:1",
+      "nisq-preskill-1801.00862.pdf:4",
+      "nisq-preskill-1801.00862.pdf:5"
+    ]
+  },
+  {
+    "id": 8,
+    "q": "How do the Spectre authors propose to mitigate the conditional-branch variant, and why is indirect branch poisoning harder to mitigate?",
+    "expect": "Halt speculative execution on sensitive paths with serializing instructions (cpuid, or lfence/mfence), at a performance cost; for indirect branch poisoning one might disable hyperthreading and flush branch prediction state on context switches, but there is no architecturally defined way to do it.",
+    "must": [
+      "serializ|lfence|mfence",
+      "hyperthread",
+      "flush|branch prediction state"
+    ],
+    "where": [
+      "spectre-attacks-1801.01203.pdf:11"
+    ]
+  },
+  {
+    "id": 9,
+    "q": "For what kind of optimization problems is Bayesian optimization best suited, according to the tutorial?",
+    "expect": "Objective functions that are expensive to evaluate (minutes or hours), over continuous domains of less than 20 dimensions, tolerating stochastic noise in evaluations.",
+    "must": [
+      "20",
+      "continuous",
+      "expensive|long time|minutes|hours"
+    ],
+    "where": [
+      "bayesian-optimization-tutorial-1807.02811.pdf:1",
+      "bayesian-optimization-tutorial-1807.02811.pdf:2"
+    ]
+  },
+  {
+    "id": 10,
+    "q": "Which acquisition functions does the Bayesian optimization tutorial describe?",
+    "expect": "Expected improvement, knowledge gradient, entropy search and predictive entropy search.",
+    "must": [
+      "expected improvement",
+      "knowledge gradient|knowledge-gradient",
+      "entropy search"
+    ],
+    "where": [
+      "bayesian-optimization-tutorial-1807.02811.pdf:1",
+      "bayesian-optimization-tutorial-1807.02811.pdf:2",
+      "bayesian-optimization-tutorial-1807.02811.pdf:3"
+    ]
+  },
+  {
+    "id": 11,
+    "q": "What share of the US workforce could have at least 10% of their work tasks affected by LLMs, and what share at least 50%?",
+    "expect": "Around 80% of the U.S. workforce could have at least 10% of their tasks affected; about 19% of workers may see at least 50% of their tasks impacted.",
+    "must": [
+      "80",
+      "19"
+    ],
+    "where": [
+      "gpts-are-gpts-labor-2303.10130.pdf:1",
+      "gpts-are-gpts-labor-2303.10130.pdf:3",
+      "gpts-are-gpts-labor-2303.10130.pdf:11"
+    ]
+  },
+  {
+    "id": 12,
+    "q": "In the GPTs-are-GPTs labor study, who applied the exposure rubric and to which occupational dataset?",
+    "expect": "Both human annotators and GPT-4 itself classified tasks with the exposure rubric, applied to occupational data from the O*NET database.",
+    "must": [
+      "human",
+      "gpt-4",
+      "o*net|onet"
+    ],
+    "where": [
+      "gpts-are-gpts-labor-2303.10130.pdf:2",
+      "gpts-are-gpts-labor-2303.10130.pdf:8",
+      "gpts-are-gpts-labor-2303.10130.pdf:9"
+    ]
+  },
+  {
+    "id": 13,
+    "q": "What do the flags High Leverage, Long-term and Uncertain Impact mean in the paper on tackling climate change with machine learning?",
+    "expect": "High Leverage — bottlenecks that domain experts identified where ML could be especially helpful; Long-term — applications whose main impact comes after 2040; Uncertain Impact — the effect on GHG emissions is uncertain (e.g. Jevons paradox) or there may be undesirable side effects.",
+    "must": [
+      "bottleneck",
+      "2040",
+      "jevons|side effect|uncertain"
+    ],
+    "where": [
+      "climate-change-ml-1906.05433.pdf:4"
+    ]
+  },
+  {
+    "id": 14,
+    "q": "What share of global greenhouse gas emissions comes from cement and steel production?",
+    "expect": "Cement and steel production together account for over 10% of all global GHG emissions.",
+    "must": [
+      "10%|10 %|10 percent|ten percent"
+    ],
+    "where": [
+      "climate-change-ml-1906.05433.pdf:27"
+    ]
+  },
+  {
+    "id": 15,
+    "q": "Which language models and which synthetic task were used in the study showing that models get lost in the middle of long contexts?",
+    "expect": "Open MPT-30B-Instruct and LongChat-13B (16K), closed GPT-3.5-Turbo and Claude-1.3; besides multi-document QA they used a synthetic key-value retrieval task.",
+    "must": [
+      "mpt",
+      "longchat",
+      "gpt-3.5",
+      "claude",
+      "key-value|key value"
+    ],
+    "where": [
+      "lost-in-the-middle-2307.03172.pdf:1",
+      "lost-in-the-middle-2307.03172.pdf:2"
+    ]
+  },
+  {
+    "id": 16,
+    "q": "Small2Big?",
+    "expect": "An index optimization from the RAG survey: sentences (small) are the retrieval unit, and the preceding and following sentences are given to the LLM as (big) context.",
+    "must": [
+      "sentence",
+      "context|surrounding|preceding|following"
+    ],
+    "where": [
+      "rag-survey-2312.10997.pdf:8"
+    ]
+  },
+  {
+    "id": 17,
+    "q": "According to the RAG survey, how does adding irrelevant documents to the context affect the accuracy of RAG?",
+    "expect": "Unexpectedly, including irrelevant documents can increase accuracy by over 30%, contradicting the assumption that it reduces quality.",
+    "must": [
+      "30",
+      "increase|improv|higher|boost"
+    ],
+    "where": [
+      "rag-survey-2312.10997.pdf:14"
+    ]
+  },
+  {
+    "id": 18,
+    "q": "In the paper on tackling climate change with machine learning, which renewable-energy hardware has been controlled with reinforcement learning or Bayesian optimization to maximize electricity production?",
+    "expect": "Prior work used reinforcement learning or Bayesian optimization to control movable solar panels and wind turbine blades.",
+    "must": [
+      "solar panel",
+      "wind turbine"
+    ],
+    "where": [
+      "climate-change-ml-1906.05433.pdf:9"
+    ]
+  },
+  {
+    "id": 19,
+    "q": "What is single-decree Paxos, and which problem with Paxos motivated the design of Raft?",
+    "expect": "Single-decree Paxos is the subset of Paxos that reaches agreement on a single decision (e.g. one replicated log entry); multi-Paxos combines many instances. Paxos is exceptionally difficult to understand (its explanation is notoriously opaque), which motivated Raft, designed for understandability.",
+    "must": [
+      "single decision|single-decree|single decree|one decision",
+      "difficult|hard to understand|opaque|understandab"
+    ],
+    "where": [
+      "raft-consensus.pdf:1",
+      "raft-consensus.pdf:2"
+    ]
+  },
+  {
+    "id": 20,
+    "q": "Can a Spectre attack be mounted from a web page?",
+    "expect": "Yes: the authors wrote a JavaScript program that, run in the browser (Chrome), reads private memory of the browser process — violating browser sandboxing.",
+    "must": [
+      "javascript",
+      "sandbox|browser"
+    ],
+    "where": [
+      "spectre-attacks-1801.01203.pdf:2",
+      "spectre-attacks-1801.01203.pdf:6"
+    ]
+  },
+  {
+    "id": 21,
+    "q": "When the relevant document sits in the middle of a 20-document context, how does GPT-3.5-Turbo compare with answering closed-book, without any documents?",
+    "expect": "In the middle of the context GPT-3.5-Turbo's multi-document QA accuracy drops below its closed-book accuracy (56.1%) — worse than having no documents at all.",
+    "must": [
+      "closed-book|closed book|without any documents|no documents",
+      "56"
+    ],
+    "where": [
+      "lost-in-the-middle-2307.03172.pdf:1",
+      "lost-in-the-middle-2307.03172.pdf:2",
+      "lost-in-the-middle-2307.03172.pdf:5"
+    ]
+  },
+  {
+    "id": 22,
+    "q": "What is the recommended ibuprofen dose for a five-year-old child?",
+    "expect": "Not in the corpus — the answer should say the documents do not cover it.",
+    "must": [],
+    "where": [],
+    "wrong": [
+      "mg|milligram"
+    ]
+  },
+  {
+    "id": 23,
+    "q": "What block time does Bitcoin target, and how is its mining difficulty adjusted?",
+    "expect": "Not in the corpus (Raft and the other consensus text never describe Bitcoin) — the answer should say the documents do not cover it.",
+    "must": [],
+    "where": [],
+    "wrong": [
+      "10 minutes|ten minutes|2016|2,016"
+    ]
+  },
+  {
+    "id": 24,
+    "q": "Which national team won the 2018 FIFA World Cup?",
+    "expect": "Not in the corpus — the answer should say the documents do not cover it.",
+    "must": [],
+    "where": [],
+    "wrong": [
+      "france"
+    ]
+  },
+  {
+    "id": 25,
+    "q": "How many qubits did Google's Sycamore processor use in its 2019 quantum supremacy experiment?",
+    "expect": "Not in the corpus (Preskill's NISQ essay predates Sycamore) — the answer should say the documents do not cover it.",
+    "must": [],
+    "where": [],
+    "wrong": [
+      "53"
+    ]
+  },
+  {
+    "id": 26,
+    "q": "What was the signal-to-noise ratio of the binary neutron star merger GW170817?",
+    "expect": "Not in the corpus (the LIGO paper is about GW150914, a black hole merger) — the answer should say the documents do not cover it.",
+    "must": [],
+    "where": [],
+    "wrong": [
+      "32"
+    ]
+  }
+]

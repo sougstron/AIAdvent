@@ -57,7 +57,18 @@ own). Which folder is active right now, and the rules for rotating to the
 next state, are in `docs/CurrentTask.md` — work only in that folder and
 don't touch the rest of the code.
 
-**The active snapshot is `tree/task-25/`.** — task 25 added the
+**The active snapshot is `tree/task-30/`.** — tasks 26–30 add a home-server
+provider: CPU-only Qwen3 (`qwen3:1.7b`, 2.0B Q4_K_M, 4096 context) and
+`nomic-embed-text` in the isolated `ask-home-engine` Docker project on
+192.168.0.128. Server source/control scripts: `tree/task-30/server/`;
+hard total RAM cap 4 GiB, no swap or GPU, no existing workloads reclaimed.
+`/login home-server` accepts a masked `LLM_KEY:EMBED_KEY` bundle and checks
+both scoped APIs; choose the model normally, and choose embeddings independently
+with `/rag provider local|home-server` or `--rag-provider home-server`.
+Secrets stay outside the repo; HTTP port 11435 is trusted-LAN-only.
+The omp-only `home-engine` start/stop skill is versioned under
+`tree/task-30/skills/` and installed only in `~/.omp/agent/skills/`.
+Task 25 added the
 **RAG mini-chat with task memory** (`src/chatmem.rs`): on top of task 24's
 grounded answers (sources, verbatim quotes, «не знаю») the chat keeps a
 structured conversation state — goal / clarifications / fixed constraints /

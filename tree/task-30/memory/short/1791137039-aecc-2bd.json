@@ -1,0 +1,12 @@
+{
+  "layer": "short",
+  "scope": "1791137039-aecc-2bd",
+  "records": [],
+  "dialog": [
+    {
+      "n": 1,
+      "role": "user",
+      "text": "вопрос"
+    }
+  ]
+}
