@@ -259,7 +259,7 @@ mod tests {
             reasoning_tokens: 0,
             total_tokens: 6144,
         };
-        assert_eq!(cost_usd("qwen3:1.7b", &usage), 0.0);
+        assert_eq!(cost_usd("qwen3:0.6b", &usage), 0.0);
         assert!(cost_usd(LIVE_COMPLETION_MODEL, &usage) > 0.0);
     }
 

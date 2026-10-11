@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-LLM_MODEL = "qwen3:1.7b"
+LLM_MODEL = "qwen3:0.6b"
 EMBED_MODEL = "nomic-embed-text"
 BODY_LIMIT = 1024 * 1024
 RESPONSE_LIMIT = 8 * 1024 * 1024
@@ -109,7 +109,7 @@ def chat_messages(messages):
 
 def chat_payload(data):
     if data.get("model") != LLM_MODEL:
-        raise RequestError(400, "Only model qwen3:1.7b is available")
+        raise RequestError(400, "Only model qwen3:0.6b is available")
     if type(data.get("stream", False)) is not bool:
         raise RequestError(400, "stream must be boolean")
     allowed = {"model", "messages", "stream", "stream_options", "temperature", "top_p", "top_k",

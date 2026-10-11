@@ -55,6 +55,30 @@ Qwen (**8192** context, **2.4 GB**) and nomic (**4096** context, **565 MB**),
 gateway **17.79 MiB**, host available RAM **6.1 GiB**; the aggregate
 4 GiB/no-swap cap remains unchanged.
 
+### 2026-10-11: 0.6B trial and initial-prompt measurements
+
+The current gateway and app use `qwen3:0.6b`, Q4_K_M, 8192 context.
+The earlier measurements above describe 1.7B. Its files remain available,
+but its runner is unloaded; Qwen 0.6B and nomic are both CPU/Forever.
+Final `ollama ps`: Qwen 1.5 GB, nomic 565 MB. Ollama 1.866 GiB,
+gateway 21.18 MiB, host available 6.8 GiB. Memory/no-swap and CPU caps
+are unchanged; no unrelated workloads were stopped.
+
+The actual initial app CLI prompt was 4666 tokens: project instruction
+file 15,417 characters plus invariant rules and a short Russian question.
+0.6B took 115.6 s; 1.7B on the same prompt took 164.9 s, including
+162.6 s prefill. Removing only the instruction file kept invariants,
+reduced the prompt to 648 tokens and completed in 5.16 s on 0.6B.
+The app README documents `/context off`, `/mcp off`, their tradeoffs,
+and the observed strict-contract failures. Defaults remain unchanged.
+Single measurements, not a latency SLA or a RAG/tool-quality qualification.
+
+The real guest TUI explicit plain-chat control (invariants off, context
+off, MCP off) returned `7 + 5 = 12.` with 96/10 tokens in 0.52 s, exit 0.
+App `--verify-login` confirmed both scoped APIs with the new model;
+embedding still returned 768-dimensional vectors.
+
+
 ## Install (new deployment only)
 
 Docker/Compose, Python 3, SSH key access and at least 4 GiB available RAM are
@@ -66,7 +90,7 @@ private backup and review changes. Never delete models, secrets or other data.
 ./deploy.sh /home/shmon/.local/share/kanban4ai/projects/homework/.kanban/backups/TASK-118/home-server-keys.txt
 ```
 
-This pulls pinned Ollama 0.13.5 and Python 3.13 images, then `qwen3:1.7b` and
+This pulls pinned Ollama 0.13.5 and Python 3.13 images, then `qwen3:0.6b` and
 `nomic-embed-text`, starts only this project, and writes a private 0600 bundle.
 Image tags are explicit; Docker stores the resolved image digests at deploy.
 Only Ollama temporarily joins the existing default bridge for model downloads;
@@ -109,10 +133,10 @@ environment secrets; this does not protect against a compromised root host.
 ## HTTP contracts
 
 - `GET http://192.168.0.128:11435/v1/models`: LLM Bearer only; lists
-  `qwen3:1.7b`.
+  `qwen3:0.6b` (the current trial model).
 - `POST /v1/chat/completions`: LLM Bearer only; OpenAI-compatible plain JSON or
   buffered SSE (`stream: true`) with text `system`, `user`, `assistant`, `tool`
-  messages. Model must be exactly `qwen3:1.7b`; images and unknown fields are
+  messages. Model must be exactly `qwen3:0.6b`; images and unknown fields are
   rejected. Supports `temperature`, `top_p`, native `top_k` (-1..2147483647;
   -1 disables vocabulary filtering), `seed`,
   `stop` and either `max_tokens` or `max_completion_tokens` (1..2048; default
