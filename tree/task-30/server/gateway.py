@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Single-flight CPU inference; only the LAN gateway has a published port."""
+"""Single-flight inference (chat: llama-server on the iGPU, embeddings: Ollama CPU);
+only the LAN gateway has a published port."""
 import hmac
 import json
 import math
@@ -11,11 +12,12 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-LLM_MODEL = "qwen3:0.6b"
+LLM_MODEL = "qwen3:1.7b"
 EMBED_MODEL = "nomic-embed-text"
 BODY_LIMIT = 1024 * 1024
 RESPONSE_LIMIT = 8 * 1024 * 1024
-BACKEND = "http://ollama:11434"
+CHAT_BACKEND = "http://chat:8080"
+EMBED_BACKEND = "http://ollama:11434"
 INFERENCE = threading.Lock()
 KEYS = {"llm": os.environ["LLM_KEY"], "embed": os.environ["EMBED_KEY"]}
 if any(len(key) != 64 or any(c not in "0123456789abcdef" for c in key) for key in KEYS.values()):
@@ -29,11 +31,29 @@ class RequestError(Exception):
         self.status, self.message = status, message
 
 
-def backend(path, payload):
-    request = urllib.request.Request(BACKEND + path, json.dumps(payload).encode(),
+def open_backend(url, payload):
+    """Returns the open response; HTTP and connection failures become RequestError."""
+    request = urllib.request.Request(url, json.dumps(payload).encode(),
                                      {"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        return urllib.request.urlopen(request, timeout=600)
+    except urllib.error.HTTPError as error:
+        raw = error.read(RESPONSE_LIMIT)
+        try:
+            detail = json.loads(raw).get("error", "Backend rejected request")
+            if isinstance(detail, dict):
+                detail = detail.get("message", detail)
+        except (ValueError, AttributeError):
+            detail = raw.decode(errors="replace")[:4096]
+        raise RequestError(error.code, str(detail)) from error
+    except (TimeoutError, OSError) as error:
+        raise RequestError(504 if isinstance(error, TimeoutError) else 502,
+                           "Backend unavailable: " + str(error)) from error
+
+
+def backend(url, payload):
+    try:
+        with open_backend(url, payload) as response:
             raw = response.read(RESPONSE_LIMIT + 1)
         if len(raw) > RESPONSE_LIMIT:
             raise RequestError(502, "Backend response exceeds limit")
@@ -41,13 +61,6 @@ def backend(path, payload):
         if not isinstance(result, dict):
             raise ValueError("Expected backend object")
         return result
-    except urllib.error.HTTPError as error:
-        raw = error.read(RESPONSE_LIMIT)
-        try:
-            detail = json.loads(raw).get("error", "Backend rejected request")
-        except (ValueError, AttributeError):
-            detail = raw.decode(errors="replace")[:4096]
-        raise RequestError(error.code, str(detail)) from error
     except (TimeoutError, OSError, ValueError) as error:
         raise RequestError(504 if isinstance(error, TimeoutError) else 502,
                            "Backend unavailable or invalid response: " + str(error)) from error
@@ -73,7 +86,8 @@ def tool_calls(calls, known_calls):
         if not isinstance(arguments, dict):
             raise RequestError(400, "Tool arguments must be JSON objects")
         known_calls[call_id] = function["name"]
-        converted.append({"function": {"name": function["name"], "arguments": arguments}})
+        converted.append({"id": call_id, "type": "function",
+                          "function": {"name": function["name"], "arguments": function["arguments"]}})
     return converted
 
 
@@ -100,7 +114,8 @@ def chat_messages(messages):
             call_id = message.get("tool_call_id")
             if not isinstance(call_id, str) or call_id not in known_calls:
                 raise RequestError(400, "Tool reply must reference an earlier assistant call")
-            item["tool_name"] = known_calls.pop(call_id)
+            known_calls.pop(call_id)
+            item["tool_call_id"] = call_id
         elif "tool_call_id" in message:
             raise RequestError(400, "Only tool replies can carry tool_call_id")
         converted.append(item)
@@ -109,7 +124,7 @@ def chat_messages(messages):
 
 def chat_payload(data):
     if data.get("model") != LLM_MODEL:
-        raise RequestError(400, "Only model qwen3:0.6b is available")
+        raise RequestError(400, "Only model " + LLM_MODEL + " is available")
     if type(data.get("stream", False)) is not bool:
         raise RequestError(400, "stream must be boolean")
     allowed = {"model", "messages", "stream", "stream_options", "temperature", "top_p", "top_k",
@@ -136,7 +151,7 @@ def chat_payload(data):
                 or not tool["function"]["name"]
                 or not isinstance(tool["function"].get("parameters"), dict)):
             raise RequestError(400, "Tools require a function name and JSON parameters schema")
-    options = {"num_ctx": 8192, "num_predict": 1024, "num_thread": 4}
+    options = {"max_tokens": 1024}
     if "max_tokens" in data and "max_completion_tokens" in data:
         raise RequestError(400, "Use only one output token limit")
     for field in ("max_tokens", "max_completion_tokens"):
@@ -144,7 +159,7 @@ def chat_payload(data):
             value = data[field]
             if type(value) is not int or not 1 <= value <= 2048:
                 raise RequestError(400, field + " must be an integer in 1..2048")
-            options["num_predict"] = value
+            options["max_tokens"] = value
     for field, low, high in (("temperature", 0, 2), ("top_p", 0, 1)):
         if field in data:
             value = data[field]
@@ -158,15 +173,19 @@ def chat_payload(data):
     if "top_k" in data:
         if type(data["top_k"]) is not int or not -1 <= data["top_k"] <= 2147483647:
             raise RequestError(400, "top_k must be an integer in -1..2147483647")
-        options["top_k"] = data["top_k"]
+        # llama.cpp disables top-k for any value <= 0.
+        options["top_k"] = max(data["top_k"], 0)
     if "stop" in data:
         stop = data["stop"]
         stop = [stop] if isinstance(stop, str) else stop
         if not isinstance(stop, list) or not 1 <= len(stop) <= 4 or any(not isinstance(s, str) or not s or len(s) > 256 for s in stop):
             raise RequestError(400, "stop must contain 1..4 nonempty strings of at most 256 characters")
         options["stop"] = stop
-    payload = {"model": LLM_MODEL, "messages": messages, "stream": False,
-               "think": False, "options": options, "keep_alive": -1}
+    stream = data.get("stream", False)
+    payload = dict(options, model=LLM_MODEL, messages=messages, stream=stream,
+                   chat_template_kwargs={"enable_thinking": False})
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     if tools and choice == "auto":
         payload["tools"] = tools
     if "response_format" in data:
@@ -174,43 +193,60 @@ def chat_payload(data):
         if not isinstance(fmt, dict):
             raise RequestError(400, "response_format must be an object")
         if fmt.get("type") == "json_object" and set(fmt) == {"type"}:
-            payload["format"] = "json"
+            payload["response_format"] = fmt
         elif fmt.get("type") == "json_schema" and isinstance(fmt.get("json_schema"), dict) and isinstance(fmt["json_schema"].get("schema"), dict):
-            payload["format"] = fmt["json_schema"]["schema"]
+            payload["response_format"] = {"type": "json_schema",
+                                          "json_schema": {"schema": fmt["json_schema"]["schema"]}}
         elif fmt != {"type": "text"}:
             raise RequestError(400, "response_format supports text, json_object or json_schema")
     return payload
 
 
-def chat_completion(result):
-    message = result.get("message")
-    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-        raise RequestError(502, "Backend returned an invalid chat message")
-    prompt_tokens = result.get("prompt_eval_count", 0)
-    completion_tokens = result.get("eval_count", 0)
-    if any(type(n) is not int or n < 0 for n in (prompt_tokens, completion_tokens)):
-        raise RequestError(502, "Backend returned invalid token usage")
-    output = {"role": "assistant", "content": message["content"]}
-    calls = message.get("tool_calls", [])
+def response_calls(calls):
+    """Validated OpenAI tool calls from the backend; arguments must be JSON objects."""
     if not isinstance(calls, list):
         raise RequestError(502, "Backend returned invalid tool calls")
+    output = []
+    for call in calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        if (not isinstance(function, dict) or not isinstance(function.get("name"), str)
+                or not isinstance(function.get("arguments"), str) or not isinstance(call.get("id"), str)):
+            raise RequestError(502, "Backend returned invalid function arguments")
+        try:
+            if not isinstance(json.loads(function["arguments"]), dict):
+                raise ValueError
+        except (ValueError, RecursionError):
+            raise RequestError(502, "Backend returned invalid function arguments")
+        output.append({"id": call["id"], "type": "function",
+                       "function": {"name": function["name"], "arguments": function["arguments"]}})
+    return output
+
+
+def usage(result):
+    usage = result.get("usage")
+    counts = [usage.get(k) if isinstance(usage, dict) else None for k in ("prompt_tokens", "completion_tokens")]
+    if any(type(n) is not int or n < 0 for n in counts):
+        raise RequestError(502, "Backend returned invalid token usage")
+    return {"prompt_tokens": counts[0], "completion_tokens": counts[1], "total_tokens": sum(counts)}
+
+
+def chat_completion(result):
+    choices = result.get("choices")
+    choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("content") or "", str):
+        raise RequestError(502, "Backend returned an invalid chat message")
+    calls = response_calls(message.get("tool_calls") or [])
+    output = {"role": "assistant", "content": message.get("content") or ""}
     if calls:
-        output["tool_calls"] = []
-        nonce = time.time_ns()
-        for index, call in enumerate(calls):
-            function = call.get("function") if isinstance(call, dict) else None
-            if (not isinstance(function, dict) or not isinstance(function.get("name"), str)
-                    or not isinstance(function.get("arguments"), dict)):
-                raise RequestError(502, "Backend returned invalid function arguments")
-            output["tool_calls"].append({"id": f"call_{nonce}_{index}", "type": "function",
-                                         "function": {"name": function["name"],
-                                                      "arguments": json.dumps(function["arguments"], ensure_ascii=False)}})
-    finish = "length" if result.get("done_reason") == "length" else "tool_calls" if calls else "stop"
+        output["tool_calls"] = calls
+    finish = choice.get("finish_reason")
+    if finish not in ("stop", "length", "tool_calls"):
+        raise RequestError(502, "Backend returned an invalid finish reason")
     return {"id": "chatcmpl-" + str(time.time_ns()), "object": "chat.completion",
             "created": int(time.time()), "model": LLM_MODEL,
             "choices": [{"index": 0, "message": output, "finish_reason": finish}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                      "total_tokens": prompt_tokens + completion_tokens}}
+            "usage": usage(result)}
 
 
 def embedding_payload(data):
@@ -227,7 +263,7 @@ def embedding_payload(data):
     if type(truncate) is not bool:
         raise RequestError(400, "truncate must be boolean")
     return {"model": EMBED_MODEL, "input": texts, "truncate": truncate,
-            "options": {"num_ctx": 4096, "num_thread": 4}, "keep_alive": -1}
+            "options": {"num_ctx": 4096, "num_thread": 2}, "keep_alive": -1}
 
 
 class Gateway(BaseHTTPRequestHandler):
@@ -258,37 +294,56 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
-    def stream_reply(self, completion, include_usage):
-        # Buffered SSE: all deltas are real backend output, not simulated tokens.
+    def stream_reply(self, response, include_usage):
+        """Relays backend SSE chunk by chunk; only whitelisted delta fields pass."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Connection", "close")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.connection.settimeout(15)
-        base = {key: completion[key] for key in ("id", "created", "model")}
-        base["object"] = "chat.completion.chunk"
+        self.close_connection = True
+        base = {"id": "chatcmpl-" + str(time.time_ns()), "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": LLM_MODEL}
 
-        def event(choices, usage=None):
-            chunk = dict(base, choices=choices)
-            if include_usage:
-                chunk["usage"] = usage
+        def send(chunk):
             self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode())
             self.wfile.flush()
 
-        choice = completion["choices"][0]
-        message = choice["message"]
-        event([{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}])
-        delta = {"content": message["content"]}
-        if "tool_calls" in message:
-            delta["tool_calls"] = [dict(call, index=index) for index, call in enumerate(message["tool_calls"])]
-        event([{"index": 0, "delta": delta, "finish_reason": None}])
-        event([{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}])
-        if include_usage:
-            event([], completion["usage"])
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
-        self.close_connection = True
+        total = 0
+        try:
+            for line in response:
+                total += len(line)
+                if total > RESPONSE_LIMIT:
+                    raise RequestError(502, "Backend response exceeds limit")
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    return
+                chunk = json.loads(data)
+                if not isinstance(chunk, dict) or "error" in chunk:
+                    raise RequestError(502, "Backend stream error")
+                choices = []
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    delta = {k: delta[k] for k in ("role", "content", "tool_calls") if delta.get(k) is not None}
+                    finish = choice.get("finish_reason")
+                    if delta or finish:
+                        choices.append({"index": 0, "delta": delta, "finish_reason": finish})
+                if choices:
+                    send(dict(base, choices=choices))
+                elif include_usage and isinstance(chunk.get("usage"), dict):
+                    send(dict(base, choices=[], usage=usage(chunk)))
+            raise RequestError(502, "Backend stream ended without [DONE]")
+        except (RequestError, ValueError, AttributeError, TimeoutError, OSError) as error:
+            if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+                raise
+            # Headers are already sent: report in-band, then end the stream.
+            message = error.message if isinstance(error, RequestError) else "Backend stream failed"
+            send({"error": {"message": message, "type": "gateway_error", "code": 502}})
 
     def error(self, status, message):
         if self.path == "/api/embed":
@@ -337,17 +392,18 @@ class Gateway(BaseHTTPRequestHandler):
         if not INFERENCE.acquire(blocking=False):
             raise RequestError(429, "Another inference request is active; retry later")
         try:
-            result = backend("/api/chat" if is_chat else "/api/embed", payload)
+            if not is_chat:
+                result = backend(EMBED_BACKEND + "/api/embed", payload)
+            elif payload["stream"]:
+                # The lock is held until the last token, so a stream counts as one inference.
+                with open_backend(CHAT_BACKEND + "/v1/chat/completions", payload) as response:
+                    self.stream_reply(response, data.get("stream_options", {}).get("include_usage", False))
+                return
+            else:
+                result = chat_completion(backend(CHAT_BACKEND + "/v1/chat/completions", payload))
         finally:
             INFERENCE.release()
-        if not is_chat:
-            self.reply(200, result)
-            return
-        completion = chat_completion(result)
-        if data.get("stream", False):
-            self.stream_reply(completion, data.get("stream_options", {}).get("include_usage", False))
-        else:
-            self.reply(200, completion)
+        self.reply(200, result)
 
     def do_GET(self):
         try:

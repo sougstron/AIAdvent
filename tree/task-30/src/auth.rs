@@ -531,11 +531,11 @@ fn confirmed_or_unverifiable(provider: Provider, body: &str) -> CheckResult {
     };
     let evidence = match provider {
         Provider::HomeServer => {
-            if v["model"].as_str() == Some("qwen3:0.6b")
+            if v["model"].as_str() == Some("qwen3:1.7b")
                 && v.pointer("/choices/0/message/content").and_then(Value::as_str).is_some()
                 && v.pointer("/usage/prompt_tokens").and_then(Value::as_u64).is_some()
             {
-                Some("chat/completions 200: model=qwen3:0.6b, completion and usage validated".into())
+                Some("chat/completions 200: model=qwen3:1.7b, completion and usage validated".into())
             } else {
                 None
             }
@@ -642,7 +642,7 @@ fn check_home(bundle: &str, base: &str) -> CheckResult {
     let completion = agent.post(&format!("{}/chat/completions", base.trim_end_matches('/')))
         .set("Authorization", &bearer(llm))
         .send_json(json!({
-            "model": "qwen3:0.6b",
+            "model": "qwen3:1.7b",
             "messages": [{"role": "user", "content": "Say OK."}],
             "max_tokens": 8,
         }));
@@ -841,7 +841,7 @@ mod tests {
             let bundle = format!("{llm}:{embed}");
             let worker = std::thread::spawn(move || {
                 for (path, key, status, response) in [
-                    ("/v1/chat/completions", llm, 200, json!({"model": "qwen3:0.6b", "usage": {"prompt_tokens": 4}, "choices": [{"message": {"content": "OK"}}]})),
+                    ("/v1/chat/completions", llm, 200, json!({"model": "qwen3:1.7b", "usage": {"prompt_tokens": 4}, "choices": [{"message": {"content": "OK"}}]})),
                     ("/api/embed", embed, embed_status, json!({"embeddings": [vec![0.1; 768]]})),
                 ] {
                     let deadline = std::time::Instant::now() + Duration::from_secs(5);

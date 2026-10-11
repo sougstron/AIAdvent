@@ -177,7 +177,8 @@ fn contains(haystack_lower: &str, needle: &str) -> bool {
 
 fn parse_accounting(line: &str) -> Option<Vec<String>> {
     let tail = line.trim().strip_prefix(ACCOUNT_MARK)?;
-    Some(tail.split(',').map(|s| s.trim().trim_matches('`').to_lowercase()).filter(|s| !s.is_empty()).collect())
+    // `[id]` mirrors how the block lists rules (qwen3:1.7b writes it that way); the id must still be known.
+    Some(tail.split(',').map(|s| s.trim().trim_matches(|c| matches!(c, '`' | '[' | ']')).trim().to_lowercase()).filter(|s| !s.is_empty()).collect())
 }
 
 pub fn file_path() -> PathBuf {
@@ -344,6 +345,14 @@ mod tests {
             assert!(set.check(answer, &[]).iter().any(|v| v.kind == ViolationKind::EmptyAnswer));
         }
         assert!(set.check("Привет!\nИНВАРИАНТЫ: нет", &[]).is_empty());
+    }
+
+    #[test]
+    fn bracketed_ids_are_accepted_but_must_still_be_known() {
+        let set = InvariantSet::in_memory();
+        assert!(set.check("2 + 2 = 4\n\nИНВАРИАНТЫ: [stack-rust]", &[]).is_empty());
+        assert!(set.check("2 + 2 = 4\nИНВАРИАНТЫ: [нет]", &[]).is_empty());
+        assert!(set.check("2 + 2 = 4\nИНВАРИАНТЫ: [no-such-rule]", &[]).iter().any(|v| v.kind == ViolationKind::UnknownAccounting));
     }
 
     #[test]

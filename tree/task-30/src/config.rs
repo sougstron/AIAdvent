@@ -43,7 +43,7 @@ const fn or(id: &'static str, live: bool, ctx: u64) -> CatalogModel {
 
 pub const MODEL_CATALOG: &[CatalogModel] = &[
     CatalogModel {
-        id: "qwen3:0.6b",
+        id: "qwen3:1.7b",
         provider: Provider::HomeServer,
         live: true,
         context_window: Some(8192),
