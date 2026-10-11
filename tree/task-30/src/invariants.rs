@@ -58,7 +58,7 @@ pub struct InvariantSet {
 pub enum Origin { User, Model }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ViolationKind { Forbidden, NoAccounting, UnknownAccounting }
+pub enum ViolationKind { Forbidden, NoAccounting, UnknownAccounting, EmptyAnswer }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
@@ -97,7 +97,7 @@ impl InvariantSet {
         for rule in active {
             out.push_str(&format!("- [{}] ({}) {}\n  почему: {}\n  разрешённый обход: {}\n", rule.id, rule.kind.label(), rule.rule, rule.why, rule.workaround));
         }
-        out.push_str("Последняя строка ответа обязательна: «ИНВАРИАНТЫ: <id через запятую>» для фактически затронутых правил либо «ИНВАРИАНТЫ: нет».\n");
+        out.push_str("Сначала дай содержательный ответ на вопрос пользователя. Строка учёта не заменяет ответ. Затем на отдельной последней строке напиши «ИНВАРИАНТЫ: <id через запятую>» для фактически затронутых правил либо «ИНВАРИАНТЫ: нет» (без точки).\n");
         out.push_str(BLOCK_END);
         Some(out)
     }
@@ -135,6 +135,16 @@ impl InvariantSet {
                 }
             },
         }
+        if answer.trim().is_empty()
+            || (answer.lines().last().is_some_and(|line| line.trim().starts_with(ACCOUNT_MARK))
+                && answer.lines().rev().skip(1).all(|line| line.trim().is_empty()))
+        {
+            out.push(Violation {
+                id: "answer".into(), kind: ViolationKind::EmptyAnswer,
+                evidence: "Нет ответа пользователю: сначала ответь на его вопрос, затем добавь отдельную строку учёта".into(),
+                origin: Origin::Model,
+            });
+        }
         out
     }
 
@@ -166,7 +176,7 @@ fn contains(haystack_lower: &str, needle: &str) -> bool {
 }
 
 fn parse_accounting(line: &str) -> Option<Vec<String>> {
-    let (_, tail) = line.trim().split_once(ACCOUNT_MARK)?;
+    let tail = line.trim().strip_prefix(ACCOUNT_MARK)?;
     Some(tail.split(',').map(|s| s.trim().trim_matches('`').to_lowercase()).filter(|s| !s.is_empty()).collect())
 }
 
@@ -325,5 +335,21 @@ mod tests {
         assert!(bad.iter().any(|v| v.id == "stack-rust" && v.origin == Origin::User));
         assert!(bad.iter().any(|v| v.kind == ViolationKind::NoAccounting));
         assert!(set.check("Оставим Rust.\nИНВАРИАНТЫ: stack-rust", &[]).is_empty());
+    }
+
+    #[test]
+    fn accounting_cannot_replace_the_answer() {
+        let set = InvariantSet::in_memory();
+        for answer in ["", "ИНВАРИАНТЫ: нет", "\nИНВАРИАНТЫ: stack-rust"] {
+            assert!(set.check(answer, &[]).iter().any(|v| v.kind == ViolationKind::EmptyAnswer));
+        }
+        assert!(set.check("Привет!\nИНВАРИАНТЫ: нет", &[]).is_empty());
+    }
+
+    #[test]
+    fn inline_marker_does_not_erase_user_facing_text() {
+        let answer = "Привет! ИНВАРИАНТЫ: нет";
+        assert_eq!(InvariantSet::strip_accounting(answer), (answer.into(), None));
+        assert!(InvariantSet::in_memory().check(answer, &[]).iter().any(|v| v.kind == ViolationKind::NoAccounting));
     }
 }
