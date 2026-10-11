@@ -166,7 +166,7 @@ def chat_payload(data):
             raise RequestError(400, "stop must contain 1..4 nonempty strings of at most 256 characters")
         options["stop"] = stop
     payload = {"model": LLM_MODEL, "messages": messages, "stream": False,
-               "think": False, "options": options, "keep_alive": "5m"}
+               "think": False, "options": options, "keep_alive": -1}
     if tools and choice == "auto":
         payload["tools"] = tools
     if "response_format" in data:
@@ -227,7 +227,7 @@ def embedding_payload(data):
     if type(truncate) is not bool:
         raise RequestError(400, "truncate must be boolean")
     return {"model": EMBED_MODEL, "input": texts, "truncate": truncate,
-            "options": {"num_ctx": 4096, "num_thread": 4}, "keep_alive": "5m"}
+            "options": {"num_ctx": 4096, "num_thread": 4}, "keep_alive": -1}
 
 
 class Gateway(BaseHTTPRequestHandler):
