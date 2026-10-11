@@ -37,7 +37,7 @@ it is ready. After stop, verify the project's containers are stopped.
 
 ## Models and app
 
-- CPU-only Qwen3 1.7B (`qwen3:1.7b`), quantized, 4096-token context.
+- CPU-only Qwen3 1.7B (`qwen3:1.7b`), quantized, 8192-token context.
 - `nomic-embed-text` embeddings, compatible with the app's existing model.
 - LLM base: `http://192.168.0.128:11435/v1`.
 - Embeddings: `http://192.168.0.128:11435/api/embed`.

@@ -21,13 +21,28 @@ read-only root filesystems, bounded tmpfs/logs/PIDs and no-new-privileges.
 Models persist in `/opt/ask-home-engine/models`; secrets persist separately in
 `/opt/ask-home-engine/secrets.env` (0600), never in the repository.
 
-Post-deployment measurement with Qwen loaded: Ollama 1.933 GiB, gateway
+Initial deployment measurement (4096-token window) with Qwen loaded: Ollama 1.933 GiB, gateway
 19.93 MiB; host 6.3 GiB available, root 67 GiB available, model files 1.6 GiB.
 `ollama ps` reports one `qwen3:1.7b` runner, **100% CPU**, **4096 context**.
 Qwen is 2.0B parameters, Q4_K_M; nomic is 137M, F16, 768-dimensional output.
 Resolved image digests: Ollama
 `sha256:2c9595c555fd70a28363489ac03bd5bf9e7c5bdf2890373c3a830ffd7252ce6d`,
 Python `sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641`.
+
+On 2026-10-11 the Qwen window was increased to **8192 tokens** in both
+Compose and the chat gateway; the app catalog/footer uses the same limit.
+Ollama reported **2.4 GB, 100% CPU, context 8192**; container usage was
+2.333 GiB plus 17.78 MiB for the gateway, inside the unchanged 4 GiB budget.
+A real authenticated request used **5504 prompt + 9 completion tokens** and
+returned the exact code `ORBIT-PINE-732` placed before the filler text,
+proving retention beyond the previous 4096-token window. The old 180-second
+backend deadline timed out on long CPU prefill; it is now 600 seconds.
+Embedding context remains 4096. Longer histories still require context
+management; 8192 includes both input and generated output.
+A second uncached request used **4596 + 10 tokens**, recalled
+`CEDAR-MOON-846` from the beginning, and completed in **203.8 seconds**.
+The rebuilt app was launched in a guest PTY: footer
+`ctx 435~/8192 (5%)`, `/quit` exit 0; 15 config tests passed.
 
 ## Install (new deployment only)
 
@@ -90,7 +105,7 @@ environment secrets; this does not protect against a compromised root host.
   rejected. Supports `temperature`, `top_p`, native `top_k` (-1..2147483647;
   -1 disables vocabulary filtering), `seed`,
   `stop` and either `max_tokens` or `max_completion_tokens` (1..2048; default
-  1024). Maps to Ollama `/api/chat` with **think=false**, **num_ctx=4096**,
+  1024). Maps to Ollama `/api/chat` with **think=false**, **num_ctx=8192**,
   4 CPU threads. Returns actual prompt/completion/total token counts and
   `stop`/`length`/`tool_calls` finish reason.
   Function `tools` (up to 64) and `tool_choice: auto|none` use native Ollama
@@ -117,7 +132,8 @@ environment secrets; this does not protect against a compromised root host.
   is **504**, unavailable/malformed response **502**.
 
 Requests are capped at 1 MiB, backend replies at 8 MiB; socket idle timeouts
-are 15 seconds for clients and 180 seconds for the backend. Maximum eight HTTP workers;
+are 15 seconds for clients and 600 seconds for the backend (8k CPU prefill can
+exceed three minutes). Maximum eight HTTP workers;
 **one inference request total** across chat and embeddings. Excess concurrency
 gets **429** with Retry-After instead of an unbounded queue. Ollama keeps only
 one loaded model, one parallel request and a five-minute keep-alive. Switching

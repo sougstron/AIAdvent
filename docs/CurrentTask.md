@@ -8,7 +8,7 @@
 - Задачи 26–30: **домашний локальный LLM + embeddings**, на базе дословной
   копии task-25. Серверный код: `tree/task-30/server/`, запуск на PVE
   `192.168.0.128` в отдельном Docker Compose проекте `ask-home-engine`;
-  CPU-only Qwen3 (`qwen3:1.7b`, GGUF 2.0B Q4_K_M, контекст 4096) и
+  CPU-only Qwen3 (`qwen3:1.7b`, GGUF 2.0B Q4_K_M, контекст 8192) и
   `nomic-embed-text`. Общий лимит памяти 4 GiB без swap; существующие
   сервисы, CT и VM не останавливались. API: порт 11435, отдельные Bearer-ключи
   чата и embeddings, секреты вне репозитория. `home-server` в `/login`

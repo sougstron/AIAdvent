@@ -46,7 +46,7 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         id: "qwen3:1.7b",
         provider: Provider::HomeServer,
         live: true,
-        context_window: Some(4096),
+        context_window: Some(8192),
     },
     // Context windows (the footer's context meter divides by these):
     // z.ai's own numbers where they are published for the direct API

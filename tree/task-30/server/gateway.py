@@ -33,7 +33,7 @@ def backend(path, payload):
     request = urllib.request.Request(BACKEND + path, json.dumps(payload).encode(),
                                      {"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=600) as response:
             raw = response.read(RESPONSE_LIMIT + 1)
         if len(raw) > RESPONSE_LIMIT:
             raise RequestError(502, "Backend response exceeds limit")
@@ -136,7 +136,7 @@ def chat_payload(data):
                 or not tool["function"]["name"]
                 or not isinstance(tool["function"].get("parameters"), dict)):
             raise RequestError(400, "Tools require a function name and JSON parameters schema")
-    options = {"num_ctx": 4096, "num_predict": 1024, "num_thread": 4}
+    options = {"num_ctx": 8192, "num_predict": 1024, "num_thread": 4}
     if "max_tokens" in data and "max_completion_tokens" in data:
         raise RequestError(400, "Use only one output token limit")
     for field in ("max_tokens", "max_completion_tokens"):
