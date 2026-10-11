@@ -37,7 +37,6 @@ use crate::api::{ChatMessage, Endpoint};
 use crate::config::{Res, Settings};
 use crate::memory::{self, MemoryStore};
 use crate::session::{self, Session, SessionSummary};
-use crate::pipeline::{self, Decision};
 
 // ---------------------------------------------------------------- policies
 
@@ -463,19 +462,6 @@ fn attach_memory(agent: &mut Agent, session: &Session) {
     agent.set_profiles(crate::profile::ProfileSet::open(memory::memory_root()));
 }
 
-fn policy_reply(text: String) -> Reply {
-    Reply {
-        text,
-        model: String::new(),
-        finish_reason: Some("invariant".into()),
-        usage: crate::api::Usage::default(),
-        reasoning: None,
-        latency_ms: 0,
-        truncated_by_max_chars: false,
-        raw: serde_json::Value::Null,
-    }
-}
-
 pub struct AgentBox {
     id: String,
     label: String,
@@ -639,8 +625,8 @@ impl AgentBox {
 
     /// [`Self::ask`], but what goes to the model is `wire(sent)` — the
     /// guarded prompt rewritten for this one request (task 22: RAG adds the
-    /// retrieved chunks). Session, memory and the invariant check keep the
-    /// prompt as it was typed.
+    /// retrieved chunks). Session and memory keep the prompt as it was
+    /// typed.
     pub fn ask_with(&mut self, prompt: &str, wire: Option<&WireFn<'_>>) -> Res<Turn> {
         let (verdict, sent) = self.input.apply(prompt);
         if verdict != InputVerdict::Allow {
@@ -675,53 +661,11 @@ impl AgentBox {
         if let (Some(wire), Some(last)) = (wire, wire_history.last_mut()) {
             last.content = wire(&sent)?;
         }
-        let invariants = self.agent.invariants().clone();
-        let invariants_enabled = self.agent.settings().invariants;
-        let pipeline = pipeline::run_with(
-            &invariants,
-            invariants_enabled,
-            &sent,
-            |_, retry_note| {
-                let mut attempt_history = wire_history.clone();
-                if let Some(note) = retry_note {
-                    attempt_history.push(ChatMessage::user(note));
-                }
-                self.agent.complete(&attempt_history)
-            },
-        )?;
-        let (mut reply, policy_generated) = match pipeline.decision {
-            Decision::Pass { text, mut reply, .. } => {
-                reply.text = text;
-                (reply, false)
-            }
-            Decision::RefusedByInvariant { explanation, .. } => {
-                (policy_reply(explanation), true)
-            }
-            Decision::GaveUp { mut last, violations } => {
-                let ids = violations
-                    .iter()
-                    .map(|v| v.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                last.text = format!(
-                    "Не могу выдать ответ: после {} попыток модель всё ещё нарушает инварианты ({ids}).",
-                    crate::invariants::MAX_ATTEMPTS
-                );
-                (last, true)
-            }
-        };
-
-        // A deterministic policy response is not model output. In
-        // particular, JSON-mode output validation must not suppress the
-        // required invariant refusal.
-        let (out_verdict, text) = if policy_generated {
-            (OutputVerdict::Accept, reply.text.clone())
-        } else {
-            self.output.apply(&reply.text)
-        };
+        let mut reply = self.agent.complete(&wire_history)?;
+        let (out_verdict, text) = self.output.apply(&reply.text);
         reply.text = text.clone();
-        let judgement = match (&self.judge, out_verdict.accepted(), policy_generated) {
-            (Some(judge), true, false) => Some(judge.judge(&sent, &text)?),
+        let judgement = match (&self.judge, out_verdict.accepted()) {
+            (Some(judge), true) => Some(judge.judge(&sent, &text)?),
             _ => None,
         };
         let turn = Turn {
@@ -996,27 +940,6 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<AgentBox>();
         assert_send::<Runtime>();
-    }
-
-    #[test]
-    fn invariant_conflict_is_a_safe_answer_without_transport_or_json_suppression() {
-        let mut rt = runtime("invariant-refusal");
-        let mut settings = Settings {
-            context_enabled: false,
-            ..Settings::default()
-        };
-        settings.json_mode.enabled = true;
-        let id = rt.spawn(BoxSpec::new("guarded", settings));
-        let turn = rt
-            .get_mut(&id)
-            .unwrap()
-            .ask("Давай перепишем приложение на Electron")
-            .unwrap();
-        assert!(turn.accepted());
-        assert!(turn.text.contains("stack-rust"));
-        assert!(turn.text.contains("Обход:"));
-        assert_eq!(turn.reply.as_ref().unwrap().usage.total_tokens, 0);
-        assert_eq!(rt.get(&id).unwrap().history().len(), 2);
     }
 
     #[test]

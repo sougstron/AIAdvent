@@ -25,10 +25,13 @@
 //! 2. `~/.claude/CLAUDE.md`
 //! 3. `~/.config/ask/AGENTS.md`
 //!
-//! Local: from `cwd` walk up to the git root (a directory that contains
-//! `.git`). At each directory `AGENTS.md` wins over `CLAUDE.md`. Several
-//! hits are included **outermost-first** (git root, then children, then
-//! cwd). No git root → only `cwd` is searched, never `/`.
+//! Local: from `cwd` walk up to, but **not including**, the git root (a
+//! directory that contains `.git`). The root's own `AGENTS.md` /
+//! `CLAUDE.md` describe how to develop the repo (homework tasks), not how to
+//! chat, and cost thousands of prompt tokens on small home models. At each
+//! directory `AGENTS.md` wins over `CLAUDE.md`. Several hits are included
+//! **outermost-first** (outer dirs, then cwd). No git root → only `cwd` is
+//! searched, never `/`.
 //!
 //! Unreadable, missing, directory, or NUL-containing ("binary") files are
 //! skipped. Each file is capped at [`MAX_FILE_CHARS`]; overflow keeps a
@@ -197,7 +200,8 @@ fn discover_local(cwd: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Innermost-first (cwd → git root). No `.git` → cwd only.
+/// Innermost-first (cwd → just below the git root; the root itself is
+/// skipped). No `.git` → cwd only.
 fn local_search_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut current = absolute(cwd);
@@ -218,6 +222,7 @@ fn local_search_dirs(cwd: &Path) -> Vec<PathBuf> {
         }
     }
     if found_git {
+        dirs.pop();
         dirs
     } else {
         dirs.truncate(1);
@@ -340,7 +345,8 @@ mod tests {
     fn local_walks_up_to_git_root_outermost_first() {
         let root = Scratch::new("walk");
         git_repo(root.path());
-        write(root.path(), "AGENTS.md", "OUTER_MARK");
+        write(root.path(), "AGENTS.md", "ROOT_MARK");
+        write(root.path(), "sub/AGENTS.md", "OUTER_MARK");
         write(root.path(), "sub/mid/AGENTS.md", "INNER_MARK");
         let home = Scratch::new("walk-home");
         let cwd = root.path().join("sub/mid");
@@ -361,12 +367,16 @@ mod tests {
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo).unwrap();
         git_repo(&repo);
-        write(&repo, "AGENTS.md", "INREPO_MARK");
+        write(&repo, "AGENTS.md", "ROOT_MARK");
+        write(&repo, "app/AGENTS.md", "INREPO_MARK");
         let home = Scratch::new("git-stop-home");
-        let bundle = ContextBundle::load(&repo, home.path(), MAX_FILE_CHARS);
+        let bundle = ContextBundle::load(&repo.join("app"), home.path(), MAX_FILE_CHARS);
         let assembled = bundle.assemble("SYS");
         assert!(assembled.contains("INREPO_MARK"));
+        assert!(!assembled.contains("ROOT_MARK"), "git root AGENTS.md is for repo development");
         assert!(!assembled.contains("OUTSIDE_MARK"));
+        let at_root = ContextBundle::load(&repo, home.path(), MAX_FILE_CHARS);
+        assert!(at_root.files.is_empty());
     }
 
     #[test]
@@ -386,10 +396,10 @@ mod tests {
     fn local_claude_md_is_fallback_when_agents_md_absent() {
         let root = Scratch::new("claude-fb");
         git_repo(root.path());
-        write(root.path(), "CLAUDE.md", "CLAUDE_LOCAL");
-        write(root.path(), "src/AGENTS.md", "AGENTS_LOCAL");
+        write(root.path(), "app/CLAUDE.md", "CLAUDE_LOCAL");
+        write(root.path(), "app/src/AGENTS.md", "AGENTS_LOCAL");
         let home = Scratch::new("claude-fb-home");
-        let bundle = ContextBundle::load(&root.path().join("src"), home.path(), MAX_FILE_CHARS);
+        let bundle = ContextBundle::load(&root.path().join("app/src"), home.path(), MAX_FILE_CHARS);
         let bodies: Vec<&str> = bundle.files.iter().map(|f| f.body.as_str()).collect();
         assert_eq!(bodies, ["CLAUDE_LOCAL", "AGENTS_LOCAL"]);
     }
@@ -398,10 +408,10 @@ mod tests {
     fn agents_md_wins_over_claude_md_in_the_same_directory() {
         let root = Scratch::new("same-dir");
         git_repo(root.path());
-        write(root.path(), "AGENTS.md", "AGENTS_WINS");
-        write(root.path(), "CLAUDE.md", "CLAUDE_LOSES");
+        write(root.path(), "app/AGENTS.md", "AGENTS_WINS");
+        write(root.path(), "app/CLAUDE.md", "CLAUDE_LOSES");
         let home = Scratch::new("same-dir-home");
-        let bundle = ContextBundle::load(root.path(), home.path(), MAX_FILE_CHARS);
+        let bundle = ContextBundle::load(&root.path().join("app"), home.path(), MAX_FILE_CHARS);
         assert_eq!(bundle.files.len(), 1);
         assert_eq!(bundle.files[0].body, "AGENTS_WINS");
     }
@@ -422,9 +432,9 @@ mod tests {
     fn truncation_caps_body_and_notes_it() {
         let root = Scratch::new("trunc");
         git_repo(root.path());
-        write(root.path(), "AGENTS.md", "abcdefghijklmnopqrstuvwxyz");
+        write(root.path(), "app/AGENTS.md", "abcdefghijklmnopqrstuvwxyz");
         let home = Scratch::new("trunc-home");
-        let bundle = ContextBundle::load(root.path(), home.path(), 8);
+        let bundle = ContextBundle::load(&root.path().join("app"), home.path(), 8);
         assert_eq!(bundle.files.len(), 1);
         let f = &bundle.files[0];
         assert!(f.truncated);
@@ -440,8 +450,8 @@ mod tests {
         write(home.path(), ".pi/agent/AGENTS.md", "GLOBAL_ONCE");
         let root = Scratch::new("both-cwd");
         git_repo(root.path());
-        write(root.path(), "AGENTS.md", "LOCAL_ONCE");
-        let bundle = ContextBundle::load(root.path(), home.path(), MAX_FILE_CHARS);
+        write(root.path(), "app/AGENTS.md", "LOCAL_ONCE");
+        let bundle = ContextBundle::load(&root.path().join("app"), home.path(), MAX_FILE_CHARS);
         let assembled = bundle.assemble("SYS_HEAD");
         assert_eq!(assembled.matches("GLOBAL_ONCE").count(), 1);
         assert_eq!(assembled.matches("LOCAL_ONCE").count(), 1);
@@ -453,7 +463,7 @@ mod tests {
         assert!(assembled.contains("scope=\"global\""));
         assert!(assembled.contains("scope=\"local\""));
         let global_path = home.path().join(".pi/agent/AGENTS.md");
-        let local_path = root.path().join("AGENTS.md");
+        let local_path = root.path().join("app/AGENTS.md");
         assert!(assembled.contains(&global_path.display().to_string()));
         assert!(assembled.contains(&local_path.display().to_string()));
     }
@@ -462,9 +472,9 @@ mod tests {
     fn disabled_bundle_does_not_inject_files() {
         let root = Scratch::new("off");
         git_repo(root.path());
-        write(root.path(), "AGENTS.md", "SHOULD_NOT_APPEAR");
+        write(root.path(), "app/AGENTS.md", "SHOULD_NOT_APPEAR");
         let home = Scratch::new("off-home");
-        let mut bundle = ContextBundle::load(root.path(), home.path(), MAX_FILE_CHARS);
+        let mut bundle = ContextBundle::load(&root.path().join("app"), home.path(), MAX_FILE_CHARS);
         assert!(!bundle.files.is_empty());
         bundle.enabled = false;
         assert_eq!(bundle.assemble("SYS"), "SYS");

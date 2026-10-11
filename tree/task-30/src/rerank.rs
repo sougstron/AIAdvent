@@ -173,8 +173,7 @@ impl Judge {
         let mut s = settings.clone();
         s.system_prompt = JUDGE_SYSTEM.into();
         s.context_enabled = false;
-        s.invariants = false;
-        s.todo = false;
+            s.todo = false;
         s.rag = false;
         s.profile = crate::profile::OFF.into();
         s.json_mode.enabled = false;

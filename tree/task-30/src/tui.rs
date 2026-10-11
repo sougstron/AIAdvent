@@ -236,18 +236,6 @@ fn outcome_from_reply(reply: crate::agent::Reply) -> api::Outcome {
     }
 }
 
-fn policy_outcome(text: String, reason: &str) -> api::Outcome {
-    api::Outcome {
-        content: Some(text),
-        reasoning: None,
-        finish_reason: Some(reason.into()),
-        model: None,
-        usage: api::Usage::default(),
-        raw: Value::Null,
-        latency_ms: 0,
-    }
-}
-
 enum Entry {
     User(String),
     Assistant { text: String, note: Option<String> },
@@ -2345,8 +2333,8 @@ impl App {
     /// в терминал, гейт или паузу.
     ///
     /// Каждый шаг проходит три отсечки, и ни одну нельзя пропустить:
-    /// пайплайн проверяет контракт этапа (`todo::check_stage_output`) с тем
-    /// же retry, что и инварианты; `TaskState::confirm` требует маркер
+    /// пайплайн проверяет контракт этапа (`todo::check_stage_output`) с
+    /// retry; `TaskState::confirm` требует маркер
     /// закрытия **текущего** этапа; и только потом `TaskRun::apply` даёт
     /// таблице решить, куда мы попадём — в следующий этап, под подпись
     /// человека или обратно на переделку.
@@ -3991,7 +3979,7 @@ impl App {
         echo: Option<String>,
         terminal: &mut DefaultTerminal,
     ) {
-        let invariant_query = question.clone();
+        let query = question.clone();
         let staged = echo.is_some();
         // Calls left over from a turn cancelled with Esc belong to that turn.
         self.take_mcp_steps();
@@ -4033,11 +4021,11 @@ impl App {
             // получает блок <task-state> тем же состоянием.
             let mem = if self.settings.chatmem { Some(self.session.task_mem().clone()) } else { None };
             let retrieval_q =
-                mem.as_ref().map(|m| m.retrieval_query(&invariant_query)).unwrap_or_else(|| invariant_query.clone());
+                mem.as_ref().map(|m| m.retrieval_query(&query)).unwrap_or_else(|| query.clone());
             match self.rag_prepare(&retrieval_q, terminal) {
                 Some(Ok(p)) => {
                     self.entries.push(Entry::Info(p.note));
-                    self.cited_turn(&invariant_query, p.retrieval, history, mem, terminal);
+                    self.cited_turn(&query, p.retrieval, history, mem, terminal);
                     return;
                 }
                 Some(Err(e)) => self.entries.push(Entry::Info(format!("RAG: {e} — отвечаю без RAG"))),
@@ -4050,18 +4038,13 @@ impl App {
             }
         }
 
-        // With invariants enabled the complete answer must pass the
-        // deterministic validator before any assistant text reaches the
-        // transcript or session. Rejected model attempts stay ephemeral.
-        // Ход этапа всегда идёт через пайплайн, даже когда инварианты
-        // выключены: контракт этапа (`check_stage_output`) — не политика
-        // проекта, а условие, без которого лестница врёт про пройденный
-        // этап. Поэтому `stage_contract` тоже заводит эту ветку.
-        if self.settings.invariants || self.stage_contract.is_some() {
-            let inv_on = self.settings.invariants;
+        // Ход этапа идёт через пайплайн: контракт этапа
+        // (`check_stage_output`) — условие, без которого лестница врёт про
+        // пройденный этап. Ответ проверяется целиком до того, как попадёт в
+        // транскрипт или сессию; отклонённые попытки остаются эфемерными.
+        if self.stage_contract.is_some() {
             let stage = self.stage_contract;
             let agent = self.prepared_agent();
-            let set = agent.invariants().clone();
             let hist = history.clone();
             let label = match stage {
                 Some(st) => format!("этап `{}`: думаю", st.id()),
@@ -4069,7 +4052,7 @@ impl App {
             };
             self.arm_flow_feed();
             let result = self.with_spinner(terminal, &label, move || {
-                crate::pipeline::run_stage_with(&set, inv_on, stage, &invariant_query, |_, retry_note| {
+                crate::pipeline::run_stage_with(stage, |_, retry_note| {
                     let mut attempt = hist.clone();
                     if let Some(note) = retry_note {
                         attempt.push(ChatMessage::user(note));
@@ -4081,21 +4064,18 @@ impl App {
             match result {
                 Some(Ok(result)) => {
                     let outcome = match result.decision {
-                        crate::pipeline::Decision::Pass { text, mut reply, .. } => {
+                        crate::pipeline::Decision::Pass { text, mut reply } => {
                             reply.text = text;
                             outcome_from_reply(reply)
-                        }
-                        crate::pipeline::Decision::RefusedByInvariant { explanation, .. } => {
-                            policy_outcome(explanation, "invariant")
                         }
                         crate::pipeline::Decision::GaveUp { last, violations } => {
                             let ids = violations.iter().map(|v| v.id.as_str()).collect::<Vec<_>>().join(", ");
                             let mut outcome = outcome_from_reply(last);
                             outcome.content = Some(format!(
-                                "Не могу выдать ответ: после {} попыток модель всё ещё нарушает инварианты ({ids}).",
-                                crate::invariants::MAX_ATTEMPTS
+                                "Не могу выдать ответ: после {} попыток модель всё ещё нарушает контракт этапа ({ids}).",
+                                crate::pipeline::MAX_ATTEMPTS
                             ));
-                            outcome.finish_reason = Some("invariant_retry_limit".into());
+                            outcome.finish_reason = Some("stage_retry_limit".into());
                             outcome
                         }
                     };
@@ -6327,6 +6307,8 @@ mod tests {
     #[test]
     fn context_command_toggles_injection() {
         let mut app = App::new(Agent::dummy(), config::Settings::default(), None);
+        assert!(!app.settings.context_enabled, "context is off by default");
+        app.cmd_context("on");
         assert!(app.settings.context_enabled);
         app.cmd_context("off");
         assert!(!app.settings.context_enabled);

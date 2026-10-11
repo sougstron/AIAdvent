@@ -12,7 +12,6 @@ use crate::config::{ContextStrategy, Res, Settings};
 use crate::context::{ContextBundle, LoadedFile, MAX_FILE_CHARS};
 use crate::facts::{self, FactStore, FactsDelta};
 use crate::memory::{self, Layer, MemoryStore};
-use crate::invariants::InvariantSet;
 use crate::mcp_agent::{self, SharedToolbox};
 use crate::profile::{self, Profile, ProfileSet};
 use crate::todo::TaskState;
@@ -101,9 +100,6 @@ pub struct Agent {
     /// внутри них: настройка `todo` — это «вести автомат или нет», а сам
     /// автомат — состояние разговора, и уезжает он в файл сессии.
     todo: TaskState,
-    /// Project invariants are loaded from their own file, never serialized
-    /// into the dialogue session.
-    invariants: InvariantSet,
     /// Подключённый MCP-сервер (задача 17): пока он есть, обычный ход идёт
     /// через цикл `tool_calls` → `tools/call` (см. `mcp_agent::tool_loop`).
     /// Общий на все клоны агента — сессия с сервером одна.
@@ -144,11 +140,6 @@ impl Agent {
             memory: MemoryStore::in_memory(),
             profiles: ProfileSet::in_memory(),
             todo: TaskState::new(),
-            invariants: if cfg!(test) {
-                InvariantSet::in_memory()
-            } else {
-                InvariantSet::load_default()
-            },
             mcp: None,
         };
         agent.refresh_context();
@@ -184,10 +175,6 @@ impl Agent {
 
     pub fn settings_mut(&mut self) -> &mut Settings {
         &mut self.settings
-    }
-
-    pub fn invariants(&self) -> &InvariantSet {
-        &self.invariants
     }
 
 
@@ -605,13 +592,6 @@ impl Agent {
             &self.facts,
             &self.memory,
         );
-        // Инварианты — отдельный system-блок. Он идёт перед состоянием
-        // задачи, чтобы task-state по-прежнему оставался последним.
-        if self.settings.invariants {
-            if let Some(block) = self.invariants.block() {
-                blocks.push(block);
-            }
-        }
         // Состояние задачи идёт последним — ближе всего к сообщениям: это
         // не роль и не знания, а «где мы сейчас». Выключенная тудушка или
         // пустое состояние не добавляют в запрос ничего.
@@ -1049,27 +1029,6 @@ mod tests {
     }
 
     #[test]
-    fn invariant_block_is_separate_and_precedes_task_state() {
-        let mut agent = Agent::dummy();
-        let system = agent.system_for_request();
-        assert_eq!(system.matches(crate::invariants::BLOCK_HEAD).count(), 1);
-        assert!(!agent.history().iter().any(|m| m.content.contains(crate::invariants::BLOCK_HEAD)));
-
-        let mut state = crate::todo::TaskState::new();
-        state.start("проверить порядок").unwrap();
-        agent.set_todo(state);
-        agent.settings_mut().todo = true;
-        let system = agent.system_for_request();
-        let inv = system.find(crate::invariants::BLOCK_HEAD).unwrap();
-        let todo = system.find(crate::todo::BLOCK_HEAD).unwrap();
-        assert!(inv < todo);
-        assert!(system.trim_end().ends_with(crate::todo::BLOCK_END));
-
-        agent.settings_mut().invariants = false;
-        assert!(!agent.system_for_request().contains(crate::invariants::BLOCK_HEAD));
-    }
-
-    #[test]
     fn unknown_profile_is_an_error_and_off_clears_the_block() {
         let mut agent = Agent::dummy_with(Settings::default());
         assert!(agent.set_profile("нет-такого").is_err());
@@ -1088,9 +1047,9 @@ mod tests {
         let home = scratch("home");
         write_tree(&home, ".pi/agent/AGENTS.md", "AGENT_GLOBAL");
         let cwd = scratch("cwd");
-        std::fs::create_dir_all(cwd.join(".git")).unwrap();
         write_tree(&cwd, "AGENTS.md", "AGENT_LOCAL");
-        let agent = Agent::dummy_at(cwd.clone(), home.clone(), Settings::default());
+        let on = Settings { context_enabled: true, ..Settings::default() };
+        let agent = Agent::dummy_at(cwd.clone(), home.clone(), on);
         assert_eq!(agent.cwd(), cwd.as_path());
         assert_eq!(agent.context().cwd, cwd);
         assert!(agent.context().enabled);
@@ -1110,12 +1069,11 @@ mod tests {
         let home = scratch("tog-home");
         write_tree(&home, ".pi/agent/AGENTS.md", "G");
         let a = scratch("tog-a");
-        std::fs::create_dir_all(a.join(".git")).unwrap();
         write_tree(&a, "AGENTS.md", "LOCAL_A");
         let b = scratch("tog-b");
-        std::fs::create_dir_all(b.join(".git")).unwrap();
         write_tree(&b, "AGENTS.md", "LOCAL_B");
-        let mut agent = Agent::dummy_at(a.clone(), home.clone(), Settings::default());
+        let on = Settings { context_enabled: true, ..Settings::default() };
+        let mut agent = Agent::dummy_at(a.clone(), home.clone(), on);
         assert!(agent.system_for_request().contains("LOCAL_A"));
         agent.set_cwd(&b);
         let system = agent.system_for_request();
