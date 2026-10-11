@@ -37,7 +37,7 @@ case "${1:-status}" in
         # Only this new container gets temporary egress; never publish its API.
         docker network connect bridge "$id"
         trap 'docker network disconnect bridge "$id"' EXIT HUP INT TERM
-        compose exec -T ollama ollama pull qwen3:1.7b
+        compose exec -T ollama ollama pull qwen3:0.6b
         compose exec -T ollama ollama pull nomic-embed-text
         compose exec -T ollama ollama list
         ;;

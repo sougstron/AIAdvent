@@ -94,14 +94,14 @@ pub fn guard_live_model(provider: Provider, model: &str) -> Res<()> {
         Provider::Glm => model == LIVE_COMPLETION_MODEL,
         Provider::DeepSeek => model == "deepseek-flash",
         Provider::OpenRouter => model.ends_with(":free"),
-        Provider::HomeServer => model == "qwen3:1.7b",
+        Provider::HomeServer => model == "qwen3:0.6b",
     };
     if !allowed {
         let what = match provider {
             Provider::Glm => format!("only `{LIVE_COMPLETION_MODEL}`"),
             Provider::DeepSeek => "only `deepseek-flash`".to_string(),
             Provider::OpenRouter => "only ids ending in `:free`".to_string(),
-            Provider::HomeServer => "only `qwen3:1.7b` (local inference)".to_string(),
+            Provider::HomeServer => "only `qwen3:0.6b` (local inference)".to_string(),
         };
         return Err(format!(
             "refusing to call `{model}` on {}: {what} may be used for live \
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn home_server_omits_vendor_reasoning_and_restricts_the_model() {
         let settings = Settings {
-            model: "qwen3:1.7b".into(),
+            model: "qwen3:0.6b".into(),
             effort: Effort::High,
             budget_tokens: Some(60),
             top_k: Some(10),
@@ -690,9 +690,9 @@ mod tests {
         assert_eq!(body["response_format"]["type"], "json_object");
         assert_eq!(body["top_k"], 10);
         assert!(!settings.thinking());
-        assert!(guard_live_model(Provider::HomeServer, "qwen3:1.7b").is_ok());
+        assert!(guard_live_model(Provider::HomeServer, "qwen3:0.6b").is_ok());
         assert!(guard_live_model(Provider::HomeServer, "glm-5.3-flash").is_err());
-        assert!(guard_live_model(Provider::Glm, "qwen3:1.7b").is_err());
+        assert!(guard_live_model(Provider::Glm, "qwen3:0.6b").is_err());
         assert!(guard_live_model(Provider::HomeServer, "another:free").is_err());
     }
 
