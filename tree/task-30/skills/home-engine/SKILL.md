@@ -37,13 +37,14 @@ it is ready. After stop, verify the project's containers are stopped.
 
 ## Models and app
 
-- CPU-only Qwen3 0.6B (`qwen3:0.6b`), Q4_K_M, 8192-token context.
+- Qwen3 1.7B (`qwen3:1.7b`), Q4_K_M, 8192-token context, served by llama.cpp
+  `llama-server` (Vulkan) on the Radeon 680M iGPU; Ollama serves only nomic.
 - `nomic-embed-text` embeddings, compatible with the app's existing model.
 - LLM base: `http://192.168.0.128:11435/v1`.
 - Embeddings: `http://192.168.0.128:11435/api/embed`.
 - Separate Bearer keys for chat and embeddings. The app login input is a
   single bundle `LLM_KEY:EMBED_KEY`; never send that bundle as a Bearer key.
-- App: `/login home-server`, choose `qwen3:0.6b` in the model picker;
+- App: `/login home-server`, choose `qwen3:1.7b` in the model picker;
   `/rag provider home-server` chooses remote embeddings. `/rag provider local`
   restores local Ollama.
 

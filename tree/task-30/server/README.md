@@ -1,8 +1,59 @@
-# CPU-only home engine
+# Home engine: qwen3:1.7b on the iGPU, nomic on CPU
 
 Isolated Docker Compose project `ask-home-engine`, installed only into the new
 `/opt/ask-home-engine` directory on `root@192.168.0.128`. No VM, CT, existing
-Docker workload, GPU, host service or router configuration is changed.
+Docker workload, host service or router configuration is changed.
+
+## Current layout (TASK-120, 2026-10-11)
+
+- `chat`: llama.cpp `llama-server` (Vulkan build, image pinned by digest
+  `f05a83f1…`, b11552) runs `qwen3:1.7b` fully on the Radeon 680M
+  (`-ngl 99`, 8192 context, flash attention, thinking off via the chat
+  template). Only `/dev/dri/renderD128` is passed in (group `render`, 993);
+  still unprivileged, read-only root, no capabilities. Weights + KV live in
+  the 4 GiB BIOS VRAM carve-out (2.2 GB used), which is already outside the
+  host's 19 GiB, so the container itself uses ~100–200 MiB RAM. The GGUF is
+  the Ollama blob `sha256-3d0b7905…` read-only; nothing new was downloaded.
+  Sampling defaults copy the model's Ollama params (temp 0.6, top_k 20,
+  top_p 0.95, min_p 0); the host-RAM prompt cache is capped at 512 MiB.
+- `ollama`: Ollama 0.13.5, now **embeddings only** (`nomic-embed-text`, CPU,
+  2 threads). It stays on Ollama on purpose: llama.cpp's nomic vectors for
+  the same GGUF had cosine only 0.82–0.85 with Ollama's, which would silently
+  break every RAG index built through Ollama (local or home-server).
+- `gateway`: unchanged contract and keys; chat now goes to llama-server's
+  OpenAI API and **SSE is real incremental streaming** (chunks are relayed as
+  generated, fields whitelisted).
+
+Limits: chat 1536 MiB / 1.20 CPU, ollama 1024 MiB / 2.50 CPU, gateway
+256 MiB / 0.25 CPU — 2.75 GiB RAM total, below the previous 4 GiB, no swap,
+3.95 CPUs. Threads ≤ quota: 0 throttled periods measured (Ollama had 89%).
+
+Measured via the LAN gateway (single runs, not an SLA):
+
+| | Ollama CPU, before | llama-server Vulkan, now |
+|---|--:|--:|
+| 5434-token prompt, time to first token | ~200 s (4596 tok) | **10.9 s** |
+| same prompt again (prefix cached) | — | 0.10 s |
+| decode, qwen3:1.7b | not measured (0.6B: 27 tok/s) | **~35 tok/s** |
+| short chat (27 + 10 tokens) | — | 0.51 s |
+| app CLI with full AGENTS.md, 5 invariant retries | ~10 min | 5 s |
+
+The 5434-token prompt recalled the code placed at its start. A request over
+8192 tokens now returns a clear **400** (`request (9434 tokens) exceeds the
+available context size`) instead of Ollama's silent truncation.
+
+`qwen3:4b` A/B (temporary container, then removed; its blob stays in
+`models`, remove with `ollama rm qwen3:4b` if unwanted): 3.8 of 4.0 GB VRAM,
+decode 13.4 tok/s, 26 s for the same 5.4k prompt, better answers on the full
+project prompt but still failed the invariants accounting, and it was
+OOM-killed at 1.5 GiB by the then-uncapped prompt cache. Not adopted.
+
+Rollback: `backups/2026-10-11-pre-vulkan/` on the server holds the previous
+`compose.yaml`, `gateway.py`, `control.sh`, `README.md`; copy them back and
+run `control.sh start` (the `chat` container then becomes an orphan: stop it
+with `docker compose … rm -sf chat`). Models and keys are untouched.
+
+Everything below up to "Install" is the history of the CPU-only setup.
 
 ## Inventory and resource budget
 
@@ -57,7 +108,7 @@ gateway **17.79 MiB**, host available RAM **6.1 GiB**; the aggregate
 
 ### 2026-10-11: 0.6B trial and initial-prompt measurements
 
-The current gateway and app use `qwen3:0.6b`, Q4_K_M, 8192 context.
+At that point the gateway and app used `qwen3:0.6b`, Q4_K_M, 8192 context.
 The earlier measurements above describe 1.7B. Its files remain available,
 but its runner is unloaded; Qwen 0.6B and nomic are both CPU/Forever.
 Final `ollama ps`: Qwen 1.5 GB, nomic 565 MB. Ollama 1.866 GiB,
@@ -90,8 +141,11 @@ private backup and review changes. Never delete models, secrets or other data.
 ./deploy.sh /home/shmon/.local/share/kanban4ai/projects/homework/.kanban/backups/TASK-118/home-server-keys.txt
 ```
 
-This pulls pinned Ollama 0.13.5 and Python 3.13 images, then `qwen3:0.6b` and
+This pulls the pinned llama.cpp Vulkan, Ollama 0.13.5 and Python 3.13 images,
+then `qwen3:1.7b` (only for its GGUF blob, loaded by `chat`) and
 `nomic-embed-text`, starts only this project, and writes a private 0600 bundle.
+If Ollama ever re-pulls `qwen3:1.7b` with a different blob digest, update
+the `-m` path in `compose.yaml`.
 Image tags are explicit; Docker stores the resolved image digests at deploy.
 Only Ollama temporarily joins the existing default bridge for model downloads;
 `control.sh pull` disconnects it afterward. Its API has **no published port**.
@@ -133,28 +187,27 @@ environment secrets; this does not protect against a compromised root host.
 ## HTTP contracts
 
 - `GET http://192.168.0.128:11435/v1/models`: LLM Bearer only; lists
-  `qwen3:0.6b` (the current trial model).
+  `qwen3:1.7b`.
 - `POST /v1/chat/completions`: LLM Bearer only; OpenAI-compatible plain JSON or
-  buffered SSE (`stream: true`) with text `system`, `user`, `assistant`, `tool`
-  messages. Model must be exactly `qwen3:0.6b`; images and unknown fields are
+  incremental SSE (`stream: true`) with text `system`, `user`, `assistant`, `tool`
+  messages. Model must be exactly `qwen3:1.7b`; images and unknown fields are
   rejected. Supports `temperature`, `top_p`, native `top_k` (-1..2147483647;
   -1 disables vocabulary filtering), `seed`,
   `stop` and either `max_tokens` or `max_completion_tokens` (1..2048; default
-  1024). Maps to Ollama `/api/chat` with **think=false**, **num_ctx=8192**,
-  4 CPU threads. Returns actual prompt/completion/total token counts and
+  1024). Maps to llama-server `/v1/chat/completions` with
+  `enable_thinking=false`, 8192 context, on the iGPU; `top_k` ≤ 0 disables it. Returns actual prompt/completion/total token counts and
   `stop`/`length`/`tool_calls` finish reason.
-  Function `tools` (up to 64) and `tool_choice: auto|none` use native Ollama
-  tools. Assistant call IDs and JSON-string arguments are converted to native
-  function argument objects; tool replies must reference an earlier call and
-  are mapped to its function name. Returned calls get unique OpenAI IDs.
+  Function `tools` (up to 64) and `tool_choice: auto|none` are passed to
+  llama-server's Qwen3 template in OpenAI form; tool replies must reference
+  an earlier call ID; returned arguments are checked to be JSON objects.
   Forced/specific tool choices are explicitly unsupported.
-  `response_format` supports `text`, `json_object`, and `json_schema` via native
-  Ollama format-constrained output. Thinking/reasoning, penalties and other
+  `response_format` supports `text`, `json_object`, and `json_schema` via llama-server
+  grammar-constrained output. Thinking/reasoning, penalties and other
   cloud-only knobs are rejected, not silently ignored.
-  SSE buffers the real backend response before sending role, content/tool,
-  finish deltas and `[DONE]`; it is compatible transport, **not incremental
-  token latency**. `stream_options: {"include_usage":true}` adds the final
-  empty-choices usage chunk. Backend errors remain ordinary HTTP errors.
+  SSE relays backend chunks as they are generated (role, content/tool-call
+  deltas, finish, `[DONE]`); `stream_options: {"include_usage":true}` adds the
+  final empty-choices usage chunk. Errors before the first byte are ordinary
+  HTTP errors; a failure mid-stream is sent as one `{"error":…}` event.
 - `POST /api/embed`: embedding Bearer only; Ollama-compatible
   `{"model":"nomic-embed-text","input":["text"]}`. Input may also be a
   single string. At most 64 texts, each 65,536 characters; `truncate` defaults
@@ -167,12 +220,11 @@ environment secrets; this does not protect against a compromised root host.
   is **504**, unavailable/malformed response **502**.
 
 Requests are capped at 1 MiB, backend replies at 8 MiB; socket idle timeouts
-are 15 seconds for clients and 600 seconds for the backend (8k CPU prefill can
-exceed three minutes). Maximum eight HTTP workers;
-**one inference request total** across chat and embeddings. Excess concurrency
-gets **429** with Retry-After instead of an unbounded queue. Ollama keeps only
-one loaded model, one parallel request and a five-minute keep-alive. Switching
-between chat and embeddings may reload models. No raw Ollama management API is
+are 15 seconds for clients and 600 seconds for the backend. Maximum eight HTTP workers;
+**one inference request total** across chat and embeddings. A stream holds
+the slot until its last chunk. Excess concurrency gets **429** with
+Retry-After instead of an unbounded queue. Both models stay resident
+(chat in VRAM, nomic in Ollama with keep-alive Forever). No raw Ollama management API is
 exposed. Gateway access logs are disabled to avoid logging prompts or keys.
 
 HTTP is deliberately restricted to a trusted home LAN, not encrypted. Do not

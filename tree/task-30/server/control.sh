@@ -29,6 +29,8 @@ case "${1:-status}" in
             docker inspect --format '{{.Name}} memory={{.HostConfig.Memory}} swap={{.HostConfig.MemorySwap}} nanoCPUs={{.HostConfig.NanoCpus}} privileged={{.HostConfig.Privileged}} devices={{json .HostConfig.Devices}} ports={{json .NetworkSettings.Ports}}' $ids
         fi
         du -sh models
+        # Radeon 680M BIOS carve-out: chat weights + KV live here, not in host RAM.
+        echo "iGPU VRAM used/total: $(cat /sys/class/drm/card0/device/mem_info_vram_used)/$(cat /sys/class/drm/card0/device/mem_info_vram_total) bytes"
         ;;
     pull)
         headroom
@@ -37,7 +39,8 @@ case "${1:-status}" in
         # Only this new container gets temporary egress; never publish its API.
         docker network connect bridge "$id"
         trap 'docker network disconnect bridge "$id"' EXIT HUP INT TERM
-        compose exec -T ollama ollama pull qwen3:0.6b
+        # qwen3:1.7b is fetched through Ollama only for its GGUF blob; llama-server (chat) loads it.
+        compose exec -T ollama ollama pull qwen3:1.7b
         compose exec -T ollama ollama pull nomic-embed-text
         compose exec -T ollama ollama list
         ;;

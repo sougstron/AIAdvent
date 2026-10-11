@@ -1,15 +1,82 @@
 name: ask-home-engine
 services:
+  chat:
+    # llama.cpp b11552 (23b0202a1) Vulkan build; runs qwen3:1.7b on the Radeon 680M.
+    image: ghcr.io/ggml-org/llama.cpp@sha256:f05a83f1037baed5aa158c18be9835778db98da0b068aedfb39d9d379fe54f4d
+    user: "1000:1000"
+    group_add: ["993"]
+    entrypoint: [/app/llama-server]
+    command:
+      # qwen3:1.7b model layer as pulled by Ollama (control.sh pull keeps it present).
+      - -m
+      - /models/sha256-3d0b790534fe4b79525fc3692950408dca41171676ed7e21db57af5c65ef6ab6
+      - --alias
+      - qwen3:1.7b
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -ngl
+      - "99"
+      - -c
+      - "8192"
+      - -np
+      - "1"
+      - -t
+      - "1"
+      - -fa
+      - "on"
+      - --jinja
+      - --chat-template-kwargs
+      - '{"enable_thinking":false}'
+      # Sampling defaults from the model's Ollama params blob (cff3f395…), as before the swap.
+      - --temp
+      - "0.6"
+      - --top-k
+      - "20"
+      - --top-p
+      - "0.95"
+      - --min-p
+      - "0"
+      # Host-RAM prompt cache defaults to 8 GiB and outgrows mem_limit (OOM-killed in the 4B trial).
+      - --cache-ram
+      - "512"
+      - --no-webui
+    environment:
+      HOME: /tmp
+      MESA_SHADER_CACHE_DIR: /tmp
+    devices: [/dev/dri/renderD128:/dev/dri/renderD128]
+    volumes:
+      - ./models/blobs:/models:ro
+    networks: [backend]
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cpus: 1.20
+    pids_limit: 128
+    read_only: true
+    tmpfs: ["/tmp:size=134217728,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, curl, -sf, http://127.0.0.1:8080/health]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "2"}
   ollama:
+    # Embeddings only: keeps nomic vectors identical to indexes built with Ollama.
     image: ollama/ollama:0.13.5
     user: "1000:1000"
     environment:
       HOME: /tmp
       OLLAMA_HOST: 0.0.0.0:11434
       OLLAMA_MODELS: /models
-      OLLAMA_CONTEXT_LENGTH: "8192"
+      OLLAMA_CONTEXT_LENGTH: "4096"
       OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_MAX_QUEUE: "1"
       OLLAMA_KEEP_ALIVE: "-1"
       OLLAMA_LLM_LIBRARY: cpu
@@ -18,9 +85,9 @@ services:
     volumes:
       - ./models:/models
     networks: [backend]
-    mem_limit: 3840m
-    memswap_limit: 3840m
-    cpus: 3.70
+    mem_limit: 1024m
+    memswap_limit: 1024m
+    cpus: 2.50
     pids_limit: 128
     read_only: true
     tmpfs: ["/tmp:size=134217728,mode=1777"]
@@ -55,6 +122,7 @@ services:
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
     depends_on:
+      chat: {condition: service_healthy}
       ollama: {condition: service_healthy}
     healthcheck:
       test:
