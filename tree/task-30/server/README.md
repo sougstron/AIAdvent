@@ -44,6 +44,17 @@ A second uncached request used **4596 + 10 tokens**, recalled
 The rebuilt app was launched in a guest PTY: footer
 `ctx 435~/8192 (5%)`, `/quit` exit 0; 15 config tests passed.
 
+Both models now remain resident together: `OLLAMA_MAX_LOADED_MODELS=2`,
+`OLLAMA_KEEP_ALIVE=-1`, and both gateway request types send `keep_alive=-1`.
+This prevents embedding requests from evicting Qwen or idle expiry from
+unloading either model; restarting/stopping the engine still unloads them.
+On 2026-10-11, authenticated chat → embedding → chat returned **12**,
+two **768-dimensional** vectors, then **14**. `ollama ps` showed both
+Qwen (**8192** context, **2.4 GB**) and nomic (**4096** context, **565 MB**),
+100% CPU, expiry **Forever**. Combined Ollama usage was **2.57 GiB**,
+gateway **17.79 MiB**, host available RAM **6.1 GiB**; the aggregate
+4 GiB/no-swap cap remains unchanged.
+
 ## Install (new deployment only)
 
 Docker/Compose, Python 3, SSH key access and at least 4 GiB available RAM are
