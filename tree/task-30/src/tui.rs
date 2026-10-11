@@ -326,6 +326,9 @@ struct App {
     /// far plus the calibration that turns "what's in the box" into an
     /// estimate of the next request.
     tokens: TokenMeter,
+    /// Last known size of the MCP part of a request (see
+    /// `Agent::mcp_wire_chars`); kept while a turn holds the toolbox.
+    mcp_chars: std::cell::Cell<usize>,
     /// Character/message size of the last request actually sent — the input
     /// side of the chars-per-token calibration.
     sent_shape: Shape,
@@ -449,6 +452,7 @@ impl App {
             quit: false,
             ctrl_c_at: None,
             tokens: TokenMeter::new(),
+            mcp_chars: std::cell::Cell::new(0),
             sent_shape: Shape::default(),
             spinner: None,
             flow_feed: None,
@@ -5145,10 +5149,16 @@ impl App {
     /// — with `compress=summary` it stops growing with the whole transcript.
     fn conversation_shape(&self) -> Shape {
         let system = self.agent.system_for_request();
-        let system_shape = if system.trim().is_empty() {
+        // MCP note + tool schemas also go out with every turn (task 30: 3.2k
+        // of the 8.5k tokens of a bare "hello" the meter showed as 4955~).
+        if let Some(chars) = self.agent.mcp_wire_chars() {
+            self.mcp_chars.set(chars);
+        }
+        let system_chars = system.chars().count() + self.mcp_chars.get();
+        let system_shape = if system.trim().is_empty() && system_chars == 0 {
             Shape::default()
         } else {
-            Shape::new(system.chars().count(), 1)
+            Shape::new(system_chars, 1)
         };
         let history = self.session.history();
         // Меряем то, что реально уйдёт на провод: при включённом сжатии это

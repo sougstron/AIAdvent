@@ -637,6 +637,19 @@ impl Agent {
         self.mcp = toolbox;
     }
 
+    /// Chars the MCP part adds to every request: the `<mcp-tools>` note in
+    /// `system` plus the `tools` schemas. On five servers that is ~3.2k
+    /// tokens the context meter used to miss. `None` while a turn holds the
+    /// toolbox — the caller keeps its last value.
+    pub fn mcp_wire_chars(&self) -> Option<usize> {
+        if !self.uses_mcp() {
+            return Some(0);
+        }
+        let tb = self.mcp.as_ref()?.try_lock().ok()?;
+        let tools = serde_json::to_string(&tb.functions).map_or(0, |s| s.chars().count());
+        Some(mcp_agent::chat_note(&tb).chars().count() + 2 + tools)
+    }
+
     /// Ход через MCP-инструменты идёт только там, где ответ — свободный
     /// текст: JSON-режим сам диктует форму ответа и остаётся без них.
     pub fn uses_mcp(&self) -> bool {

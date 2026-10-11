@@ -37,7 +37,7 @@ it is ready. After stop, verify the project's containers are stopped.
 
 ## Models and app
 
-- Qwen3 1.7B (`qwen3:1.7b`), Q4_K_M, 8192-token context, served by llama.cpp
+- Qwen3 1.7B (`qwen3:1.7b`), Q4_K_M, 16384-token context, served by llama.cpp
   `llama-server` (Vulkan) on the Radeon 680M iGPU; Ollama serves only nomic.
 - `nomic-embed-text` embeddings, compatible with the app's existing model.
 - LLM base: `http://192.168.0.128:11435/v1`.

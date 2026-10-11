@@ -8,10 +8,10 @@ Docker workload, host service or router configuration is changed.
 
 - `chat`: llama.cpp `llama-server` (Vulkan build, image pinned by digest
   `f05a83f1…`, b11552) runs `qwen3:1.7b` fully on the Radeon 680M
-  (`-ngl 99`, 8192 context, flash attention, thinking off via the chat
+  (`-ngl 99`, 16384 context, flash attention, thinking off via the chat
   template). Only `/dev/dri/renderD128` is passed in (group `render`, 993);
   still unprivileged, read-only root, no capabilities. Weights + KV live in
-  the 4 GiB BIOS VRAM carve-out (2.2 GB used), which is already outside the
+  the 4 GiB BIOS VRAM carve-out (3.15 GB used at 16k; 2.2 GB at 8k), which is already outside the
   host's 19 GiB, so the container itself uses ~100–200 MiB RAM. The GGUF is
   the Ollama blob `sha256-3d0b7905…` read-only; nothing new was downloaded.
   Sampling defaults copy the model's Ollama params (temp 0.6, top_k 20,
@@ -38,8 +38,18 @@ Measured via the LAN gateway (single runs, not an SLA):
 | short chat (27 + 10 tokens) | — | 0.51 s |
 | app CLI with full AGENTS.md, 5 invariant retries | ~10 min | 5 s |
 
+**16k window (2026-10-11, later).** A bare `hello` from the TUI in this repo
+was 8515 tokens and got the 400 below. Breakdown via llama-server
+`/tokenize`: repo `AGENTS.md` 4007, MCP tool schemas (14) 2136, `<mcp-tools>`
+note 1112, invariants 584, global `~/.pi/agent/AGENTS.md` 561, prompt 22,
+template ~93. Raised `-c` to 16384 (f16 KV, `-fa on`): VRAM 2.2 → 3.15 GB of
+4 GiB, container RAM unchanged (~96 MiB idle). The same 8515-token request
+then answered in 22.4 s cold / 0.6 s with the prefix cached. `/context off`
+in the app drops the two AGENTS.md (~4.6k tokens) for chats that don't need
+them. Backup of the 8k compose: `backups/compose.yaml.pre-16k-1791726079`.
+
 The 5434-token prompt recalled the code placed at its start. A request over
-8192 tokens now returns a clear **400** (`request (9434 tokens) exceeds the
+the window returns a clear **400** (`request (9434 tokens) exceeds the
 available context size`) instead of Ollama's silent truncation.
 
 `qwen3:4b` A/B (temporary container, then removed; its blob stays in
@@ -195,7 +205,7 @@ environment secrets; this does not protect against a compromised root host.
   -1 disables vocabulary filtering), `seed`,
   `stop` and either `max_tokens` or `max_completion_tokens` (1..2048; default
   1024). Maps to llama-server `/v1/chat/completions` with
-  `enable_thinking=false`, 8192 context, on the iGPU; `top_k` ≤ 0 disables it. Returns actual prompt/completion/total token counts and
+  `enable_thinking=false`, 16384 context, on the iGPU; `top_k` ≤ 0 disables it. Returns actual prompt/completion/total token counts and
   `stop`/`length`/`tool_calls` finish reason.
   Function `tools` (up to 64) and `tool_choice: auto|none` are passed to
   llama-server's Qwen3 template in OpenAI form; tool replies must reference
