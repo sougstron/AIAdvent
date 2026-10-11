@@ -29,8 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::Reply;
 use crate::config::{Res, Settings};
-use crate::invariants::{InvariantSet, MAX_ATTEMPTS};
-use crate::pipeline::{self, Decision};
+use crate::pipeline::{self, Decision, MAX_ATTEMPTS};
 use crate::todo::{Stage, Status, TaskState, Verdict};
 
 /// Фаза одного запроса внутри этапа. Нужна ровно для одного: чтобы по файлу
@@ -43,7 +42,7 @@ pub enum Phase {
     Prompt,
     /// Запрос ушёл модели; ответа ещё нет.
     Model,
-    /// Ответ есть, идёт детерминированная проверка (инварианты + контракт).
+    /// Ответ есть, идёт детерминированная проверка (контракт этапа).
     Validate,
     /// Проверка пройдена, решаем судьбу этапа (закрыть / переделать).
     Decide,
@@ -428,7 +427,7 @@ pub struct TaskRun {
     /// Номер попытки текущего запроса (retry валидатора).
     pub attempt: usize,
     /// Настройки на момент старта прогона: модель, стратегия, профиль,
-    /// тудушка, инварианты. Меняются в середине — молчать об этом нельзя.
+    /// тудушка. Меняются в середине — молчать об этом нельзя.
     pub pinned: Pinned,
     /// Подписи под утверждёнными этапами: `plan: человек — ок`.
     pub approvals: Vec<String>,
@@ -462,7 +461,6 @@ pub struct Pinned {
     pub model: String,
     pub strategy: String,
     pub profile: String,
-    pub invariants: bool,
     pub approve: ApprovePolicy,
 }
 
@@ -472,7 +470,6 @@ impl Pinned {
             model: s.model.clone(),
             strategy: s.context_strategy.label().to_string(),
             profile: s.profile.clone(),
-            invariants: s.invariants,
             approve: s.approve,
         }
     }
@@ -489,11 +486,6 @@ impl Pinned {
         cmp("модель", &self.model, &now.model);
         cmp("стратегия", &self.strategy, &now.strategy);
         cmp("профиль", &self.profile, &now.profile);
-        cmp(
-            "инварианты",
-            if self.invariants { "on" } else { "off" },
-            if now.invariants { "on" } else { "off" },
-        );
         cmp("утверждение", self.approve.id(), now.approve.id());
         out
     }
@@ -769,11 +761,10 @@ impl TaskRun {
             }
         ));
         out.push_str(&format!(
-            "зафиксировано на старте: модель {}, стратегия {}, профиль {}, инварианты {}\n",
+            "зафиксировано на старте: модель {}, стратегия {}, профиль {}\n",
             self.pinned.model,
             self.pinned.strategy,
             self.pinned.profile,
-            if self.pinned.invariants { "on" } else { "off" }
         ));
         out
     }
@@ -812,7 +803,7 @@ pub enum StepOutcome {
 ///
 /// Именно тут живёт «ассистент не может перепрыгнуть этап»: ответ модели
 /// проходит `confirm` (маркер закрытия именно текущего этапа), контракт
-/// этапа (`check_stage_output`, тот же retry, что у инвариантов) и только
+/// этапа (`check_stage_output` с retry) и только
 /// потом — [`transition`]. Ни один из трёх шагов пропустить нельзя.
 pub struct Engine;
 
@@ -822,8 +813,6 @@ impl Engine {
     /// сетевого вызова**: иначе падение посреди запроса не видно на диске.
     pub fn step<C, P>(
         run: &mut TaskRun,
-        set: &InvariantSet,
-        inv_on: bool,
         extra: Option<String>,
         mut call: C,
         persist: &mut P,
@@ -850,7 +839,7 @@ impl Engine {
         run.set_attempt(1);
         persist(run);
 
-        let outcome = pipeline::run_stage_with(set, inv_on, Some(stage), &prompt, |n, note| {
+        let outcome = pipeline::run_stage_with(Some(stage), |n, note| {
             run.set_attempt(n);
             persist(run);
             call(&prompt, n, note)
@@ -861,14 +850,6 @@ impl Engine {
 
         let text = match outcome.decision {
             Decision::Pass { text, .. } => text,
-            Decision::RefusedByInvariant { explanation, .. } => {
-                let _ = run.apply(Event::Pause(format!("инвариант: {explanation}")));
-                persist(run);
-                return Ok(StepOutcome::Paused {
-                    why: explanation.clone(),
-                    text: Some(explanation),
-                });
-            }
             Decision::GaveUp { last, violations } => {
                 let why = format!(
                     "после {MAX_ATTEMPTS} попыток этап `{}` так и не сложился: {}",

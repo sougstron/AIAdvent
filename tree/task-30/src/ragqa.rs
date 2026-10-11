@@ -570,13 +570,12 @@ pub fn load_controls(dir: &Path) -> Res<Vec<Control>> {
 
 /// The agent every mode shares: the user's model and sampling, but a fixed
 /// system prompt and nothing else in `system` (no AGENTS.md, profile,
-/// invariants, todo) — the only thing that differs between modes is how
+/// todo) — the only thing that differs between modes is how
 /// the documents reach the model.
 pub fn eval_agent(settings: &Settings) -> Res<Agent> {
     let mut s = settings.clone();
     s.system_prompt = EVAL_SYSTEM.into();
     s.context_enabled = false;
-    s.invariants = false;
     s.todo = false;
     s.rag = false;
     s.profile = crate::profile::OFF.into();

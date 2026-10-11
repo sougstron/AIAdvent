@@ -765,7 +765,7 @@ mod tests {
         let s: Session = serde_json::from_str(raw).unwrap();
         assert_eq!(s.id, "legacy-1");
         assert_eq!(s.settings.model, DEFAULT_MODEL);
-        assert!(s.settings.context_enabled);
+        assert!(!s.settings.context_enabled);
         assert!(s.context_files.is_empty());
         assert!(!s.messages[0].interrupted);
         assert_eq!(s.created_at, 0);

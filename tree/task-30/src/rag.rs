@@ -123,8 +123,20 @@ impl Config {
     /// the nearest ancestor of the executable that has `dir` (the task
     /// folder), and only then to the folder the binary was compiled in —
     /// that one is baked in at build time and may be another checkout.
-    pub fn resolve_paths(mut self) -> Self {
-        if !self.dir.is_relative() || self.dir.exists() {
+    pub fn resolve_paths(self) -> Self {
+        self.resolve_where(|dir, _| dir.exists())
+    }
+
+    /// Like [`Config::resolve_paths`], but a folder only counts if it holds
+    /// a built index or the control questions: a bare `docs/` in the
+    /// current directory (e.g. the repo root's own `docs/`) must not shadow
+    /// the task folder's corpus for the chat, `/rag questions` and evals.
+    pub fn resolve_corpus(self) -> Self {
+        self.resolve_where(|dir, db| db.exists() || dir.join(crate::ragqa::CONTROL_FILE).exists())
+    }
+
+    fn resolve_where(mut self, ok: impl Fn(&Path, &Path) -> bool) -> Self {
+        if !self.dir.is_relative() || ok(&self.dir, &self.db) {
             return self;
         }
         let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
@@ -133,7 +145,8 @@ impl Config {
             .flat_map(|p| p.ancestors().skip(1).map(Path::to_path_buf).collect::<Vec<_>>())
             .collect();
         homes.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-        if let Some(home) = homes.into_iter().find(|h| h.join(&self.dir).exists()) {
+        let db = |h: &Path| if self.db.is_relative() { h.join(&self.db) } else { self.db.clone() };
+        if let Some(home) = homes.into_iter().find(|h| ok(&h.join(&self.dir), &db(h))) {
             self.dir = home.join(&self.dir);
             if self.db.is_relative() {
                 self.db = home.join(&self.db);
@@ -142,9 +155,9 @@ impl Config {
         self
     }
 
-    /// Default chunking parameters over `dir` / `db`, paths resolved as
-    /// [`Config::resolve_paths`] does — how the chat and `--rag-eval` find
-    /// the index `--rag-index` built.
+    /// Default chunking parameters over `dir` / `db`, paths resolved by
+    /// [`Config::resolve_corpus`] — how the chat and `--rag-eval` find the
+    /// index `--rag-index` built.
     pub fn locate(dir: &str, db: &str) -> Config {
         Config {
             dir: dir.into(),
@@ -157,7 +170,7 @@ impl Config {
             provider: EmbeddingProvider::Local,
             db: db.into(),
         }
-        .resolve_paths()
+        .resolve_corpus()
     }
 
     fn params(&self, s: Strategy) -> Value {

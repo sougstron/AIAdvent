@@ -523,18 +523,6 @@ pub struct Cli {
     #[arg(long, value_name = "WHICH")]
     pub verify_todo: Option<String>,
 
-    /// Project invariants: `on` (default) or `off`.
-    #[arg(long, value_name = "on|off", default_value = "on")]
-    pub invariants: String,
-
-    /// JSON file containing editable project invariants.
-    #[arg(long, value_name = "FILE", env = "ASK_INVARIANTS_FILE")]
-    pub inv_file: Option<String>,
-
-    /// Offline causal proof: `wire`, `validate`, `retry`, `refuse`, or `all`.
-    #[arg(long, value_name = "WHICH")]
-    pub verify_invariants: Option<String>,
-
     /// Live proof for personalization: `wire` (what the profile puts into
     /// the system message — no network), `voice` (same question, two
     /// profiles, each answer carrying its own machine-checkable signature),
@@ -733,11 +721,6 @@ impl Cli {
             None if self.todo && !self.question.is_empty() => crate::run::ApprovePolicy::Auto,
             None => crate::run::ApprovePolicy::Manual,
         };
-        s.invariants = match self.invariants.as_str() {
-            "on" => true,
-            "off" => false,
-            other => return Err(format!("--invariants: ожидалось on или off, получено `{other}`")),
-        };
         if let Some(path) = &self.json_schema_file {
             let raw =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -830,9 +813,6 @@ pub fn run() -> Res<()> {
     if let Some(dir) = cli.memory_dir.as_deref().filter(|d| !d.is_empty()) {
         std::env::set_var("ASK_MEMORY_DIR", dir);
     }
-    if let Some(path) = cli.inv_file.as_deref().filter(|p| !p.is_empty()) {
-        std::env::set_var("ASK_INVARIANTS_FILE", path);
-    }
 
     if cli.profiles {
         println!("{}", profile::ProfileSet::open(memory::memory_root()).listing());
@@ -840,11 +820,6 @@ pub fn run() -> Res<()> {
     }
 
     let settings = cli.to_settings()?;
-
-    if let Some(which) = cli.verify_invariants.as_deref() {
-        println!("{}", crate::invariants::verify(which)?);
-        return Ok(());
-    }
 
     if cli.verify_billing {
         let report = billing::run()?;
@@ -1345,14 +1320,10 @@ fn todo_shot(settings: Settings, question: &str) -> Res<()> {
             break;
         }
         eprintln!("{}", run.state.enter_line());
-        let set = agent.invariants().clone();
-        let inv_on = agent.settings().invariants;
         let hist = history.clone();
         let mut sent_prompt = String::new();
         let outcome = crate::run::Engine::step(
             &mut run,
-            &set,
-            inv_on,
             None,
             |prompt, _, retry_note| {
                 sent_prompt = prompt.to_string();

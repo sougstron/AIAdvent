@@ -440,11 +440,7 @@ fn default_profile() -> String {
 }
 
 const fn default_context_enabled() -> bool {
-    true
-}
-
-const fn default_invariants() -> bool {
-    true
+    false
 }
 
 /// Everything one turn of generation needs. Built once per app, mutated live
@@ -525,10 +521,6 @@ pub struct Settings {
     /// поведением по умолчанию, а не опцией.
     #[serde(default)]
     pub approve: crate::run::ApprovePolicy,
-    /// Inject project invariants and validate every answer client-side.
-    /// Enabled by default; the rules themselves live outside the session.
-    #[serde(default = "default_invariants")]
-    pub invariants: bool,
     /// When true, `Agent` injects discovered AGENTS.md / CLAUDE.md files
     /// into the system message. Toggled at runtime via `set_context_enabled`.
     #[serde(default = "default_context_enabled")]
@@ -652,8 +644,7 @@ impl Default for Settings {
             rag_min_llm: default_rag_min_llm(),
             rag_idk_llm: default_rag_idk_llm(),
             rag_idk_z: default_rag_idk_z(),
-            invariants: true,
-            context_enabled: true,
+            context_enabled: false,
             context_strategy: ContextStrategy::default(),
             keep_recent: DEFAULT_KEEP_RECENT,
             summarize_every: DEFAULT_SUMMARIZE_EVERY,
@@ -780,10 +771,6 @@ impl Settings {
         } else {
             "rag=off".into()
         });
-        parts.push(format!(
-            "invariants={}",
-            if self.invariants { "on" } else { "off" }
-        ));
         parts.push(match self.max_chars {
             Some(n) => format!("max_chars={n}"),
             None => "max_chars=off".into(),

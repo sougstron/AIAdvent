@@ -4941,10 +4941,8 @@ pub fn life_gate(model: Option<&str>) -> Res<LifeReport> {
     let mut prompt = run.state.stage_prompt();
     prompt.push_str(&format!("\n\nУточнение от человека: {jump}"));
 
-    let set = agent.invariants().clone();
-    let inv_on = agent.settings().invariants;
     let mut calls = 0usize;
-    let outcome = crate::pipeline::run_stage_with(&set, inv_on, Some(Stage::Plan), &prompt, |_, note| {
+    let outcome = crate::pipeline::run_stage_with(Some(Stage::Plan), |_, note| {
         calls += 1;
         let mut turn = vec![ChatMessage::user(prompt.clone())];
         if let Some(n) = note {
@@ -4956,7 +4954,6 @@ pub fn life_gate(model: Option<&str>) -> Res<LifeReport> {
     let text = match &outcome.decision {
         crate::pipeline::Decision::Pass { text, .. } => text.clone(),
         crate::pipeline::Decision::GaveUp { last, .. } => last.text.clone(),
-        crate::pipeline::Decision::RefusedByInvariant { explanation, .. } => explanation.clone(),
     };
     let contract_rejected = outcome.attempts.iter().any(|a| {
         a.violations.iter().any(|v| v.id.starts_with("этап:"))
