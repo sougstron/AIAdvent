@@ -41,7 +41,10 @@ const BATCH: usize = 16;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EmbeddingProvider {
+    /// Follow the chat model: home-server model → home-server embeddings,
+    /// anything else → local Ollama.
     #[default]
+    Auto,
     Local,
     HomeServer,
 }
@@ -49,16 +52,35 @@ pub enum EmbeddingProvider {
 impl EmbeddingProvider {
     pub fn parse(value: &str) -> Res<Self> {
         match value {
+            "auto" => Ok(Self::Auto),
             "local" => Ok(Self::Local),
             "home-server" => Ok(Self::HomeServer),
-            _ => Err("embedding provider must be local or home-server".into()),
+            _ => Err("embedding provider must be auto, local or home-server".into()),
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Local => "local",
             Self::HomeServer => "home-server",
+        }
+    }
+
+    /// The concrete transport for a chat model; explicit choices win.
+    pub fn resolve(self, chat_model: &str) -> Self {
+        match self {
+            Self::Auto if crate::config::provider_of(chat_model) == Some(crate::auth::Provider::HomeServer) => Self::HomeServer,
+            Self::Auto => Self::Local,
+            other => other,
+        }
+    }
+
+    /// `auto (home-server)` for display, plain name otherwise.
+    pub fn label(self, chat_model: &str) -> String {
+        match self {
+            Self::Auto => format!("auto ({})", self.resolve(chat_model).name()),
+            other => other.name().into(),
         }
     }
 }
@@ -553,7 +575,7 @@ pub struct Embedder {
 impl Embedder {
     pub fn new(provider: EmbeddingProvider, url: &str, model: &str) -> Res<Embedder> {
         let (url, api_key) = match provider {
-            EmbeddingProvider::Local => (url.trim_end_matches('/').to_string(), None),
+            EmbeddingProvider::Auto | EmbeddingProvider::Local => (url.trim_end_matches('/').to_string(), None),
             EmbeddingProvider::HomeServer => {
                 if model != DEFAULT_MODEL {
                     return Err(format!("home-server embeddings allow only {DEFAULT_MODEL}; index uses {model}"));
@@ -1037,6 +1059,19 @@ pub fn compare(cfg: &Config) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_embeddings_follow_the_chat_model() {
+        assert_eq!(EmbeddingProvider::default(), EmbeddingProvider::Auto);
+        assert_eq!(EmbeddingProvider::Auto.resolve("qwen3:1.7b"), EmbeddingProvider::HomeServer);
+        assert_eq!(EmbeddingProvider::Auto.resolve("glm-5.3-flash"), EmbeddingProvider::Local);
+        assert_eq!(EmbeddingProvider::Local.resolve("qwen3:1.7b"), EmbeddingProvider::Local);
+        assert_eq!(EmbeddingProvider::HomeServer.resolve("glm-5.3-flash"), EmbeddingProvider::HomeServer);
+        assert_eq!(EmbeddingProvider::Auto.label("qwen3:1.7b"), "auto (home-server)");
+        // A pre-auto session stored the default as `rag_provider: "local"`; it must not pin.
+        let old: crate::config::Settings = serde_json::from_str(r#"{"model":"qwen3:1.7b","rag_provider":"local"}"#).unwrap();
+        assert_eq!(old.embeddings(), EmbeddingProvider::HomeServer);
+    }
 
     fn cfg(size: usize, overlap: usize, struct_max: usize) -> Config {
         Config {

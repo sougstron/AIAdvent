@@ -518,7 +518,7 @@ const SCORE_HEAD: &str = "| настройка | нужный чанк в кон
 pub fn tune(settings: &Settings, paths: &crate::rag::Config, only: &[usize]) -> Res<()> {
     let controls: Vec<Control> =
         load_controls(&paths.dir)?.into_iter().filter(|c| only.is_empty() || only.contains(&c.id)).collect();
-    let r = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.rag_provider)?;
+    let r = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.embeddings())?;
     let judge = Judge::new(settings, &r)?;
     let base = Pipeline::from_settings(settings);
     let judged = base.pool.max(base.k);

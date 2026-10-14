@@ -241,7 +241,7 @@ pub const ROOT: &[Node] = &[
             lit("k", "1-12", &[free("N")]),
             lit("pool", "N", &[free("N")]),
             lit("strategy", "structure|fixed", &[leaf("structure"), leaf("fixed")]),
-            lit("provider", "local|home-server", &[leaf("local"), leaf("home-server")]),
+            lit("provider", "auto|local|home-server", &[leaf("auto"), leaf("local"), leaf("home-server")]),
             lit("rewrite", "on|off", &[leaf("on"), leaf("off")]),
             lit("filter", "off|sim|llm|both", &[leaf("off"), leaf("sim"), leaf("llm"), leaf("both")]),
             lit("min-sim", "Z", &[free("Z")]),

@@ -477,8 +477,10 @@ pub struct Settings {
     /// Из какой стратегии индекса брать чанки: `structure` или `fixed`.
     #[serde(default = "default_rag_strategy")]
     pub rag_strategy: String,
-    /// Embedding transport; local Ollama remains the default.
-    #[serde(default)]
+    /// Embedding transport; `auto` (default) follows the chat model. Stored
+    /// under a new key: pre-auto sessions wrote `rag_provider: "local"` as a
+    /// mere default, which would pin home-server chats to a dead Ollama.
+    #[serde(default, rename = "rag_embeddings")]
     pub rag_provider: crate::rag::EmbeddingProvider,
     /// Задача 23: перед поиском LLM переписывает вопрос в поисковый запрос
     /// (`rerank.rs`); ищем по обоим, у чанка берём лучший из двух скоров.
@@ -665,6 +667,11 @@ impl Settings {
     /// Token cap sent as `max_tokens`.
     pub fn max_tokens(&self) -> Option<u32> {
         self.budget_tokens
+    }
+
+    /// Embedding transport actually used for RAG with the current model.
+    pub fn embeddings(&self) -> crate::rag::EmbeddingProvider {
+        self.rag_provider.resolve(&self.model)
     }
 
     pub fn thinking(&self) -> bool {

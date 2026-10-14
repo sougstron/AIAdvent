@@ -175,11 +175,13 @@ Production-ключи не передавались в VM; временный cr
 Связка целиком никогда не попадает в Authorization: каждый транспорт берёт
 только свой ключ. `ask --verify-login` перепроверяет оба API.
 
-Выбор модели и embedding-провайдера независимы. `/rag provider local`
+По умолчанию embedding-провайдер `auto`: он следует за моделью чата —
+`qwen3:1.7b` (home-server) берёт embeddings с домашнего сервера, остальные
+модели — локальный Ollama. Явный выбор сильнее `auto`: `/rag provider local`
 оставляет прежний локальный Ollama (`OLLAMA_URL`, CLI `--ollama-url`);
 `/rag provider home-server` выбирает защищённый сервер. Выбор сохраняется
 в настройках сессии, виден в `/rag show` и дополняется через Tab.
-CLI-эквивалент — `--rag-provider local|home-server`, включая индексирование,
+CLI-эквивалент — `--rag-provider auto|local|home-server`, включая индексирование,
 поиск, rewrite, reranking, оценки и чат с памятью. Без корректной связки
 выбранный home-server завершает операцию ошибкой, **без fallback** на Ollama.
 

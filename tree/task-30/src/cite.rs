@@ -907,7 +907,7 @@ pub struct EvalRow {
 /// five without an answer, three vague ones → `rag/cite.md`, `rag/cite.json`.
 pub fn eval(settings: &Settings, paths: &crate::rag::Config, only: &[usize]) -> Res<()> {
     let controls = ragqa::load_controls(&paths.dir)?;
-    let r = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.rag_provider)?;
+    let r = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.embeddings())?;
     let p = Pipeline::from_settings(settings);
     let idk = Idk::from_settings(settings);
     let judge = if p.needs_llm() { Some(Judge::new(settings, &r)?) } else { None };

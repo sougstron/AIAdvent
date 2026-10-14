@@ -412,7 +412,7 @@ pub struct Chat {
 impl Chat {
     pub fn new(settings: &Settings, paths: &crate::rag::Config) -> Res<Chat> {
         let pipeline = Pipeline::from_settings(settings);
-        let retriever = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.rag_provider)?;
+        let retriever = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.embeddings())?;
         let judge = if pipeline.needs_llm() { Some(Judge::new(settings, &retriever)?) } else { None };
         let checker = Checker::new(settings).ok();
         Ok(Chat {
