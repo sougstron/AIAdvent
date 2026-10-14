@@ -1,0 +1,17 @@
+{
+  "layer": "short",
+  "scope": "1791963996-cd4a-1",
+  "records": [],
+  "dialog": [
+    {
+      "n": 1,
+      "role": "user",
+      "text": "Hello?"
+    },
+    {
+      "n": 2,
+      "role": "assistant",
+      "text": "Hello? I'm here to help. How can I assist you today?"
+    }
+  ]
+}
