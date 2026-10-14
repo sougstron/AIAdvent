@@ -85,7 +85,7 @@ const PROFILE_USAGE: &str =
 const TODO_USAGE: &str = "/todo [show|on|off|start <задача>|approve [коммент]|reject <причина>|\
                           pause [почему]|resume|abort <причина>|log|reset|prompt]";
 const RAG_USAGE: &str = "/rag [show|on|off|k N|pool N|rewrite on|off|filter off|sim|llm|both|min-sim Z|min-llm N|\
-                         idk N|idk-z Z|strategy fixed|structure|provider local|home-server|questions|search <вопрос>|compare <N|вопрос>|mem [show|on|off|reset]]";
+                         idk N|idk-z Z|strategy fixed|structure|provider auto|local|home-server|questions|search <вопрос>|compare <N|вопрос>|mem [show|on|off|reset]]";
 const MEM_USAGE: &str =
     "/mem [show [слой]|dialog|<слой> set <ключ> <значение>|del <ключ>|clear <слой>|task <имя>|where <ключ>|routes], слой = short|working|long";
 /// Status + key hints stay separate from the always-on token bar.
@@ -2994,7 +2994,7 @@ impl App {
 
     fn rag_card(&self) -> String {
         let paths = crate::ragqa::default_paths();
-        let index = match crate::ragqa::Retriever::open(&paths.db, &self.settings.rag_strategy, &paths.url, self.settings.rag_provider) {
+        let index = match crate::ragqa::Retriever::open(&paths.db, &self.settings.rag_strategy, &paths.url, self.settings.embeddings()) {
             Ok(r) => format!(
                 "{} — {} чанков `{}` из {} документов, эмбеддинги {} ({})",
                 r.db.display(),
@@ -3002,7 +3002,7 @@ impl App {
                 r.strategy,
                 r.titles().len(),
                 r.model,
-                self.settings.rag_provider.name()
+                self.settings.rag_provider.label(&self.settings.model)
             ),
             Err(e) => format!("недоступен: {e}"),
         };
@@ -3034,7 +3034,7 @@ impl App {
         f(self.agent.settings_mut());
         self.status = format!(
             "RAG: embeddings {} · {} · {}",
-            self.settings.rag_provider.name(),
+            self.settings.rag_provider.label(&self.settings.model),
             crate::rerank::Pipeline::from_settings(&self.settings).label(),
             crate::cite::Idk::from_settings(&self.settings).label()
         );
@@ -5261,7 +5261,7 @@ const HELP: &str = "\
 /profile [show|list|off|prompt|<id>]  user profile: style, format, limits on every request
 /todo [show|on|off|start <task>|next|pause|resume|reset|prompt]  task state machine (off by default)
 /rag [show|on|off|k N|strategy fixed|structure]  RAG: nearest chunks of rag/index.sqlite go with every question (off by default)
-/rag provider local|home-server  choose embedding API (home-server requires the login bundle; no fallback)
+/rag provider auto|local|home-server  embedding API; auto (default) follows the chat model (home-server needs the login bundle; no fallback)
 /rag rewrite on|off | filter off|sim|llm|both | pool N | min-sim Z | min-llm N  second stage: query rewrite, similarity threshold, LLM reranker
 /rag idk N | idk-z Z  answers carry sources + verbatim quotes (checked); below the threshold — «не знаю» + a clarifying question
 /rag questions | search <q> | compare <N|q>  control questions / retrieval only / the same question without and with the second stage

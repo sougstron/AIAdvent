@@ -259,7 +259,7 @@ pub fn prepare(question: &str, settings: &Settings) -> Res<Prepared> {
 
 pub fn prepare_with(question: &str, settings: &Settings, p: &Pipeline) -> Res<Prepared> {
     let paths = default_paths();
-    let r = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.rag_provider)?;
+    let r = Retriever::open(&paths.db, &settings.rag_strategy, &paths.url, settings.embeddings())?;
     let judge = if p.needs_llm() { Some(Judge::new(settings, &r)?) } else { None };
     let got = rerank::run(&r, p, judge.as_ref(), question)?;
     // task 24: what goes out is the grounded-answer prompt (`cite.rs`)
@@ -640,7 +640,7 @@ pub fn eval(settings: &Settings, opts: &EvalOpts) -> Res<()> {
     if controls.is_empty() {
         return Err("no control questions match --rag-eval-only".into());
     }
-    let retriever = Retriever::open(&opts.paths.db, &opts.strategy, &opts.paths.url, settings.rag_provider)?;
+    let retriever = Retriever::open(&opts.paths.db, &opts.strategy, &opts.paths.url, settings.embeddings())?;
     let judge = Judge::new(settings, &retriever)?;
     let plain = eval_agent(settings)?;
     let mut mcp = eval_agent(settings)?;

@@ -404,8 +404,9 @@ pub struct Cli {
     #[arg(long, value_name = "structure|fixed")]
     pub rag_strategy: Option<String>,
 
-    /// Embeddings: local Ollama or authenticated home-server (no fallback).
-    #[arg(long, value_name = "local|home-server")]
+    /// Embeddings: auto (follow the chat model, default), local Ollama or
+    /// authenticated home-server (no fallback).
+    #[arg(long, value_name = "auto|local|home-server")]
     pub rag_provider: Option<String>,
 
     /// Task 23: rewrite the question into a search query with the LLM
@@ -973,7 +974,7 @@ pub fn run() -> Res<()> {
             struct_max: cli.struct_max,
             model: cli.embed_model.clone(),
             url: cli.ollama_url.clone(),
-            provider: cli.rag_provider.as_deref().map(rag::EmbeddingProvider::parse).transpose()?.unwrap_or_default(),
+            provider: cli.to_settings()?.embeddings(),
             db: cli.rag_db.clone().into(),
         }
         .resolve_paths();
